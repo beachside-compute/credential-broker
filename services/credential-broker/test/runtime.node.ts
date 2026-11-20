@@ -1542,7 +1542,8 @@ test("HTTP endpoint at an upstream origin root supports literal-only configurati
     assert.equal(seen.at(-1)?.headers.get("x-mode"), "literal");
     const rotation = await admin(`${item}/credential`, "PUT", JSON.stringify(credential));
     assert.equal(rotation.status, 200);
-    assert.equal((await rotation.json()).credentialVersion, 2);
+    const rotated = z.object({ credentialVersion: z.number() }).parse(await rotation.json());
+    assert.equal(rotated.credentialVersion, 2);
   } finally {
     await admin(item, "DELETE");
     await eligible(defaultNames);
