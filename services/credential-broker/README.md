@@ -4,39 +4,53 @@ The broker lets a sandbox use GitHub over HTTPS or call HTTPS APIs with expiring
 
 ## Deploy
 
-Use Bun 1.4.4 and a Cloudflare account with permission to provision a Worker, Worker secrets, and a SQLite Durable Object namespace. Have your Cloudflare account ID and a scoped API token ready. Run these commands from the repository root. [Find your account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/) · [Create an API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+Use Bun 1.4.4, Node.js 22 or later, and a Cloudflare account with permission to create a Worker, Worker secrets, and a SQLite Durable Object namespace. Run these commands from the repository root.
 
 ```sh
 bun install --frozen-lockfile
 bun run deploy
 ```
 
-On a fresh checkout, the wizard masks the Cloudflare API token, generates independent broker and Alchemy keys, and writes `.env.deploy` with mode `0600` after confirmation. It separately asks whether to deploy to Cloudflare. Use `bun run deploy:setup` to create the file without starting a deployment. Subsequent `bun run deploy` invocations reuse the file. Keep it private and retain it with `services/credential-broker/.alchemy` and secure backups of the encryption keys. The wizard uses the `production` stage for newly configured deployments. For updates, retain the same stage and state directory.
+On a fresh checkout, confirm generation of separate admin, issuer, and encryption keys. The wizard saves them in `.env.deploy` with mode `0600` and asks whether to deploy. Wrangler handles browser sign-in when needed and uses its normal account selection. For an unattended deployment, export `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
 
-For manual setup, use the [deployment template](../../.env.deploy.example), replace its placeholders, and set the file mode to `0600`. Alchemy also supports deployments with the broker variables already exported by your secret manager and Cloudflare credentials available in the environment or in its profile. A protected `.env.deploy` takes precedence for variables it sets. The runtime `.dev.vars` file is for local Worker bindings.
+Use `bun run deploy:setup` to save keys without signing in or deploying. Subsequent `bun run deploy` invocations reuse the saved keys. Keep secure backups of the keys for as long as the registry or its backups may need them. Run `bun run deploy --dry-run` to check the Worker bundle offline.
 
-| Variable                                           | Value                                                                                                                                                                 |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BROKER_ADMIN_KEY`                                 | Required management bearer key. Generate it from at least 32 random bytes and encode it as base64url.                                                                 |
-| `BROKER_ISSUER_KEY`                                | Optional static grant-issuance bearer key. Generate it independently of the admin key.                                                                                |
-| `BROKER_ENCRYPTION_KEYS`                           | Required JSON object mapping encryption key versions to unpadded base64url encodings of 32 independently generated random bytes each. Provisioned as a Worker secret. |
-| `BROKER_ENCRYPTION_KEY_VERSION`                    | Required active encryption key version. Use a 1–32 character label made of letters, digits, hyphens, or underscores, starting with a letter or digit.                 |
-| `BROKER_CONFIG`                                    | Optional JSON for GitHub Actions trust policies and declared Worker secret bindings. Defaults to an empty object.                                                     |
-| `CREDENTIAL_…`                                     | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.                                                                  |
-| `ALCHEMY_PASSWORD`                                 | Passphrase that encrypts secrets in Alchemy state. Keep it and the state directory private and available for updates.                                                 |
-| `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` | Cloudflare provisioning credentials.                                                                                                                                  |
+### Configure deployment bindings
 
-Configure a static issuer key, GitHub Actions OIDC, or both. The admin key, issuer key, and encryption keys must be distinct. The API keys use 32–256 base64url characters and exclude the reserved sandbox grant token format.
+For manual setup, use the [deployment template](../../.env.deploy.example) and give the resulting `.env.deploy` file mode `0600`. You can also supply the settings through exported environment variables. The file takes precedence for values it sets. The runtime `.dev.vars` file is for local development.
 
-Use the resulting HTTPS origin for the client. The Durable Object applies pending migrations on startup. After schema changes, run `bun run --cwd services/credential-broker db:generate --name your_change` and commit its SQL, journal, snapshot, and bundled migration index.
+| Variable                                                      | Value                                                                                                                                      |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `BROKER_ADMIN_KEY`                                            | Required management bearer key. Generate it from at least 32 random bytes and encode it as base64url.                                      |
+| `BROKER_ISSUER_KEY`                                           | Optional static grant-issuance bearer key. Generate it independently of the admin key.                                                     |
+| `BROKER_ENCRYPTION_KEYS`                                      | Required JSON object mapping encryption key versions to unpadded base64url encodings of 32 independently generated random bytes each.      |
+| `BROKER_ENCRYPTION_KEY_VERSION`                               | Required active key version. Use a 1–32 character label made of letters, digits, hyphens, or underscores, starting with a letter or digit. |
+| `BROKER_CONFIG`                                               | Optional JSON for GitHub Actions trust policies and declared Worker secret bindings. Defaults to an empty object.                          |
+| `CREDENTIAL_…`                                                | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.                                       |
+| `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                                                       |
+| `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                                           |
 
-The new deployment starts with no integrations or issuer permissions. Add integrations, approve them for issuance, then use the issuer client to launch credentialed sandboxes.
+Configure a static issuer key, GitHub Actions OIDC, or both. The admin, issuer, and encryption keys must be distinct. The API keys use 32–256 base64url characters and exclude the reserved sandbox grant token format.
 
-### Deploy with Wrangler
+The wizard passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings so the deployment settings take precedence over the defaults in `wrangler.jsonc`.
 
-Use `bun run deploy:wrangler` from the repository root for a direct Wrangler deployment. The [Wrangler configuration](./wrangler.jsonc) creates the `beachside-credential-broker` Worker and its SQLite-backed grant registry. Choose Wrangler or Alchemy for a deployment and use the same tool when updating it. Each manages its own Worker and registry state.
+Wrangler preserves previously deployed secrets omitted from a later upload. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
 
-Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` for Wrangler. Put the Worker secrets in a protected JSON file outside the repository. For static issuance, the file contains these fields with values from your secret manager. The keyring is a JSON-encoded string.
+```sh
+bun run --cwd services/credential-broker wrangler secret delete BROKER_ISSUER_KEY
+```
+
+Use the HTTPS origin Wrangler prints in the client. The Durable Object applies pending migrations on startup. After schema changes, run `bun run --cwd services/credential-broker db:generate --name your_change` and commit its SQL, journal, snapshot, and bundled migration index. A new deployment begins with an empty integration catalog and issuer allowlist.
+
+### Update an Alchemy deployment
+
+Run `bun run deploy:alchemy` to retain an existing Alchemy-managed Worker and registry. Restore the original broker keys and `ALCHEMY_PASSWORD` through `.env.deploy` or your secret manager. Keep the same Alchemy stage and state directory and use its existing Cloudflare profile or provisioning credentials. The passphrase protects Alchemy state. The default command directs detected Alchemy deployments to the explicit Alchemy command.
+
+### Deploy directly with Wrangler
+
+Use `bun run deploy:wrangler` to manage Wrangler arguments and Worker secrets yourself. The [Wrangler configuration](./wrangler.jsonc) creates the `beachside-credential-broker` Worker and its SQLite-backed grant registry. Its regular variables default to version `v1` and an empty `BROKER_CONFIG`. Supply custom runtime settings in the configuration or as secret bindings. Use the same deployment path when updating the Worker and registry.
+
+Put the Worker secret values in a protected JSON file outside the repository. For static issuance, furnish these fields. The keyring is a JSON-encoded string.
 
 ```json
 {
@@ -46,13 +60,11 @@ Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` for Wrangler. Put the Wor
 }
 ```
 
-The Wrangler configuration defaults to encryption key version `v1` and an empty `BROKER_CONFIG`. Set those variables in `wrangler.jsonc` if you use a different active version, GitHub Actions OIDC, or declared Worker secret bindings. Include the declared binding values in the secrets file. Wrangler uploads the supplied values as Worker secrets along with the code and preserves existing secrets omitted from that file. [Wrangler secret uploads](https://developers.cloudflare.com/workers/configuration/secrets/#upload-secrets-alongside-code).
-
 ```sh
 bun run deploy:wrangler --secrets-file /secure/path/broker-secrets.json
 ```
 
-Use the HTTPS origin Wrangler prints. Native Workers logs and traces are disabled as they can capture full request URLs.
+Native Workers logs and traces are disabled as they can capture full request URLs. [Wrangler secret uploads](https://developers.cloudflare.com/workers/configuration/secrets/#upload-secrets-alongside-code).
 
 ### Run Wrangler locally
 
@@ -72,7 +84,16 @@ Wrangler runs the Worker and SQLite Durable Object locally. Use its local URL wi
 
 ## Manage integrations
 
-Run `bun run build` from the repository root to build the management CLI. Set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` there. Pipe a credential from the operator's secret store to the CLI and approve its integration ID for issuance. For example, with an upstream credential in a protected file:
+Run `bun run build` from the repository root to build the management CLI. In the operator shell, set `BEACHSIDE_BROKER_URL` to the deployed Worker HTTPS origin and `BEACHSIDE_BROKER_ADMIN_KEY` to the `BROKER_ADMIN_KEY` from `.env.deploy` or your secret manager. If you use `.env.deploy`, load the key without sourcing the file as a shell script.
+
+```sh
+export BEACHSIDE_BROKER_URL=https://your-broker.example.com
+export BEACHSIDE_BROKER_ADMIN_KEY="$(
+  node -p 'require("node:util").parseEnv(require("node:fs").readFileSync(".env.deploy", "utf8")).BROKER_ADMIN_KEY'
+)"
+```
+
+Pipe a credential from the operator's secret store to the CLI and approve its integration ID for issuance.
 
 ```sh
 node dist/cli.js integration create github-work --provider github --secret-stdin < /secure/path/github-token
@@ -84,7 +105,7 @@ Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or 
 
 Encrypted-store credentials are encrypted before the Worker sends their envelopes to SQLite. AES-256-GCM uses a fresh nonce for every write and authenticates the integration identity, credential version, and encryption key version. Use `integration rotate <id> --secret-stdin` with a replacement credential. Subsequent requests using an existing grant see the replacement. Requests that already passed authorization may finish with the prior credential.
 
-For a declared Worker secret, use `integration create <id> --provider <kind> --worker-secret CREDENTIAL_NAME`. The registry stores its reference. If you update that Worker secret through Alchemy, subsequent requests resolve the new value.
+For a declared Worker secret, use `integration create <id> --provider <kind> --worker-secret CREDENTIAL_NAME`. The registry stores its reference. After you update the Worker secret on the deployment, subsequent requests resolve the new value.
 
 `integration disable <id>` and `integration delete <id>` revoke every grant that includes the integration. Re-enabling can admit fresh grants. Deleting and recreating a name creates a new identity and requires setting issuer permissions again. The admin API returns integration metadata, including the source kind and credential version. There is no API to retrieve plaintext or ciphertext.
 
