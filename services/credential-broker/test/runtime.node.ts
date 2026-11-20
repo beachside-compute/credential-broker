@@ -35,7 +35,7 @@ import type { CredentialInput } from "../src/credentials/source";
 import type { IntegrationKind } from "../src/integrations/types";
 import { workerSecretSource } from "../src/credentials/sources/worker-secret";
 import { tokenHash } from "../src/grants/tokens";
-import { endpointHeaders } from "../src/proxy/forward";
+import { endpointHeaders, endpointResponseHeaders } from "../src/proxy/forward";
 
 const execute = promisify(execFile);
 
@@ -1307,6 +1307,26 @@ test("strips headers nominated by Connection wherever present at the runtime bou
   );
 });
 
+test("response filtering preserves content type for short secrets and strips reflected credentials", () => {
+  const response = endpointResponseHeaders(
+    new Headers({
+      "content-type": "application/json",
+      "x-plain-reflection": "a",
+      "x-prefixed-reflection": "request used Bearer b",
+      "x-long-reflection": "key=long-secret-fixture",
+      "x-plain": "other-value",
+    }),
+    [
+      { name: "x-plain", secret: true },
+      { name: "authorization", secret: true, prefix: "Bearer " },
+      { name: "x-long", secret: true },
+    ],
+    { "x-plain": "a", authorization: "b", "x-long": "long-secret-fixture" },
+  );
+
+  assert.deepEqual([...response], [["content-type", "application/json"]]);
+});
+
 test("proxies an administrator-configured endpoint and rotates one sealed header without disturbing its grant", async () => {
   const id = "custom-api";
   const gateway = `/gateway/${id}`;
@@ -1393,6 +1413,11 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
           "x-session-id": "conversation-id",
           "x-mode": "guest-override",
           "cf-aig-authorization": "guest-cf-value",
+          "cf-aig-byok-alias": "guest-alias",
+          "cf-aig-collect-log": "true",
+          "x-original-url": "/outside",
+          "sentry-trace": "untrusted-context",
+          "x-request-id": "application-request-identifier",
           "x-token-copy": `copied ${token}`,
           "x-forwarded-for": "192.0.2.1",
           traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
@@ -1419,7 +1444,19 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
     assert.equal(forwarded.headers.get("x-session-id"), "conversation-id");
     assert.equal(forwarded.headers.get("user-agent"), "provider-tool/1.2.3");
 
-    for (const name of ["x-api-key", "x-token-copy", "x-forwarded-for", "traceparent", "cookie"])
+    assert.equal(forwarded.headers.get("x-request-id"), "application-request-identifier");
+
+    for (const name of [
+      "x-api-key",
+      "x-token-copy",
+      "x-forwarded-for",
+      "traceparent",
+      "cookie",
+      "cf-aig-byok-alias",
+      "cf-aig-collect-log",
+      "x-original-url",
+      "sentry-trace",
+    ])
       assert.equal(forwarded.headers.get(name), null);
 
     for (const suffix of ["", "/"]) {
@@ -1427,9 +1464,21 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
       assert.equal(seen.at(-1)?.url.href, `${upstreamBase}${suffix}`);
     }
 
+    assert.equal((await access(`${gateway}/info/refs?service=git-upload-pack`, token)).status, 200);
+    assert.equal(seen.at(-1)?.url.pathname, "/nested/v1/info/refs");
     const initial = seen.length;
 
-    for (const suffix of ["//outside", "/a%2Fb", "/a%5Cb", "/%252e%252e", `?cursor=${token}`]) {
+    for (const suffix of [
+      "//outside",
+      "/a%2Fb",
+      "/a%5Cb",
+      "/%252e%252e",
+      "/..;/outside",
+      "/..%3b/outside",
+      "/..%20/outside",
+      "/%2e%2e%3b/outside",
+      `?cursor=${token}`,
+    ]) {
       assert.equal((await access(`${gateway}${suffix}`, token)).status, 404);
     }
 
@@ -1474,6 +1523,50 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
     );
 
     assert.ok(![first, rotated, gatewayKey].some((value) => JSON.stringify(rows).includes(value)));
+
+    const complete = {
+      authorization: "whole-map-upstream-key",
+      "cf-aig-authorization": "whole-map-gateway-key",
+    };
+
+    assert.equal(
+      (await adminClient.integrations.rotate(id, { source: "encrypted-store", values: complete }))
+        .credentialVersion,
+      3,
+    );
+
+    const replacements: Record<string, string>[] = [
+      { authorization: "parallel-upstream-key" },
+      { "cf-aig-authorization": "parallel-gateway-key" },
+    ];
+
+    const writes = await Promise.allSettled(
+      replacements.map((values) =>
+        adminClient.integrations.rotate(id, { source: "encrypted-store", values }),
+      ),
+    );
+
+    let successful = 0;
+
+    for (const [index, write] of writes.entries()) {
+      if (write.status === "fulfilled") {
+        Object.assign(complete, replacements[index]);
+        successful++;
+      } else {
+        assert.ok(write.reason instanceof CredentialBrokerError);
+        assert.equal(write.reason.code, "CONFLICT");
+      }
+    }
+
+    assert.ok(successful > 0);
+    assert.equal((await adminClient.integrations.get(id)).credentialVersion, 3 + successful);
+    const current = await access(`${gateway}/widgets/123`, token);
+    assert.equal(current.status, 200);
+    assert.equal(seen.at(-1)?.headers.get("authorization"), `Bearer ${complete.authorization}`);
+    assert.equal(
+      seen.at(-1)?.headers.get("cf-aig-authorization"),
+      `Bearer ${complete["cf-aig-authorization"]}`,
+    );
 
     const fixtureStream = await access(`${gateway}/stream`, token);
     assert.equal(fixtureStream.headers.get("content-type"), "text/event-stream");

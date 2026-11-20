@@ -71,7 +71,11 @@ export async function upstream(
 
   const responseHeaders =
     "values" in credential
-      ? endpointResponseHeaders(response.headers, credential.values)
+      ? endpointResponseHeaders(
+          response.headers,
+          target.integration.endpoint?.headers ?? [],
+          credential.values,
+        )
       : copyHeaders(response.headers, upstreamHeaders);
 
   responseHeaders.set("cache-control", "no-store");
@@ -160,6 +164,7 @@ export function endpointHeaders(
     if (
       name === "authorization" ||
       name === "x-api-key" ||
+      name.startsWith("cf-") ||
       reservedEndpointHeader(name) ||
       nominated.has(name) ||
       name.includes(grant) ||
@@ -193,18 +198,35 @@ const endpointResponseBlocked = new Set([
   "x-api-key",
 ]);
 
-function endpointResponseHeaders(incoming: Headers, values: Record<string, string>): Headers {
+export function endpointResponseHeaders(
+  incoming: Headers,
+  configured: readonly BrokerEndpointHeader[],
+  values: Record<string, string>,
+): Headers {
   const nominated = connectionHeaders(incoming);
-  const secrets = Object.values(values);
+
+  const secrets = configured.flatMap((header) => {
+    if (!("secret" in header)) return [];
+    const raw = values[header.name];
+
+    return [{ raw, injected: `${header.prefix ?? ""}${raw}` }];
+  });
+
   const headers = new Headers();
 
   for (const [name, value] of incoming) {
     if (
       reservedEndpointHeader(name) ||
+      name.startsWith("cf-") ||
       endpointResponseBlocked.has(name) ||
       nominated.has(name) ||
       Object.hasOwn(values, name) ||
-      secrets.some((secret) => value.includes(secret))
+      secrets.some(
+        ({ raw, injected }) =>
+          value === raw ||
+          (raw.length >= 8 && (value.includes(raw) || name.includes(raw))) ||
+          (injected !== raw && value.includes(injected)),
+      )
     )
       continue;
 

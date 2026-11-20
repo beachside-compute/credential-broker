@@ -9,7 +9,7 @@ import { z } from "zod";
 import { administrator } from "../auth";
 import { integrationId, parseConfig } from "../config";
 import { credentialInput } from "../credentials/source";
-import type { CredentialInput } from "../credentials/source";
+import type { CredentialInput, CredentialReference } from "../credentials/source";
 import {
   openEndpointValues,
   sealCredential,
@@ -85,7 +85,7 @@ adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async 
   const keyring = context.get("keyring");
   const endpoint = input.data.kind === "http" ? normalizeEndpoint(input.data.endpoint) : null;
   const revision = { identity, id, kind, endpoint: endpoint ?? null, credentialVersion: 1 };
-  let credential;
+  let credential: CredentialReference | undefined;
 
   if (input.data.kind === "http") {
     const values = normalizeEndpointValues(input.data.credential.values);
@@ -93,7 +93,7 @@ adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async 
     if (!endpoint || !values || !matchingEndpointValues(endpoint, values, "full"))
       return failure(400, "invalid_integration");
 
-    credential = await sealEndpointValues(values, revision, keyring);
+    credential = await sealEndpointValues(values, { ...revision, kind: "http", endpoint }, keyring);
   } else {
     credential = await prepareCredential(input.data.credential, revision, context.env, keyring);
   }
@@ -155,7 +155,7 @@ adminRoutes.put(
 
     const next = { ...revision, credentialVersion: revision.credentialVersion + 1 };
     const keyring = context.get("keyring");
-    let credential;
+    let credential: CredentialReference | undefined;
 
     if (revision.kind === "http") {
       const { endpoint, credential: previous } = revision;
@@ -164,15 +164,17 @@ adminRoutes.put(
       if (!endpoint || !values || !matchingEndpointValues(endpoint, values, "partial"))
         return failure(400, "invalid_credential");
 
+      const nextEndpoint = { ...next, kind: revision.kind, endpoint };
+
       if (matchingEndpointValues(endpoint, values, "full")) {
-        credential = await sealEndpointValues(values, next, keyring);
+        credential = await sealEndpointValues(values, nextEndpoint, keyring);
       } else {
         const current =
           previous.source === "encrypted-store" &&
           (await openEndpointValues(previous, revision, keyring));
 
         if (current)
-          credential = await sealEndpointValues({ ...current, ...values }, next, keyring);
+          credential = await sealEndpointValues({ ...current, ...values }, nextEndpoint, keyring);
       }
     } else {
       if ("values" in input.data) return failure(400, "invalid_credential");

@@ -11,8 +11,12 @@ export const maxEndpointHeaders = 8;
 
 export const endpointSecretValue = /^[\x21-\x7e](?:[\x20-\x7e]{0,4094}[\x21-\x7e])?$/;
 
+export const endpointSecretPrefix = /^[\x20-\x7e]{0,128}$/;
+
+export const endpointLiteralValue = /^[\x20-\x7e]{0,1024}$/;
+
 const blockedHeader =
-  /^(?:accept-encoding|baggage|cdn-loop|connection|content-length|cookie2?|expect|forwarded|host|keep-alive|set-cookie2?|te|trailer|transfer-encoding|upgrade|via|true-client-ip|traceparent|tracestate|x-real-ip|x-http-method(?:-override)?|x-method-override)$|^(?:proxy-|sec-|x-forwarded-|x-b3-|cf-(?!aig-))/i;
+  /^(?:accept-encoding|baggage|cdn-loop|connection|content-length|cookie2?|expect|forwarded|host|keep-alive|set-cookie2?|te|trailer|transfer-encoding|upgrade|via|grpc-trace-bin|sentry-trace|true-client-ip|traceparent|tracestate|x-client-ip|x-original-ip|x-original-url|x-rewrite-url|x-real-ip|x-http-method(?:-override)?|x-method-override)$|^(?:proxy-|sec-|x-forwarded-|x-b3-|x-datadog-|cf-(?!aig-))/i;
 
 const headerName = /^[!#$%&'*+.^_`|~\w-]{1,64}$/;
 
@@ -34,7 +38,7 @@ export function safeEndpointPath(path: string): boolean {
     return path.split("/").every((segment) => {
       const value = decodeURIComponent(segment);
 
-      return value !== "." && value !== ".." && !hasControl(value);
+      return !value.includes(";") && !/[.\s]$/.test(value) && !hasControl(value);
     });
   } catch {
     return false;
@@ -54,19 +58,25 @@ function hasControl(value: string): boolean {
 export function endpointBaseURL(value: string): string | undefined {
   const raw = value.match(/^https:\/\/([^/?#\\\s]+)(\/[^?#]*)?$/i);
 
-  if (!raw || value.length > 2048 || !safeEndpointPath(raw[2] ?? "")) return;
+  if (!raw || raw[1].includes("@") || value.length > 2048 || !safeEndpointPath(raw[2] ?? ""))
+    return;
+  let url: URL;
 
-  const url = URL.parse(value);
+  try {
+    url = new URL(value);
+  } catch {
+    return;
+  }
 
   if (
-    !url ||
-    raw[1].includes("@") ||
     !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/i.test(url.hostname) ||
     /\.(?:local|localhost|internal|test|invalid|example)$/i.test(url.hostname)
   )
     return;
 
-  return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+  const normalized = `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+
+  return normalized.length <= 2048 ? normalized : undefined;
 }
 
 /* oxlint-disable anti-slop/no-runtime-typeof -- Normalize endpoint configuration at the HTTP and CLI trust boundaries. */
@@ -94,13 +104,13 @@ export function normalizeEndpoint(input: unknown): BrokerEndpoint | undefined {
 
     if (header.secret === true && !("value" in header)) {
       if (header.prefix === undefined) headers.push({ name, secret: true });
-      else if (typeof header.prefix === "string" && /^[\x20-\x7e]{0,128}$/.test(header.prefix))
+      else if (typeof header.prefix === "string" && endpointSecretPrefix.test(header.prefix))
         headers.push({ name, secret: true, prefix: header.prefix });
       else return;
     } else if (
       !("secret" in header || "prefix" in header) &&
       typeof header.value === "string" &&
-      /^[\x20-\x7e]{0,1024}$/.test(header.value)
+      endpointLiteralValue.test(header.value)
     )
       headers.push({ name, value: header.value });
     else return;

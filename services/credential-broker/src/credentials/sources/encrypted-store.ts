@@ -1,6 +1,6 @@
 import { matchingEndpointValues, normalizeEndpointValues } from "../../../../../src/endpoint";
 import { z } from "zod";
-import type { IntegrationRevision } from "../../integrations/types";
+import type { HttpIntegrationRevision, IntegrationRevision } from "../../integrations/types";
 import { credentialValue } from "../source";
 import type { CredentialSource, EncryptedCredential } from "../source";
 
@@ -58,7 +58,7 @@ export async function sealCredential(
 
 export function sealEndpointValues(
   values: Record<string, string>,
-  integration: IntegrationRevision,
+  integration: HttpIntegrationRevision,
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
   return seal(JSON.stringify(values), integration, keyring);

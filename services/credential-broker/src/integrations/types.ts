@@ -14,6 +14,11 @@ export interface IntegrationRevision {
   endpoint?: BrokerEndpoint | null;
 }
 
+export interface HttpIntegrationRevision extends IntegrationRevision {
+  kind: "http";
+  endpoint: BrokerEndpoint;
+}
+
 export interface StoredIntegration extends IntegrationRevision {
   endpoint: BrokerEndpoint | null;
   enabled: boolean;
