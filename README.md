@@ -103,7 +103,13 @@ The root package exports `createCredentialBroker` and `createCredentialBrokerAdm
 
 For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/guides/credential-broker/).
 
-For a configurable HTTP integration, map its gateway URL and temporary grant to the environment variables your API client reads.
+`broker.sandbox()` builds the environment a sandbox needs. Pass integrations by ID and each one is set up from the kind the broker reports: a GitHub integration configures `git` and `gh`, and an Anthropic, OpenAI or OpenRouter integration sets `<PROVIDER>_BASE_URL` and `<PROVIDER>_API_KEY`.
+
+```ts
+const credentials = broker.sandbox({ integrations: ["github", "openrouter"], ttlSeconds: 3_600 });
+```
+
+A generic HTTP integration has no standard variables, so map its gateway URL and temporary grant to the names your API client reads.
 
 ```ts
 const credentials = broker.sandbox({
@@ -117,7 +123,7 @@ const credentials = broker.sandbox({
 });
 ```
 
-The broker reports each integration's kind with the grant, so the base URL always matches what the client should call. The shorthand properties (`openrouter: "openrouter"`, `openai`, `anthropic`) work with integrations created by setup as well as the built-in kinds.
+The broker reports each integration's kind with the grant, so the base URL always matches what the client should call. The shorthand properties (`github`, `anthropic`, `openai`, `openrouter`) still work when you want to choose the variables yourself, for example to use an HTTP integration as `OPENROUTER_*`.
 
 For OpenCode v2, set the provider’s `baseURL` to the broker endpoint and its `apiKey` to the temporary grant. `OPENCODE_CONFIG_CONTENT` takes the nested JSON shown in the [OpenCode configuration example](./services/credential-broker/README.md#opencode).
 

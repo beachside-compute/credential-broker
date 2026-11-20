@@ -86,6 +86,12 @@ export interface SandboxEndpoint {
 }
 
 export interface SandboxIntegrations {
+  /**
+   * Integrations whose variables follow their kind, as the broker reports it: GitHub sets up git
+   * and gh, Anthropic, OpenAI and OpenRouter set `<PROVIDER>_BASE_URL` and `<PROVIDER>_API_KEY`.
+   * A generic HTTP integration has no standard variables, so name them in `endpoints`.
+   */
+  integrations?: readonly string[];
   github?: string;
   anthropic?: string;
   openai?: string;
@@ -106,6 +112,20 @@ export interface SandboxGrant {
   /** Move expiry to `ttlSeconds` from now (up to 7 days) and return the new expiry. */
   renew(ttlSeconds: number, signal: AbortSignal, traceParent?: string): Promise<string>;
 }
+
+/** The variables a GitHub integration sets so git and gh reach the broker. */
+const gitVariables = [
+  "GH_HOST",
+  "GH_ENTERPRISE_TOKEN",
+  "GIT_CONFIG_COUNT",
+  "GIT_TERMINAL_PROMPT",
+  "GIT_CONFIG_KEY_0",
+  "GIT_CONFIG_VALUE_0",
+  "GIT_CONFIG_KEY_1",
+  "GIT_CONFIG_VALUE_1",
+  "GIT_CONFIG_KEY_2",
+  "GIT_CONFIG_VALUE_2",
+];
 
 const kindNames: readonly BrokerIntegrationKindName[] = [
   "github",
@@ -443,6 +463,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
   }
 
   function sandbox({
+    integrations: automatic = [],
     github,
     anthropic,
     openai,
@@ -451,7 +472,12 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     ttlSeconds,
     label,
   }: SandboxIntegrations) {
-    const integrations = [github, anthropic, openai, openrouter].filter((id) => id !== undefined);
+    if (!Array.isArray(automatic))
+      throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker grant request");
+
+    const integrations = [...automatic, github, anthropic, openai, openrouter].filter(
+      (id) => id !== undefined,
+    );
 
     if (
       !Array.isArray(endpoints) ||
@@ -465,19 +491,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     const variables = new Set<string>();
 
     if (github !== undefined) {
-      for (const name of [
-        "GH_HOST",
-        "GH_ENTERPRISE_TOKEN",
-        "GIT_CONFIG_COUNT",
-        "GIT_TERMINAL_PROMPT",
-        "GIT_CONFIG_KEY_0",
-        "GIT_CONFIG_VALUE_0",
-        "GIT_CONFIG_KEY_1",
-        "GIT_CONFIG_VALUE_1",
-        "GIT_CONFIG_KEY_2",
-        "GIT_CONFIG_VALUE_2",
-      ])
-        variables.add(name);
+      for (const name of gitVariables) variables.add(name);
     }
 
     for (const [id, prefix] of [
@@ -526,15 +540,63 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         const url = (id: string, fallback: BrokerIntegrationKindName) =>
           integrationBaseURL(base, id, grant.kinds?.[id] ?? fallback);
 
-        if (github !== undefined && grant.kinds && grant.kinds[github] !== "github") {
+        const refuse = async (message: string): Promise<never> => {
           await revoke(grant.id, { signal, traceParent }).catch(() => undefined);
-          throw new CredentialBrokerError(
-            "INVALID_ARGUMENT",
+          throw new CredentialBrokerError("INVALID_ARGUMENT", message);
+        };
+
+        if (github !== undefined && grant.kinds && grant.kinds[github] !== "github")
+          await refuse(
             `Integration ${github} is not a GitHub integration. Pass it in endpoints instead`,
           );
+
+        // Integrations passed by id take their variables from the kind the broker reports.
+        let gitHost = github;
+        const prefixes: [string, string, BrokerIntegrationKindName][] = [];
+
+        for (const id of automatic) {
+          const kind = grant.kinds?.[id];
+
+          if (!kind)
+            await refuse(
+              "This broker does not report integration kinds. Update it, or name each integration's variables in endpoints",
+            );
+
+          if (kind === "http")
+            await refuse(
+              `Integration ${id} is a generic HTTP integration with no standard variables. Name them in endpoints, such as { integration: "${id}", baseURLEnv: "MY_API_BASE_URL", apiKeyEnv: "MY_API_KEY" }`,
+            );
+
+          if (kind === "github") {
+            if (gitHost !== undefined)
+              await refuse(
+                `Only one GitHub integration can configure git in a sandbox; ${gitHost} and ${id} both do`,
+              );
+            gitHost = id;
+          } else if (kind) prefixes.push([id, kind.toUpperCase(), kind]);
         }
 
-        if (github !== undefined) {
+        for (const [id, prefix] of prefixes) {
+          for (const name of [`${prefix}_BASE_URL`, `${prefix}_API_KEY`]) {
+            if (
+              variables.has(name) ||
+              prefixes.some(([other, same]) => other !== id && same === prefix)
+            )
+              await refuse(
+                `Two integrations would set ${name}. Name one of them in endpoints with its own variables`,
+              );
+          }
+        }
+
+        for (const [id, prefix, kind] of prefixes) {
+          env[`${prefix}_BASE_URL`] = url(id, kind);
+          env[`${prefix}_API_KEY`] = grant.token;
+        }
+
+        if (gitHost !== undefined) {
+          const taken = gitVariables.find((name) => github === undefined && variables.has(name));
+
+          if (taken) await refuse(`An endpoint also sets ${taken}. Give it another variable name`);
           env.GH_HOST = base.host;
           env.GH_ENTERPRISE_TOKEN = grant.token;
           env.GIT_CONFIG_COUNT = "3";

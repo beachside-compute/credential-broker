@@ -460,6 +460,68 @@ test("refuses a GitHub shorthand that names a non-GitHub integration and revokes
   expect(methods).toEqual(["POST", "DELETE"]);
 });
 
+test("sets each integration passed by id up from its reported kind, and refuses ones it can't", async () => {
+  const methods: string[] = [];
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      methods.push(request.method);
+
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      const { integrations } = await request.json();
+
+      return Response.json(
+        {
+          id,
+          token,
+          expiresAt,
+          integrations,
+          kinds: {
+            claude: "anthropic",
+            router: "openrouter",
+            gh: "github",
+            api: "http",
+            gpt: "openai",
+            work: "openai",
+          },
+        },
+        { status: 201 },
+      );
+    },
+  });
+
+  const signal = new AbortController().signal;
+  const grant = await broker.sandbox({ integrations: ["claude", "router", "gh"] }).acquire(signal);
+
+  expect(grant.env).toMatchObject({
+    ANTHROPIC_BASE_URL: `${url}/gateway/claude`,
+    ANTHROPIC_API_KEY: token,
+    OPENROUTER_BASE_URL: `${url}/gateway/router/v1`,
+    OPENROUTER_API_KEY: token,
+    GH_ENTERPRISE_TOKEN: token,
+    GIT_CONFIG_COUNT: "3",
+  });
+  expect(methods).toEqual(["POST"]);
+
+  for (const [integrations, message] of [
+    [["api"], "Name them in endpoints"],
+    [["gpt", "work"], "Two integrations would set OPENAI_BASE_URL"],
+  ] as const) {
+    methods.length = 0;
+    await expect(broker.sandbox({ integrations }).acquire(signal)).rejects.toMatchObject({
+      code: "INVALID_ARGUMENT",
+      message: expect.stringContaining(message),
+    });
+    expect(methods).toEqual(["POST", "DELETE"]);
+  }
+
+  expect(() => broker.sandbox({ integrations: ["gh"], github: "gh" })).toThrow(
+    "Invalid broker grant request",
+  );
+});
+
 test("explains issuance refusals and accepts a loopback HTTP broker for local development", async () => {
   const broker = createCredentialBroker({
     url: "http://localhost:8787",
