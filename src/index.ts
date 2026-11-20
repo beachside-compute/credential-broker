@@ -46,6 +46,8 @@ export {
   type BrokerIntegrationCredential,
   type BrokerEndpointCredential,
   type BrokerIntegrationInput,
+  type BrokerDeploymentConfig,
+  type BrokerWorkflowPolicy,
 } from "./admin.js";
 
 export type { BrokerEndpoint, BrokerEndpointHeader } from "./endpoint.js";
@@ -210,6 +212,14 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
 
   if ("apiKey" in auth) requireApiKey(auth.apiKey);
 
+  function operationName(path: string, method: string): string {
+    if (path === "/v1/status") return "status";
+
+    if (path.endsWith("/renew")) return "grant renewal";
+
+    return method === "GET" ? "grant listing" : "this request";
+  }
+
   async function management(
     path: string,
     method: "GET" | "POST" | "DELETE",
@@ -234,16 +244,22 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     if (typeof token !== "string" || !bearerToken.test(token))
       throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker authentication");
 
-    const response = await fetchRequest(transport, new URL(path, base), {
-      method,
-      signal,
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(body && { "content-type": "application/json" }),
-        ...(traceParent && traceParentPattern.test(traceParent) && { traceparent: traceParent }),
+    // Issuing twice mints two grants, so a lost issuance has an unknown outcome.
+    const response = await fetchRequest(
+      transport,
+      new URL(path, base),
+      {
+        method,
+        signal,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body && { "content-type": "application/json" }),
+          ...(traceParent && traceParentPattern.test(traceParent) && { traceparent: traceParent }),
+        },
+        body,
       },
-      body,
-    });
+      method === "POST" && path === "/v1/grants",
+    );
 
     if (response.status === expected) return response;
 
@@ -254,7 +270,9 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         "INVALID_ARGUMENT",
         error === "multiple_github_integrations"
           ? "A grant can include at most one GitHub integration"
-          : "Credential broker rejected the grant request",
+          : path.endsWith("/renew")
+            ? "Credential broker rejected the renewal request"
+            : "Credential broker rejected the grant request",
       );
     }
 
@@ -282,12 +300,14 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     }
 
     if (response.status === 404) {
-      void response.body?.cancel().catch(() => undefined);
+      const { error } = await brokerFailure(response);
+
+      // A broker older than this client answers its unknown routes with 404 too.
       throw new CredentialBrokerError(
         "NOT_FOUND",
-        path === "/v1/status"
-          ? "This broker does not support status. Redeploy it from the latest credential-broker release"
-          : "The grant was not found. It may have expired, been revoked, or belong to another issuer",
+        error === "grant_not_found"
+          ? "The grant was not found. It may have expired, been revoked, or belong to another issuer"
+          : `This broker does not support ${operationName(path, method)}. Redeploy it from the latest credential-broker release`,
       );
     }
 
@@ -425,7 +445,10 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     });
   }
 
-  /** Move an active grant's expiry to `ttlSeconds` from now, up to 7 days. Returns the new expiry. */
+  /**
+   * Move an active grant's expiry to `ttlSeconds` from now, up to 7 days per renewal. Returns the
+   * grant's summary with its new `expiresAt`.
+   */
   async function renew(
     id: string,
     ttlSeconds: number,
@@ -542,7 +565,9 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
           integrationBaseURL(base, id, grant.kinds?.[id] ?? fallback);
 
         const refuse = async (message: string): Promise<never> => {
-          await revoke(grant.id, { signal, traceParent }).catch(() => undefined);
+          // The caller's signal may already be aborted. Revoke on the request's own time budget so
+          // the refused grant does not stay live until it expires.
+          await revoke(grant.id, { traceParent }).catch(() => undefined);
           throw new CredentialBrokerError("INVALID_ARGUMENT", message);
         };
 

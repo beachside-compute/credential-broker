@@ -5,51 +5,122 @@ import { loadDeploymentFile, setupError } from "./deployment-file";
 
 const root = resolve(import.meta.dir, "..");
 
+/** Options that take a value, so their value is never mistaken for the command. */
+const valueOptions = new Set(["--url", "--provider", "--ttl", "--label", "--worker-secret"]);
+
+/** The command words, skipping options and their values. */
+function commandWords(args: readonly string[]): string[] {
+  const words: string[] = [];
+
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+
+    if (valueOptions.has(argument)) index++;
+    else if (!argument.startsWith("-")) words.push(argument);
+  }
+
+  return words;
+}
+
+/** Take `--url <origin>` or `--url=<origin>` out of the arguments; the runner resolves the URL. */
+function takeURL(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+
+    if (argument === "--url") {
+      const value = args[index + 1];
+
+      if (!value || value.startsWith("--")) return setupError("Pass the broker origin after --url");
+      args.splice(index, 2);
+
+      return value;
+    }
+
+    if (argument.startsWith("--url=")) {
+      args.splice(index, 1);
+
+      return argument.slice("--url=".length);
+    }
+  }
+}
+
+async function packageVersion(): Promise<string> {
+  try {
+    const manifest: { version?: string } = await Bun.file(resolve(root, "package.json")).json();
+
+    return manifest.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 async function broker() {
   const args = process.argv.slice(2);
-  let selectedURL: string | undefined;
-
-  if (args[0] === "--url") {
-    selectedURL = args[1];
-
-    if (!selectedURL || selectedURL.startsWith("--"))
-      return setupError("Pass the broker HTTPS origin after --url");
-    args.splice(0, 2);
-  }
+  const selectedURL = takeURL(args);
+  const [group] = commandWords(args);
+  const help = args.includes("--help") || args.includes("-h") || !group;
+  const version = args.includes("--version");
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     BEACHSIDE_BROKER_CLI_PREFIX: "bun run broker",
+    BEACHSIDE_BROKER_CLI_VERSION: await packageVersion(),
   };
 
-  // Grant commands use the issuer key, except `grant list --all`, which reads every grant.
-  const grant =
-    args.find((argument) => !argument.startsWith("-")) === "grant" && !args.includes("--all");
+  const fromEnv = {
+    url: env.BEACHSIDE_BROKER_URL,
+    admin: env.BEACHSIDE_BROKER_ADMIN_KEY,
+    issuer: env.BEACHSIDE_BROKER_ISSUER_KEY,
+  };
 
-  const key = grant ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY";
-  const fileKey = grant ? "BROKER_ISSUER_KEY" : "BROKER_ADMIN_KEY";
-  delete env[grant ? "BEACHSIDE_BROKER_ADMIN_KEY" : "BEACHSIDE_BROKER_ISSUER_KEY"];
+  delete env.BEACHSIDE_BROKER_URL;
+  delete env.BEACHSIDE_BROKER_ADMIN_KEY;
+  delete env.BEACHSIDE_BROKER_ISSUER_KEY;
   delete env.BROKER_ADMIN_KEY;
   delete env.BROKER_ISSUER_KEY;
 
-  if (args.length && !args.includes("--help") && !args.includes("-h")) {
-    if (selectedURL || !env.BEACHSIDE_BROKER_URL || !env[key]) {
-      const file = loadDeploymentFile(resolve(root, ".env.deploy"));
-      env[key] = file?.[fileKey] ?? (selectedURL ? env[key] : undefined);
-      env.BEACHSIDE_BROKER_URL = selectedURL ?? file?.BEACHSIDE_BROKER_URL;
-    }
+  if (!help && !version) {
+    const file = loadDeploymentFile(resolve(root, ".env.deploy"));
+    const admin = file?.BROKER_ADMIN_KEY ?? fromEnv.admin;
+    const issuer = file?.BROKER_ISSUER_KEY ?? fromEnv.issuer;
 
-    if (!env.BEACHSIDE_BROKER_URL || !env[key])
+    // Grant commands use the issuer key, except `grant list --all`, which reads every grant.
+    // `status` reports whichever key is available, preferring the admin key.
+    const role =
+      group === "grant" && !args.includes("--all")
+        ? "issuer"
+        : group === "status" && !admin && issuer
+          ? "issuer"
+          : "admin";
+
+    const key = role === "issuer" ? issuer : admin;
+
+    const keyFromFile =
+      (role === "issuer" ? file?.BROKER_ISSUER_KEY : file?.BROKER_ADMIN_KEY) !== undefined;
+
+    // .env.deploy takes precedence for the values it sets. A key from the file is only sent to the
+    // file's URL or an explicit --url, never to a URL that happens to be in the environment.
+    const url =
+      selectedURL ?? file?.BEACHSIDE_BROKER_URL ?? (keyFromFile ? undefined : fromEnv.url);
+
+    if (!url || !key)
       return setupError(
-        `Run bun run broker --url https://your-broker.example.com <command> with your ${grant ? "issuer" : "admin"} key in .env.deploy or the environment`,
+        keyFromFile && fromEnv.url && !url
+          ? "The key in .env.deploy is only sent to the BEACHSIDE_BROKER_URL in that file. Add it there, or pass --url"
+          : `Run bun run broker --url https://your-broker.example.com <command> with your ${role} key in .env.deploy or the environment`,
       );
-  } else {
-    delete env[key];
+
+    env.BEACHSIDE_BROKER_URL = url;
+    env[role === "issuer" ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY"] = key;
   }
 
   const node = Bun.which("node");
 
-  if (!node) return setupError("Install Node.js 22 or later to run the broker management CLI");
+  if (!node)
+    throw new CredentialBrokerError(
+      "UNAVAILABLE",
+      "Install Node.js 22 or later to run the broker management CLI",
+    );
   const cache = resolve(root, ".cache");
   mkdirSync(cache, { recursive: true });
   const directory = mkdtempSync(resolve(cache, "broker-cli-"));
@@ -64,7 +135,8 @@ async function broker() {
       outdir: directory,
     });
 
-    if (!build.success) return setupError("Could not build the broker management CLI");
+    if (!build.success)
+      throw new CredentialBrokerError("UNAVAILABLE", "Could not build the broker management CLI");
 
     const child = Bun.spawn([node, resolve(directory, "broker.mjs"), ...args], {
       env,
@@ -82,10 +154,8 @@ async function broker() {
 try {
   process.exitCode = await broker();
 } catch (error) {
-  console.error(
-    error instanceof CredentialBrokerError
-      ? error.message
-      : "Could not start the broker management CLI",
-  );
-  process.exitCode = 1;
+  const known = error instanceof CredentialBrokerError;
+  console.error(known ? error.message : "Could not start the broker management CLI");
+  // Usage and setup errors exit 2, like the CLI's own; anything else is 1.
+  process.exitCode = known && error.code === "INVALID_ARGUMENT" ? 2 : 1;
 }

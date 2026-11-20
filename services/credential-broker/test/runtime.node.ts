@@ -2140,3 +2140,74 @@ test("explains refused issuance, lists and renews grants, and reports status by 
 
   await adminClient.integrations.delete("parked");
 });
+
+test("scopes GitHub Actions grant listing and renewal to the issuing run, and counts what is issuable", async () => {
+  const url = "https://broker.test";
+  const authority = await githubToken();
+  const otherRun = await githubToken({ run_id: "302" });
+
+  const outside = await issue(["openai"], authority);
+  assert.equal(outside.status, 403);
+  assert.deepEqual(await outside.json(), {
+    error: "integration_forbidden",
+    reason: "not_in_policy",
+    integrations: ["openai"],
+  });
+
+  const status = await access("/v1/status", authority);
+  assert.equal(status.status, 200);
+  assert.equal(z.object({ role: z.string() }).parse(await status.json()).role, "github-actions");
+
+  const record = await grant(["github"], authority);
+
+  const listed = async (token: string) => {
+    const response = await access("/v1/grants", token);
+    assert.equal(response.status, 200);
+
+    const { grants } = z
+      .object({ grants: z.array(z.object({ id: z.string() })) })
+      .parse(await response.json());
+
+    return grants.map(({ id }) => id);
+  };
+
+  assert.ok((await listed(authority)).includes(record.id));
+  assert.ok(!(await listed(otherRun)).includes(record.id));
+  assert.ok(!(await listed(apiKey)).includes(record.id));
+
+  const renew = (token: string) =>
+    runtime.dispatchFetch(`${url}/v1/grants/${record.id}/renew`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ ttlSeconds: 120 }),
+    });
+
+  const foreign = await renew(otherRun);
+  assert.equal(foreign.status, 404);
+  assert.deepEqual(await foreign.json(), { error: "grant_not_found" });
+  const foreignIssuer = await renew(apiKey);
+  assert.equal(foreignIssuer.status, 404);
+  await foreignIssuer.text();
+  const own = await renew(authority);
+  assert.equal(own.status, 200);
+  await own.text();
+
+  const adminClient = createCredentialBrokerAdmin({ url, apiKey: adminKey, fetch: relayRequest });
+  const before = (await adminClient.status()).counts!;
+  const extra = await grant(["openai"]);
+  assert.equal((await adminClient.status()).counts!.activeGrants, before.activeGrants + 1);
+
+  await adminClient.integrations.setEnabled("anthropic", false);
+  const disabled = (await adminClient.status()).counts!;
+  assert.equal(disabled.issuable, before.issuable - 1);
+  assert.equal(disabled.integrations, before.integrations);
+  await adminClient.integrations.setEnabled("anthropic", true);
+  assert.equal((await adminClient.status()).counts!.issuable, before.issuable);
+
+  await adminClient.issuerPermissions.deny("anthropic");
+  assert.equal((await adminClient.status()).counts!.issuable, before.issuable - 1);
+  await adminClient.issuerPermissions.allow("anthropic");
+
+  assert.equal((await access(`/v1/grants/${record.id}`, authority, "DELETE")).status, 204);
+  assert.equal((await access(`/v1/grants/${extra.id}`, apiKey, "DELETE")).status, 204);
+});

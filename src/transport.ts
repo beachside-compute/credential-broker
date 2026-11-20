@@ -59,11 +59,13 @@ export function refusalMessage(reason: IssuanceRefusal, ids: readonly string[]):
 
   switch (reason) {
     case "not_found":
-      return `No integration named ${names} exists on this broker. List them with \`${hint("integration list")}\``;
+      return `No integration${plural ? "s" : ""} named ${names} ${plural ? "exist" : "exists"} on this broker. List them with \`${hint("integration list")}\``;
     case "disabled":
-      return `Integration ${names} ${plural ? "are" : "is"} disabled. Enable ${plural ? "them" : "it"} with \`${hint(`integration enable ${ids[0]}`)}\``;
+      return plural
+        ? `Integrations ${names} are disabled. Enable each with ${ids.map((id) => `\`${hint(`integration enable ${id}`)}\``).join(", ")}`
+        : `Integration ${names} is disabled. Enable it with \`${hint(`integration enable ${names}`)}\``;
     case "not_allowlisted":
-      return `Integration ${names} ${plural ? "are" : "is"} not allowed to issue grants. Allow ${plural ? "them" : "it"} with \`${hint(`issuer allow ${ids.join(" ")}`)}\``;
+      return `Integration${plural ? "s" : ""} ${names} ${plural ? "are" : "is"} not allowed to issue grants. Allow ${plural ? "them" : "it"} with \`${hint(`issuer allow ${ids.join(" ")}`)}\``;
     case "not_in_policy":
       return `This GitHub Actions workflow's broker policy does not include ${names}. Add ${plural ? "them" : "it"} to the workflow's integrations in BROKER_CONFIG and redeploy`;
   }
@@ -172,7 +174,10 @@ export function brokerOrigin(input: string): URL {
   const base = brokerURL(input);
 
   if (base.pathname !== "/" || base.search)
-    throw new CredentialBrokerError("INVALID_ARGUMENT", "Use the credential broker HTTPS origin");
+    throw new CredentialBrokerError(
+      "INVALID_ARGUMENT",
+      "Use the credential broker origin: HTTPS, or HTTP to localhost, 127.0.0.1 or [::1]",
+    );
 
   return base;
 }
@@ -193,10 +198,15 @@ export async function jsonRecord(response: Response) {
   throw new CredentialBrokerError("INVALID_RESPONSE", "Credential endpoint returned invalid JSON");
 }
 
+/**
+ * Send one request. A transport failure is retryable (`UNAVAILABLE`), except for a write that is
+ * not safe to repeat: the broker may have applied it, so its outcome is unknown (`TIMEOUT`).
+ */
 export async function fetchRequest(
   transport: Fetch,
   url: URL,
   init: RequestInit & { signal: AbortSignal },
+  unsafeWrite = false,
 ): Promise<Response> {
   try {
     return await waitForSignal(init.signal, () =>
@@ -205,6 +215,12 @@ export async function fetchRequest(
   } catch {
     if (init.signal.aborted)
       throw new CredentialBrokerError("WAIT_ABORTED", "Credential request was cancelled");
+
+    if (unsafeWrite)
+      throw new CredentialBrokerError(
+        "TIMEOUT",
+        "The connection to the credential endpoint failed, so the request may have been applied. Check before retrying",
+      );
 
     throw new CredentialBrokerError("UNAVAILABLE", "Credential endpoint is unavailable");
   }

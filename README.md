@@ -99,9 +99,9 @@ Commands print text for people and JSON with `--json`. Errors name the fix, for 
 
 ![A sandbox calls the broker with a temporary grant. The broker swaps it for the upstream key, calls OpenRouter, and relays the response to the sandbox.](./docs/images/credential-broker-flow.png)
 
-The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds, label })`, `broker.renew(grant.id, ttlSeconds)`, `broker.list()` and `broker.revoke(grant.id)` from a trusted host. Grants last up to 7 days. `@beachside/credential-client/cli` exports `runBrokerCli` for tools that embed the commands. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. If a grant issuance response is lost, an issued grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
+The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds, label })`, `broker.renew(grant.id, ttlSeconds)`, `broker.list()` and `broker.revoke(grant.id)` from a trusted host. Each grant lasts up to 7 days from its issuance or latest renewal, and renewal has no overall cap. `@beachside/credential-client/cli` exports `runBrokerCli` for tools that embed the commands. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. A lost grant issuance, from a timeout or a dropped connection, fails with `TIMEOUT` (exit code 6, outcome unknown) because the grant may exist: check `broker.list()` before retrying. Such a grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
 
-For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/guides/credential-broker/).
+For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/credential-broker/).
 
 `broker.sandbox()` builds the environment a sandbox needs. Pass integrations by ID and each one is set up from the kind the broker reports:
 
@@ -113,6 +113,11 @@ For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, a
 
 ```ts
 const credentials = broker.sandbox({ integrations: ["github", "openrouter"], ttlSeconds: 3_600 });
+const grant = await credentials.acquire(AbortSignal.timeout(10_000));
+
+// grant.env holds GH_HOST, GIT_CONFIG_*, OPENROUTER_BASE_URL and OPENROUTER_API_KEY.
+// Pass it to the sandbox's environment, then revoke it when the sandbox is gone.
+await grant.revoke(AbortSignal.timeout(10_000));
 ```
 
 To pick other names, map the integration's gateway URL and temporary grant to the variables your API client reads.

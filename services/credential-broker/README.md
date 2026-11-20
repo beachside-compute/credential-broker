@@ -30,7 +30,7 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 
 ### Configure deployment bindings
 
-For manual setup, use the [deployment template](../../.env.deploy.example) and give the resulting `.env.deploy` file mode `0600`. You can also supply the settings through exported environment variables. The file takes precedence for values it sets. The runtime `.dev.vars` file is for local development.
+For manual setup, use the [deployment template](../../.env.deploy.example) and give the resulting `.env.deploy` file mode `0600`. You can also supply the settings through exported environment variables. The file takes precedence for values it sets. `bun run broker` sends a key from the file only to the file's `BEACHSIDE_BROKER_URL` or an explicit `--url`, never to a URL that only the environment sets. The runtime `.dev.vars` file is for local development.
 
 | Variable                                                      | Value                                                                                                                                      |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -96,8 +96,12 @@ bun run dev
 Wrangler runs the Worker and SQLite Durable Object locally. The client and CLI accept plain HTTP for `localhost`, `127.0.0.1` and `[::1]`, so point them at the local URL with your fixture keys.
 
 ```sh
-BEACHSIDE_BROKER_URL=http://localhost:8787 BEACHSIDE_BROKER_ADMIN_KEY=LOCAL_ADMIN_KEY bun run broker status
+BEACHSIDE_BROKER_URL=http://localhost:8787 \
+BEACHSIDE_BROKER_ADMIN_KEY="$(sed -n 's/^BROKER_ADMIN_KEY=//p' services/credential-broker/.dev.vars)" \
+  bun run broker status
 ```
+
+Keys in `.env.deploy` take precedence, so run this from a checkout without deployment keys, or use the installed `beachside-broker` command, which reads only the environment.
 
 ## Manage integrations
 
@@ -132,7 +136,7 @@ bun run broker grant revoke GRANT_ID
 
 Use the base URL for each integration as the client's API base and the token as its API key. The broker reports each integration's kind, so the URL already maps to the upstream base for built-in and configurable integrations. Grants default to 15 minutes. `--ttl` takes seconds or a number with `s`, `m`, `h` or `d`, up to `7d`. `--token` prints only the token and `--json` the full record. Keep the output private.
 
-`grant list` shows the issuer's active grants with label, expiry, request count and last use. `grant list --all` uses the admin key to show every grant and its issuing authority. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
+`grant list` shows the issuer's active grants with their integrations, label, expiry, request count and last use. `grant list --all` uses the admin key to show every grant and its issuing authority. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
 
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 
@@ -235,7 +239,7 @@ GitHub Actions jobs must match both the administrator's current allowlist and an
 }
 ```
 
-Give the trusted orchestration job `id-token: write` and request a token for the configured audience. Pick an audience unique to the deployment. The [credential client](../../README.md) can request the token from the runner. The broker verifies GitHub's signature, issuer, exact audience, expiry, token age, repository and owner IDs, repository name, workflow path and ref, and event. A matching workflow can revoke grants issued within its repository workflow run.
+Give the trusted orchestration job `id-token: write` and request a token for the configured audience. Pick an audience unique to the deployment. The [credential client](../../README.md) can request the token from the runner. The broker verifies GitHub's signature, issuer, exact audience, expiry, token age, repository and owner IDs, repository name, workflow path and ref, and event. A matching workflow can list, renew and revoke the grants issued within its own workflow run. A later run, even of the same workflow, cannot renew them, so use a static issuer key for a grant that must outlive the run, such as an always-on sandbox.
 
 Supported events are `push`, `schedule`, `workflow_dispatch`, `workflow_run`, and `pull_request_target`. For a reusable workflow, configure the called workflow's exact `jobWorkflowRef`. For a direct job, omit it. The broker accepts an absent `job_workflow_ref` or one that matches `workflowRef`. Trust refs controlled by your operators. For `pull_request_target` and `workflow_run`, keep PR-controlled code, actions, scripts, and artifacts out of the orchestration job. Run untrusted work inside the sandbox after issuing its limited grant.
 
@@ -249,7 +253,7 @@ Supported events are `push`, `schedule`, `workflow_dispatch`, `workflow_run`, an
 | `GET /v1/grants`            | Returns `{ "grants": [...] }`: the caller's active grants with `id`, `integrations`, `label`, `createdAt`, `expiresAt`, `requests` and `lastUsedAt`. Tokens are never listed.                                                                                                                                                                                                                                   |
 | `GET /v1/status`            | With the admin, issuer or a workflow token. Returns `apiVersion`, `role`, `limits.maxGrantTtlSeconds`, and for the admin key integration and grant counts.                                                                                                                                                                                                                                                      |
 
-Grants last between 1 second and 7 days (604,800 seconds). An issuer can renew its own active grant to a new lifetime of up to 7 days from the renewal, keeping its token and scope. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
+Grants last between 1 second and 7 days (604,800 seconds). An issuer can renew its own active grant to a new lifetime of up to 7 days from the renewal, keeping its token and scope. There is no overall cap: each renewal can add up to another 7 days, so a grant renewed weekly lives until it is revoked. The 7-day limit bounds how long a forgotten grant stays live, not a grant's total lifetime. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
 
 By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Each grant allows 120 requests per UTC minute and eight concurrent gateway requests, including streams. A lost lease release can occupy a slot until expiry. A request over a bound receives HTTP `429`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
 
@@ -287,7 +291,7 @@ Use the corresponding environment variables for Anthropic or OpenRouter. In Open
 
 ## Observability and trust
 
-Set `BROKER_OTLP_TRACES_ENDPOINT` to a trusted HTTPS OTLP/HTTP traces endpoint, such as `https://collector.example.com/v1/traces`, to export safe broker spans. If the collector needs authentication, supply the complete Authorization value in `BROKER_OTLP_AUTHORIZATION` as a Worker secret. Admin and issuer requests can propagate trusted W3C trace context. Admin spans use static operation names and status codes. Authorized gateway requests link to the issuing trace when available. The broker discards guest trace context and does not propagate broker trace headers to upstreams. Telemetry delivery is best effort. The deployment disables automatic invocation logging and native HTTP tracing to keep caller-supplied paths, query strings, and payloads out of telemetry.
+Set `BROKER_OTLP_TRACES_ENDPOINT` to a trusted HTTPS OTLP/HTTP traces endpoint, such as `https://collector.example.com/v1/traces`, to export safe broker spans. If the collector needs authentication, supply the complete Authorization value in `BROKER_OTLP_AUTHORIZATION` as a Worker secret. Admin and issuer requests can propagate trusted W3C trace context. Issuance, renewal, listing, revocation and status each have a span. Admin spans use static operation names and status codes. Authorized gateway requests link to the issuing trace when available. The broker discards guest trace context and does not propagate broker trace headers to upstreams. Telemetry delivery is best effort. The deployment disables automatic invocation logging and native HTTP tracing to keep caller-supplied paths, query strings, and payloads out of telemetry.
 
 Any sandbox workload or provider infrastructure able to read a grant can use it until expiry or revocation. Grants are bearer credentials scoped to integrations and are not bound to an IP address, sandbox identity, or private network. Keep them out of logs, artifacts, environment dumps, and persistent sandbox files. The registry stores token digests, expiry, grant scope, optional trace correlation, credential envelopes, and Worker-secret references. Root encryption keys and role keys are Worker secret bindings. The Worker uses resolved upstream credentials only at the fixed provider endpoints. This deployment trusts its operators, Cloudflare, and the upstream providers.
 

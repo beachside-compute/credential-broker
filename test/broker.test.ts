@@ -39,7 +39,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
     symlinkSync(join(project, "node_modules"), join(root, "node_modules"));
     writeFileSync(
       join(root, "package.json"),
-      JSON.stringify({ scripts: { broker: "bun scripts/broker.ts" } }),
+      JSON.stringify({ version: "9.9.9-test", scripts: { broker: "bun scripts/broker.ts" } }),
     );
     const secretFile = join(root, ".env.deploy");
     const settings = `BROKER_ADMIN_KEY=${adminKey}\n`;
@@ -87,6 +87,19 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
 
     const requests: { path: string; authorization: string | null }[] = [];
     const grantRequests: object[] = [];
+    const renewRequests: object[] = [];
+
+    const summary = {
+      id: grant.id,
+      integrations: ["openrouter"],
+      label: "box web",
+      createdAt: "2026-11-20T00:00:00.000Z",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      requests: 3,
+      lastUsedAt: null,
+    };
+
+    const limits = { maxGrantTtlSeconds: 604_800 };
 
     const server = Bun.serve({
       hostname: "127.0.0.1",
@@ -97,11 +110,30 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
         const authorization = request.headers.get("authorization");
         requests.push({ path, authorization });
 
+        if (path === "/v1/status")
+          return authorization === `Bearer ${adminKey}`
+            ? Response.json({
+                apiVersion: 2,
+                role: "admin",
+                limits,
+                counts: { integrations: 1, issuable: 1, activeGrants: 1 },
+              })
+            : Response.json({ apiVersion: 2, role: "issuer", limits });
+
         if (path.startsWith("/v1/grants")) {
           expect(authorization).toBe(`Bearer ${issuerKey}`);
 
           if (request.method === "DELETE" && path === `/v1/grants/${grant.id}`)
             return new Response(null, { status: 204 });
+
+          if (request.method === "GET" && path === "/v1/grants")
+            return Response.json({ grants: [summary] });
+
+          if (request.method === "POST" && path === `/v1/grants/${grant.id}/renew`) {
+            renewRequests.push(await request.json());
+
+            return Response.json(summary);
+          }
 
           expect(path).toBe("/v1/grants");
           expect(request.method).toBe("POST");
@@ -114,6 +146,22 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
 
         if (request.method === "PUT" && path === "/v1/admin/issuer-permissions/openrouter")
           return Response.json({ integrations: ["openrouter"] });
+
+        if (request.method === "DELETE" && path === "/v1/admin/issuer-permissions/openrouter")
+          return Response.json({ integrations: [] });
+
+        if (path === "/v1/admin/grants")
+          return Response.json({ grants: [{ ...summary, owner: "broker-api-key" }] });
+
+        if (path === "/v1/admin/config")
+          return Response.json({
+            githubActions: {
+              audience: "beachside-broker",
+              workflows: [{ repository: "acme/app" }],
+            },
+            workerSecretBindings: 0,
+            issuerKey: true,
+          });
 
         if (request.method === "POST") {
           expect(await request.json()).toEqual({
@@ -156,9 +204,17 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
         return { status, stdout, stderr };
       };
 
+      // --version needs neither a URL nor a key, and reports the checkout's version.
+      for (const version of [["--version"], ["--version", "--json"]]) {
+        const printed = await run(version);
+        expect(printed.status, printed.stderr).toBe(0);
+        expect(printed.stdout).toContain("9.9.9-test");
+      }
+
       const list = ["integration", "list", "--json"];
+      // A key from .env.deploy is never sent to a URL that only the environment names.
       const unpaired = await run(list, { BEACHSIDE_BROKER_URL: origin });
-      expect(unpaired.status).toBe(1);
+      expect(unpaired.status).toBe(2);
       expect(unpaired.stderr).toContain("--url");
       expect(requests).toEqual([]);
       const explicit = await run(["--url", origin, ...list]);
@@ -250,7 +306,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       const issue = ["grant", "issue", "openrouter"];
       const beforeGrants = requests.length;
       const missingIssuer = await run(issue, { BEACHSIDE_BROKER_ADMIN_KEY: adminKey });
-      expect(missingIssuer.status).toBe(1);
+      expect(missingIssuer.status).toBe(2);
       expect(missingIssuer.stderr).toContain("issuer key");
       expect(requests).toHaveLength(beforeGrants);
       writeFileSync(
@@ -286,6 +342,35 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
         path: `/v1/grants/${grant.id}`,
         authorization: `Bearer ${issuerKey}`,
       });
+
+      // Option values are never mistaken for the command: this is a grant command.
+      const listed = await run(["--json", "--url", origin, "grant", "list"]);
+      expect(listed.status, listed.stderr).toBe(0);
+      expect(JSON.parse(listed.stdout)).toEqual({ grants: [summary] });
+      const listedText = await run(["grant", "list"]);
+      expect(listedText.stdout).toContain("LAST USED");
+      expect(listedText.stdout).toContain("never");
+      const all = await run(["grant", "list", "--all", "--json"]);
+      expect(all.status, all.stderr).toBe(0);
+      expect(JSON.parse(all.stdout)).toEqual({ grants: [{ ...summary, owner: "broker-api-key" }] });
+      expect(requests.at(-1)).toEqual({
+        path: "/v1/admin/grants",
+        authorization: `Bearer ${adminKey}`,
+      });
+      const renewed = await run(["grant", "renew", grant.id, "--ttl", "7d", "--json"]);
+      expect(renewed.status, renewed.stderr).toBe(0);
+      expect(renewRequests).toEqual([{ ttlSeconds: 604_800 }]);
+      const status = await run(["status", "--json"]);
+      expect(status.status, status.stderr).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({ role: "admin" });
+      const config = await run(["config", "show"]);
+      expect(config.status, config.stderr).toBe(0);
+      expect(config.stdout).toContain("audience beachside-broker");
+      expect(config.stdout).toContain("- (-): -");
+      const allowed = await run(["issuer", "allow", "openrouter", "--json"]);
+      expect(JSON.parse(allowed.stdout)).toEqual({ integrations: ["openrouter"] });
+      const denied = await run(["issuer", "deny", "openrouter", "--json"]);
+      expect(JSON.parse(denied.stdout)).toEqual({ integrations: [] });
       const beforeInvalid = requests.length;
 
       for (const ttl of ["0", "604801", "8d", "5.5", "1e3"]) {
@@ -296,9 +381,14 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
 
       writeFileSync(secretFile, `BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`);
       const missingAdmin = await run(list, { BEACHSIDE_BROKER_ISSUER_KEY: issuerKey });
-      expect(missingAdmin.status).toBe(1);
+      expect(missingAdmin.status).toBe(2);
       expect(missingAdmin.stderr).toContain("admin key");
       expect(requests).toHaveLength(beforeInvalid);
+      // With only an issuer key, status reports the issuer role instead of asking for the admin key.
+      const issuerStatus = await run(["status", "--json"]);
+      expect(issuerStatus.status, issuerStatus.stderr).toBe(0);
+      expect(JSON.parse(issuerStatus.stdout)).toMatchObject({ role: "issuer" });
+      expect(requests.at(-1)).toEqual({ path: "/v1/status", authorization: `Bearer ${issuerKey}` });
 
       expect(readdirSync(join(root, ".cache"))).toEqual([]);
     } finally {

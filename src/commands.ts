@@ -8,6 +8,7 @@ import {
   type BrokerIntegrationCredential,
   type BrokerIntegrationKind,
   type BrokerIntegrationInput,
+  type BrokerWorkflowPolicy,
 } from "./admin.js";
 import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
 import type { BrokerGrantSummary } from "./grants.js";
@@ -76,7 +77,7 @@ Grants (issuer key; --all uses the admin key)
   grant revoke <grant-id>
 
 Options
-  --url <origin>   Broker HTTPS origin (default BEACHSIDE_BROKER_URL)
+  --url <origin>   Broker origin: HTTPS, or HTTP to localhost (default BEACHSIDE_BROKER_URL)
   --json           Print JSON instead of text
   --version        Print the client version
 
@@ -135,6 +136,17 @@ function until(iso: string, now = Date.now()): string {
   if (hours) return `in ${hours}h${minutes ? ` ${minutes}m` : ""}`;
 
   return minutes ? `in ${minutes}m` : `in ${left}s`;
+}
+
+function since(iso: string | null, now = Date.now()): string {
+  if (!iso) return "never";
+  const elapsed = Math.max(0, Math.round((now - Date.parse(iso)) / 1_000));
+
+  if (elapsed >= 86_400) return `${Math.floor(elapsed / 86_400)}d ago`;
+
+  if (elapsed >= 3_600) return `${Math.floor(elapsed / 3_600)}h ago`;
+
+  return elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ago` : `${elapsed}s ago`;
 }
 
 function table(rows: readonly (readonly string[])[]): string {
@@ -323,7 +335,10 @@ function flagsFor(command: string): readonly string[] | undefined {
   for (const [name, flags] of Object.entries(allowedFlags)) if (name === command) return flags;
 }
 
-function clientVersion(): string {
+function clientVersion(env: CliIo["env"]): string {
+  // The checkout runner bundles this file away from its manifest and passes the version instead.
+  if (env.BEACHSIDE_BROKER_CLI_VERSION) return env.BEACHSIDE_BROKER_CLI_VERSION;
+
   try {
     const manifest: unknown = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
@@ -391,16 +406,70 @@ function grantLines(grants: readonly BrokerGrantSummary[], withOwner: boolean): 
   if (!grants.length) return "No active grants.";
 
   return table([
-    ["ID", "INTEGRATIONS", "LABEL", "EXPIRES", "REQUESTS", ...(withOwner ? ["ISSUER"] : [])],
+    [
+      "ID",
+      "INTEGRATIONS",
+      "LABEL",
+      "EXPIRES",
+      "REQUESTS",
+      "LAST USED",
+      ...(withOwner ? ["ISSUER"] : []),
+    ],
     ...grants.map((grant) => [
       grant.id,
       grant.integrations.join(",") || "-",
       grant.label ?? "-",
       until(grant.expiresAt),
       String(grant.requests),
+      since(grant.lastUsedAt),
       ...(withOwner ? [grant.owner ?? "-"] : []),
     ]),
   ]);
+}
+
+function policyText(value: BrokerWorkflowPolicy[string]): string {
+  if (typeof value === "string" && value) return value;
+
+  if (Array.isArray(value) && value.length) return value.join(", ");
+
+  return "-";
+}
+
+/**
+ * A broker that reports kinds must report one for every integration in the grant. Only a broker
+ * that reports none (before API v2) falls back to generic HTTP.
+ */
+function grantKind(
+  kinds: Readonly<Record<string, BrokerIntegrationKind>> | undefined,
+  id: string,
+): BrokerIntegrationKind {
+  if (!kinds) return "http";
+  const kind = kinds[id];
+
+  if (!kind)
+    throw new CredentialBrokerError(
+      "INVALID_RESPONSE",
+      `Credential broker did not report the kind of ${id}`,
+    );
+
+  return kind;
+}
+
+/** Allow a just-created integration, saying how to finish if that second step fails. */
+async function allowCreated(
+  admin: ReturnType<typeof createCredentialBrokerAdmin>,
+  id: string,
+): Promise<{ integrations: string[] }> {
+  try {
+    return await admin.issuerPermissions.allow(id);
+  } catch (error) {
+    if (!(error instanceof CredentialBrokerError)) throw error;
+
+    throw new CredentialBrokerError(
+      error.code,
+      `Created integration ${id}, but could not allow grants for it: ${error.message}. Finish with \`${hint(`issuer allow ${id}`)}\``,
+    );
+  }
 }
 
 /**
@@ -417,7 +486,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
     json = Boolean(values.json);
 
     if (values.version) {
-      io.stdout(json ? JSON.stringify({ version: clientVersion() }) : clientVersion());
+      io.stdout(json ? JSON.stringify({ version: clientVersion(io.env) }) : clientVersion(io.env));
 
       return 0;
     }
@@ -450,7 +519,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
     if (!url)
       return usageError(
-        "Set BEACHSIDE_BROKER_URL to the broker's HTTPS origin, or pass --url https://your-broker.example.com",
+        "Set BEACHSIDE_BROKER_URL to the broker's origin, or pass --url https://your-broker.example.com (plain HTTP works for localhost)",
       );
 
     const base = brokerOrigin(url);
@@ -495,7 +564,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
             `max ttl   ${formatDuration(status.limits.maxGrantTtlSeconds)}`,
             ...(status.counts
               ? [
-                  `integrations  ${status.counts.integrations} (${status.counts.issuable} allowed to issue)`,
+                  `integrations  ${status.counts.integrations} (${status.counts.issuable} enabled and allowed to issue)`,
                   `active grants ${status.counts.activeGrants}`,
                 ]
               : []),
@@ -518,7 +587,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
             `github actions        ${config.githubActions ? `audience ${config.githubActions.audience}` : "not configured"}`,
             ...workflows.map(
               (workflow) =>
-                `  ${String(workflow.workflowRef)} (${String(workflow.event)}): ${[workflow.integrations].flat().join(", ")}`,
+                `  ${policyText(workflow.workflowRef)} (${policyText(workflow.event)}): ${policyText(workflow.integrations)}`,
             ),
           ].join("\n"),
         );
@@ -534,7 +603,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
         const allowedNow = values["no-allow-issue"]
           ? undefined
-          : await admin.issuerPermissions.allow(created.id);
+          : await allowCreated(admin, created.id);
 
         if (json) {
           io.stdout(JSON.stringify({ ...created, issuable: Boolean(allowedNow) }));
@@ -595,7 +664,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
         const created = await admin.integrations.create(input);
 
         const issuable = values["allow-issue"]
-          ? Boolean(await admin.issuerPermissions.allow(created.id))
+          ? Boolean(await allowCreated(admin, created.id))
           : false;
 
         print(
@@ -718,7 +787,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
         const gatewayUrls = Object.fromEntries(
           grant.integrations.map((id) => [
             id,
-            integrationBaseURL(base, id, grant.kinds?.[id] ?? "http"),
+            integrationBaseURL(base, id, grantKind(grant.kinds, id)),
           ]),
         );
 
@@ -770,11 +839,11 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
     return usageError(`Unknown command. See \`${prefix} --help\``);
   } catch (error) {
     const known = error instanceof CredentialBrokerError;
-    const code = known ? error.code : "INVALID_ARGUMENT";
+    const code = known ? error.code : "INTERNAL";
 
     const message = known
       ? error.message
-      : `Invalid command or unreadable input. See \`${prefix} --help\``;
+      : "The broker command failed unexpectedly. Run it again, and report it if it keeps failing";
 
     io.stderr(
       json
@@ -789,6 +858,6 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
         : `${code}: ${message}`,
     );
 
-    return exitCodes[code];
+    return known ? exitCodes[error.code] : 1;
   }
 }

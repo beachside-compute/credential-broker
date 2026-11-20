@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { z } from "zod";
 import { grantIdPattern, newGrantToken, tokenHash } from "./grants/tokens";
 import { administrator, orchestrator } from "./auth";
@@ -27,6 +28,34 @@ const issueRequest = z.strictObject({
 });
 
 const renewRequest = z.strictObject({ ttlSeconds });
+
+/**
+ * Trace an authenticated request. Callers only reach this after authentication, so a trace parent
+ * from an unauthenticated request is never honoured.
+ */
+async function traced(
+  context: Context<Worker>,
+  operation: "grant.list" | "grant.renew" | "status",
+  work: () => Promise<Response>,
+): Promise<Response> {
+  const span = startSpan(
+    context.env,
+    (task) => context.executionCtx.waitUntil(task),
+    operation,
+    parseTraceparent(context.req.header("traceparent") ?? null),
+  );
+
+  let status = 503;
+
+  try {
+    const response = await work();
+    status = response.status;
+
+    return response;
+  } finally {
+    finishSpan(span, status);
+  }
+}
 
 const app = new Hono<Worker>();
 
@@ -131,23 +160,27 @@ app.get("/v1/status", async (context) => {
   if (await administrator(request, context.env.BROKER_ADMIN_KEY)) {
     managementKeyring(context.env);
 
-    return privateJson({
-      apiVersion,
-      role: "admin",
-      limits,
-      counts: await registry(context.env).counts(),
-    });
+    return traced(context, "status", async () =>
+      privateJson({
+        apiVersion,
+        role: "admin",
+        limits,
+        counts: await registry(context.env).counts(),
+      }),
+    );
   }
 
   const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
 
   if (!principal) return failure(401, "authentication_required");
 
-  return privateJson({
-    apiVersion,
-    role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
-    limits,
-  });
+  return traced(context, "status", async () =>
+    privateJson({
+      apiVersion,
+      role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
+      limits,
+    }),
+  );
 });
 
 app.get("/v1/grants", async (context) => {
@@ -156,9 +189,11 @@ app.get("/v1/grants", async (context) => {
 
   if (!principal) return failure(401, "orchestrator_authentication_required");
 
-  const grants = await registry(context.env).listGrants(principal.owner);
+  return traced(context, "grant.list", async () => {
+    const grants = await registry(context.env).listGrants(principal.owner);
 
-  return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
+    return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
+  });
 });
 
 app.post("/v1/grants/:id/renew", async (context) => {
@@ -168,20 +203,22 @@ app.post("/v1/grants/:id/renew", async (context) => {
 
   if (!principal) return failure(401, "orchestrator_authentication_required");
 
-  const id = context.req.param("id");
-  const input = renewRequest.safeParse(await readJson(request, 1_024));
+  return traced(context, "grant.renew", async () => {
+    const id = context.req.param("id");
+    const input = renewRequest.safeParse(await readJson(request, 1_024));
 
-  if (!grantIdPattern.test(id) || !input.success) return failure(400, "invalid_grant_request");
+    if (!grantIdPattern.test(id) || !input.success) return failure(400, "invalid_grant_request");
 
-  const result = await registry(context.env).renew(
-    id,
-    principal.owner,
-    Date.now() + input.data.ttlSeconds * 1_000,
-  );
+    const result = await registry(context.env).renew(
+      id,
+      principal.owner,
+      Date.now() + input.data.ttlSeconds * 1_000,
+    );
 
-  if (result.status === "not_found") return failure(404, "grant_not_found");
+    if (result.status === "not_found") return failure(404, "grant_not_found");
 
-  return privateJson(grantView(result.grant, false));
+    return privateJson(grantView(result.grant, false));
+  });
 });
 
 app.delete("/v1/grants/:id", async (context) => {

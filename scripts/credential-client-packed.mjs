@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createCredentialBroker } from "@beachside/credential-client";
+import { runBrokerCli } from "@beachside/credential-client/cli";
 
 const token = `bsg_${"9".repeat(64)}`;
 
@@ -47,4 +48,19 @@ try {
 
 assert.deepEqual(events, ["issue", "revoke"]);
 
-console.log("Packed client configured and revoked a standalone sandbox grant");
+const printed = [];
+
+assert.equal(
+  await runBrokerCli(["--version"], {
+    env: {},
+    stdout: (text) => printed.push(text),
+    stderr: (text) => printed.push(text),
+  }),
+  0,
+);
+
+assert.match(printed.join(""), /^\d+\.\d+\.\d+/);
+
+console.log(
+  "Packed client configured and revoked a standalone sandbox grant, and ran the /cli export",
+);

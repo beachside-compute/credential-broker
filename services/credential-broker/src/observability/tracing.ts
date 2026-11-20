@@ -38,7 +38,14 @@ export type AdminOperation =
   | "admin.grant.list"
   | "admin.config.read";
 
-type Operation = "grant.create" | "grant.revoke" | "gateway" | AdminOperation;
+type Operation =
+  | "grant.create"
+  | "grant.revoke"
+  | "grant.list"
+  | "grant.renew"
+  | "status"
+  | "gateway"
+  | AdminOperation;
 
 export function startSpan(
   env: TraceExportBindings,

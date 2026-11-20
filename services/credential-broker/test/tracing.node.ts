@@ -339,3 +339,48 @@ test("exports a static administrator span without integration IDs or request cre
     await broker.runtime.dispose();
   }
 });
+
+test("traces issuer grant listing, renewal and status with the verified parent", async () => {
+  const broker = fixture({ BROKER_OTLP_TRACES_ENDPOINT: endpoint });
+  const headers = { authorization: `Bearer ${apiKey}`, traceparent };
+
+  try {
+    const missing = "685daa5a-0771-4ef8-9e41-3a5a913e7a04";
+
+    const responses = [
+      await broker.runtime.dispatchFetch("http://broker.test/v1/grants", { headers }),
+      await broker.runtime.dispatchFetch(`http://broker.test/v1/grants/${missing}/renew`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ ttlSeconds: 60 }),
+      }),
+      await broker.runtime.dispatchFetch("http://broker.test/v1/status", { headers }),
+    ];
+
+    assert.deepEqual(
+      responses.map(({ status }) => status),
+      [200, 404, 200],
+    );
+
+    for (const response of responses) await response.text();
+
+    const spans = await broker.spans(3);
+
+    assert.deepEqual(spans.map(({ name }) => name).sort(), [
+      "beachside.broker.grant.list",
+      "beachside.broker.grant.renew",
+      "beachside.broker.status",
+    ]);
+
+    for (const span of spans) {
+      assert.equal(span.traceId, traceId);
+      assert.equal(span.parentSpanId, parentSpanId);
+    }
+
+    for (const exported of broker.exported) {
+      for (const canary of [apiKey, missing]) assert.ok(!exported.body.includes(canary));
+    }
+  } finally {
+    await broker.runtime.dispose();
+  }
+});

@@ -355,7 +355,14 @@ export class GrantRegistry extends DurableObject {
   counts() {
     const now = Date.now();
     const { total } = this.db.select({ total: count() }).from(integrations).get()!;
-    const { issuable } = this.db.select({ issuable: count() }).from(issuerIntegrations).get()!;
+
+    // Issuable means the issuer can mint a grant for it now: allowlisted and enabled.
+    const { issuable } = this.db
+      .select({ issuable: count() })
+      .from(issuerIntegrations)
+      .innerJoin(integrations, eq(issuerIntegrations.identity, integrations.identity))
+      .where(eq(integrations.enabled, true))
+      .get()!;
 
     const { active } = this.db
       .select({ active: count() })

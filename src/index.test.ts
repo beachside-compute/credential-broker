@@ -556,3 +556,149 @@ test("explains issuance refusals and accepts a loopback HTTP broker for local de
 
   expect(() => broker.issue({ integrations: ["router"], ttlSeconds: 604_801 })).toThrow();
 });
+
+test("lists, renews and reports status, and tells a missing grant from an older broker", async () => {
+  const summary = {
+    id,
+    integrations: ["router"],
+    label: null,
+    createdAt: "2029-12-31T00:00:00.000Z",
+    expiresAt,
+    requests: 2,
+    lastUsedAt: null,
+  };
+
+  let reply: () => Response = () => new Response(null, { status: 500 });
+  const seen: string[] = [];
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      seen.push(`${request.method} ${new URL(request.url).pathname}`);
+
+      if (request.method === "POST") expect(await request.json()).toEqual({ ttlSeconds: 604_800 });
+
+      return reply();
+    },
+  });
+
+  reply = () => Response.json({ grants: [summary] });
+  expect(await broker.list()).toEqual([summary]);
+  reply = () => Response.json(summary);
+  expect(await broker.renew(id, 604_800)).toEqual(summary);
+  reply = () =>
+    Response.json({ apiVersion: 2, role: "issuer", limits: { maxGrantTtlSeconds: 604_800 } });
+  expect(await broker.status()).toEqual({
+    apiVersion: 2,
+    role: "issuer",
+    limits: { maxGrantTtlSeconds: 604_800 },
+  });
+  expect(seen).toEqual(["GET /v1/grants", `POST /v1/grants/${id}/renew`, "GET /v1/status"]);
+
+  reply = () => Response.json({ grants: [{ ...summary, requests: -1 }] });
+  await expect(broker.list()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+  expect(() => broker.renew(id, 604_801)).toThrow("Grant lifetime must be 1 second to 7 days");
+
+  reply = () => Response.json({ error: "grant_not_found" }, { status: 404 });
+  await expect(broker.renew(id, 604_800)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+    message: expect.stringContaining("The grant was not found"),
+  });
+
+  reply = () => Response.json({ error: "unsupported_route" }, { status: 404 });
+  await expect(broker.renew(id, 604_800)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+    message: expect.stringContaining("does not support grant renewal. Redeploy"),
+  });
+  await expect(broker.list()).rejects.toMatchObject({
+    message: expect.stringContaining("does not support grant listing. Redeploy"),
+  });
+  await expect(broker.status()).rejects.toMatchObject({
+    message: expect.stringContaining("does not support status. Redeploy"),
+  });
+
+  reply = () => Response.json({ error: "invalid_grant_request" }, { status: 400 });
+  await expect(broker.renew(id, 604_800)).rejects.toMatchObject({
+    code: "INVALID_ARGUMENT",
+    message: "Credential broker rejected the renewal request",
+  });
+});
+
+test("a lost issuance is outcome unknown, while a lost read stays retryable", async () => {
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch() {
+      throw new Error("connection reset");
+    },
+  });
+
+  await expect(broker.issue({ integrations: ["router"] })).rejects.toMatchObject({
+    code: "TIMEOUT",
+    message: expect.stringContaining("may have been applied"),
+  });
+  await expect(broker.list()).rejects.toMatchObject({ code: "UNAVAILABLE" });
+  await expect(broker.revoke(id)).rejects.toMatchObject({ code: "UNAVAILABLE" });
+});
+
+test("names every integration in plural refusals", async () => {
+  let refusal = {};
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch() {
+      return Response.json(refusal, { status: 403 });
+    },
+  });
+
+  refusal = { reason: "not_found", integrations: ["a", "b"] };
+  await expect(broker.issue({ integrations: ["a", "b"] })).rejects.toMatchObject({
+    message: expect.stringContaining("No integrations named a, b exist"),
+  });
+
+  refusal = { reason: "disabled", integrations: ["a", "b"] };
+  await expect(broker.issue({ integrations: ["a", "b"] })).rejects.toMatchObject({
+    message: expect.stringMatching(
+      /Enable each with .*integration enable a`, .*integration enable b`/,
+    ),
+  });
+});
+
+test("revokes a refused sandbox grant even when the caller's signal is already aborted", async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      calls.push(request.method);
+
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+
+      const response = Response.json(null, { status: 201 });
+
+      // The caller gives up while the grant reply is read, after the broker issued it.
+      response.json = async () => ({
+        id,
+        token,
+        expiresAt,
+        integrations: ["router"],
+        get kinds() {
+          controller.abort();
+
+          return { router: "http" };
+        },
+      });
+
+      return response;
+    },
+  });
+
+  await expect(
+    broker.sandbox({ github: "router" }).acquire(controller.signal),
+  ).rejects.toBeDefined();
+  expect(calls).toEqual(["POST", "DELETE"]);
+});

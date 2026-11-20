@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const integrationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
-/** Seven days, long enough for an always-on sandbox between renewals. */
+/** Seven days, long enough for an always-on sandbox between renewals (with a static issuer key; a GitHub Actions run can only renew its own grants). */
 export const maxGrantTtlSeconds = 604_800;
 
 /** Printable ASCII without leading or trailing space, shown in grant listings. */
