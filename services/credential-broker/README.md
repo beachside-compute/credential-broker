@@ -103,7 +103,7 @@ From the deployment checkout, use the HTTPS origin printed by Wrangler to open t
 bun run broker --url https://your-broker.example.com integration setup
 ```
 
-The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`.
+The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`. Setup displays a confirmation. Add `--json` to write the integration metadata to stdout instead.
 
 Set `BEACHSIDE_BROKER_URL=https://your-broker.example.com` in `.env.deploy` to reuse that origin for later commands. You can also set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` together in the environment. If you omit `--url`, the checkout command uses a configured URL and admin key from the same source.
 

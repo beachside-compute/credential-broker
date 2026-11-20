@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* oxlint-disable anti-slop/no-runtime-typeof -- Validate JSON objects read from stdin. */
 import { parseArgs } from "node:util";
+import { outro } from "@clack/prompts";
 import {
   createCredentialBrokerAdmin,
   type BrokerIntegrationCredential,
@@ -16,7 +17,7 @@ const help = `Manage runtime integrations and grant issuance for a Beachside cre
 Set BEACHSIDE_BROKER_URL to the broker HTTPS origin and BEACHSIDE_BROKER_ADMIN_KEY to its admin key.
 
 Commands
-  beachside-broker integration setup
+  beachside-broker integration setup [--json]
   beachside-broker integration list
   beachside-broker integration show <id>
   beachside-broker integration create <id> --provider <github|anthropic|openai|openrouter> (--secret-stdin | --worker-secret <binding>)
@@ -32,7 +33,8 @@ Issuer set replaces the grant issuance allowlist. Omit integration IDs to clear 
 Pipe one credential value to --secret-stdin, optionally followed by a newline.
 For HTTP integrations, --config-stdin takes JSON with endpoint and credential fields.
 --credentials-stdin takes a JSON map of header names to replacement secrets.
-Successful commands print JSON metadata.`;
+Interactive setup prints a confirmation. Add --json to write its metadata to stdout.
+Other commands print JSON metadata.`;
 
 function usageError(message: string): never {
   throw new CredentialBrokerError("INVALID_ARGUMENT", message);
@@ -117,6 +119,7 @@ async function main(args: string[]) {
 
   const [group, command, ...options] = args;
   const creates = group === "integration" && command === "create";
+  const setup = group === "integration" && command === "setup";
   const usesCredential = creates || (group === "integration" && command === "rotate");
 
   if (group !== "integration" && group !== "issuer")
@@ -125,6 +128,8 @@ async function main(args: string[]) {
   const { values, positionals } = parseCommandOptions(options);
 
   const rotates = group === "integration" && command === "rotate";
+
+  if (!setup && values.json) return usageError("--json is only accepted by integration setup");
 
   if (!creates && values["config-stdin"])
     return usageError("--config-stdin is only accepted by integration create");
@@ -149,7 +154,7 @@ async function main(args: string[]) {
       ? await integrationCommand(command, positionals, values, admin)
       : await issuerCommand(command, positionals, admin);
 
-  console.log(JSON.stringify(output));
+  if (output !== undefined) console.log(JSON.stringify(output));
 }
 
 function parseCommandOptions(args: string[]) {
@@ -159,6 +164,7 @@ function parseCommandOptions(args: string[]) {
       allowPositionals: true,
       options: {
         provider: { type: "string" },
+        json: { type: "boolean" },
         "secret-stdin": { type: "boolean" },
         "worker-secret": { type: "string" },
         "config-stdin": { type: "boolean" },
@@ -219,14 +225,15 @@ async function integrationCommand(
       noPositionals(positionals);
       const config = await setupIntegration();
       const created = await integrations.create(config);
+
+      if (values.json) return created;
+
+      outro(`Created integration ${created.id}.`, { output: process.stderr });
       console.error(
-        `To authorize issuance, run beachside-broker issuer show, then issuer set with the existing IDs plus ${created.id}.`,
-      );
-      console.error(
-        `In broker.sandbox({ endpoints: [{ integration: "${created.id}", baseURLEnv: "YOUR_BASE_URL", apiKeyEnv: "YOUR_API_KEY" }] }), use the environment names required by your client.`,
+        `Allow your issuer to create temporary grants for this integration.\nRun issuer show using the same CLI prefix.\nThen run issuer set with your existing IDs plus ${created.id}.`,
       );
 
-      return created;
+      return;
     }
 
     case "list":

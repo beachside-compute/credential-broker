@@ -4,6 +4,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -57,17 +58,46 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
     ]);
 
     expect(certificate.exitCode).toBe(0);
+    const upstreamKey = "fixture-only-openrouter-key";
+
+    const endpoint = {
+      baseURL: "https://openrouter.ai/api/v1",
+      headers: [{ name: "authorization", secret: true, prefix: "Bearer " }],
+    };
+
+    const metadata = {
+      id: "openrouter",
+      kind: "http",
+      enabled: true,
+      endpoint,
+      credentialSource: "encrypted-store",
+      credentialVersion: 1,
+      createdAt: "2026-11-20T00:00:00.000Z",
+      updatedAt: "2026-11-20T00:00:00.000Z",
+    };
+
     const requests: { path: string; authorization: string | null }[] = [];
 
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       tls: { key: Bun.file(key), cert: Bun.file(cert) },
-      fetch(request) {
+      async fetch(request) {
         requests.push({
           path: new URL(request.url).pathname,
           authorization: request.headers.get("authorization"),
         });
+
+        if (request.method === "POST") {
+          expect(await request.json()).toEqual({
+            id: "openrouter",
+            kind: "http",
+            endpoint,
+            credential: { source: "encrypted-store", values: { authorization: upstreamKey } },
+          });
+
+          return Response.json(metadata, { status: 201 });
+        }
 
         return Response.json({ integrations: [] });
       },
@@ -114,6 +144,75 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           authorization: `Bearer ${adminKey}`,
         })),
       );
+
+      for (const json of [false, true]) {
+        const prompts = [
+          ["Choose a provider", "\r"],
+          ["Enter for openrouter", "\r"],
+          ["Provider API key", `${upstreamKey}\r`],
+          ["Create openrouter", "\x1b[D\r"],
+        ];
+
+        const stdoutFile = join(root, "setup-stdout");
+        let transcript = "";
+        let answered = 0;
+
+        const child = Bun.spawn(
+          [
+            "/bin/sh",
+            "-c",
+            'exec "$@" > "$FIXTURE_STDOUT"',
+            "fixture",
+            process.execPath,
+            "run",
+            "broker",
+            "integration",
+            "setup",
+            ...(json ? ["--json"] : []),
+          ],
+          {
+            cwd: root,
+            env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: cert, FIXTURE_STDOUT: stdoutFile },
+            terminal: {
+              cols: 110,
+              data(terminal, bytes) {
+                transcript += Buffer.from(bytes).toString();
+                const prompt = prompts[answered];
+
+                if (!prompt || !transcript.includes(prompt[0])) return;
+                answered++;
+                terminal.write(prompt[1]);
+              },
+            },
+          },
+        );
+
+        const timeout = setTimeout(() => child.kill(), 4_000);
+
+        try {
+          expect(await child.exited).toBe(0);
+          expect(answered).toBe(prompts.length);
+          const stdout = readFileSync(stdoutFile, "utf8");
+          expect(transcript).not.toContain(upstreamKey);
+          expect(stdout).not.toContain(upstreamKey);
+          expect(transcript).not.toContain("broker.sandbox");
+
+          if (json) {
+            expect(JSON.parse(stdout)).toEqual(metadata);
+            expect(transcript).not.toContain("Created integration openrouter.");
+          } else {
+            expect(stdout).toBe("");
+            expect(transcript).toContain("Created integration openrouter.");
+            expect(transcript).toContain("create temporary grants for this integration");
+            expect(transcript).toContain("issuer show");
+            expect(transcript).toContain("issuer set with your existing IDs plus openrouter");
+          }
+        } finally {
+          clearTimeout(timeout);
+          child.terminal?.close();
+        }
+      }
+
       expect(readdirSync(join(root, ".cache"))).toEqual([]);
     } finally {
       await server.stop(true);
