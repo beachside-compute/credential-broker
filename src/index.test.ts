@@ -359,3 +359,40 @@ test("cancellation bounds the grant body after a successful response status", as
     bodyReleased.resolve();
   }
 });
+
+test("maps configurable HTTP endpoints to caller-selected sandbox environment variables", async () => {
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      const input = await request.json();
+
+      expect(input).toEqual({ integrations: ["github", "custom"], ttlSeconds: 900 });
+
+      return grantResponse(input.integrations);
+    },
+  });
+
+  const endpoint = {
+    integration: "custom",
+    baseURLEnv: "PROVIDER_URL",
+    apiKeyEnv: "PROVIDER_TOKEN",
+  };
+
+  const sandbox = broker.sandbox({ github: "github", endpoints: [endpoint] });
+  const grant = await sandbox.acquire(new AbortController().signal);
+
+  expect(grant.env.PROVIDER_URL).toBe(`${url}/gateway/custom`);
+  expect(grant.env.PROVIDER_TOKEN).toBe(token);
+  expect(grant.env.GH_ENTERPRISE_TOKEN).toBe(token);
+  expect(() => broker.sandbox({ endpoints: [endpoint, endpoint] })).toThrow("Invalid or duplicate");
+  expect(() =>
+    broker.sandbox({
+      github: "github",
+      endpoints: [{ ...endpoint, apiKeyEnv: "GH_ENTERPRISE_TOKEN" }],
+    }),
+  ).toThrow("Invalid or duplicate");
+  expect(() => broker.sandbox({ endpoints: [{ ...endpoint, baseURLEnv: "bad=name" }] })).toThrow(
+    "Invalid or duplicate",
+  );
+});

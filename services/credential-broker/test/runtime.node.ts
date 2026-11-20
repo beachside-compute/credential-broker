@@ -35,6 +35,7 @@ import type { CredentialInput } from "../src/credentials/source";
 import type { IntegrationKind } from "../src/integrations/types";
 import { workerSecretSource } from "../src/credentials/sources/worker-secret";
 import { tokenHash } from "../src/grants/tokens";
+import { endpointHeaders } from "../src/proxy/forward";
 
 const execute = promisify(execFile);
 
@@ -190,6 +191,29 @@ const options: V4MiniflareOptions = {
       headers: new Headers([...request.headers]),
       body: await request.text(),
     });
+
+    if (url.hostname === "upstream.example.com") {
+      if (url.pathname.endsWith("/stream")) return sseFixture();
+
+      if (url.pathname.endsWith("/redirect")) {
+        return new RuntimeResponse(null, {
+          status: 302,
+          headers: { location: `${url.origin}/outside` },
+        });
+      }
+
+      return RuntimeResponse.json(
+        { fixture: true },
+        {
+          headers: {
+            "x-page-count": "2",
+            "x-reflected-credential": request.headers.get("authorization") ?? "",
+            "cf-aig-authorization": "remove-by-name",
+            "set-cookie": "untrusted=response-cookie",
+          },
+        },
+      );
+    }
 
     if (url.hostname === "api.openai.com" && url.pathname === "/v1/chat/completions") {
       return sseFixture();
@@ -1111,7 +1135,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 2 },
+        { count: 3 },
       ]);
 
       const path = "/gateway/openai/v1/models";
@@ -1257,6 +1281,270 @@ test("separates administration, issuance, OIDC and sandbox access", async () => 
     await existing.text();
   } finally {
     await admin("/integrations/new-ai", "DELETE");
+    await eligible(defaultNames);
+  }
+});
+
+test("strips headers nominated by Connection wherever present at the runtime boundary", () => {
+  const headers = endpointHeaders(
+    new Headers({
+      connection: "x-private, x-fixed",
+      "x-private": "guest-transport-metadata",
+      "x-fixed": "untrusted",
+      "x-session-id": "kept",
+    }),
+    [{ name: "x-fixed", value: "configured" }],
+    {},
+    "fixture-grant",
+  );
+
+  assert.deepEqual(
+    [...headers],
+    [
+      ["x-fixed", "configured"],
+      ["x-session-id", "kept"],
+    ],
+  );
+});
+
+test("proxies an administrator-configured endpoint and rotates one sealed header without disturbing its grant", async () => {
+  const id = "custom-api";
+  const gateway = `/gateway/${id}`;
+  const url = "https://broker.test";
+  const upstreamBase = "https://upstream.example.com/nested/v1";
+  const first = "configured-upstream-key";
+  const rotated = "rotated-upstream-key";
+  const gatewayKey = "encrypted-gateway-key";
+  const adminClient = createCredentialBrokerAdmin({ url, apiKey: adminKey, fetch: relayRequest });
+  const broker = createCredentialBroker({ url, auth: { apiKey }, fetch: relayRequest });
+
+  const endpoint = {
+    baseURL: `${upstreamBase}/`,
+    headers: [
+      { name: "Authorization", secret: true, prefix: "Bearer " },
+      { name: "CF-AIG-Authorization", secret: true, prefix: "Bearer " },
+      { name: "X-Mode", value: "fixed-override" },
+    ],
+  } satisfies NonNullable<Awaited<ReturnType<typeof adminClient.integrations.get>>["endpoint"]>;
+
+  const body = {
+    kind: "http",
+    id,
+    endpoint,
+    credential: {
+      source: "encrypted-store",
+      values: {
+        authorization: first,
+        "cf-aig-authorization": gatewayKey,
+      },
+    },
+  } as const;
+
+  try {
+    const invalidEndpoints = [
+      { ...endpoint, baseURL: "http://upstream.example.com" },
+      { ...endpoint, baseURL: "https://owner:secret@upstream.example.com" },
+      { ...endpoint, baseURL: `${upstreamBase}?token=secret` },
+      { ...endpoint, baseURL: `${upstreamBase}/%2e%2e/elsewhere` },
+      { ...endpoint, headers: [...endpoint.headers, { name: "Host", value: "evil.example.com" }] },
+      {
+        ...endpoint,
+        headers: [...endpoint.headers, { name: "authorization", value: "duplicate" }],
+      },
+      { ...endpoint, headers: [...endpoint.headers, { name: "x-extra", value: "break\r\nfield" }] },
+    ];
+
+    for (const invalid of invalidEndpoints) {
+      const response = await admin(
+        "/integrations",
+        "POST",
+        JSON.stringify({ ...body, endpoint: invalid }),
+      );
+
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: "invalid_integration" });
+    }
+
+    const created = await adminClient.integrations.create(body);
+    assert.deepEqual(created.endpoint, {
+      baseURL: upstreamBase,
+      headers: endpoint.headers.map((header) => ({ ...header, name: header.name.toLowerCase() })),
+    });
+    assert.ok(!JSON.stringify(created).includes(first));
+    assert.ok(!JSON.stringify(await adminClient.integrations.get(id)).includes(gatewayKey));
+    assert.equal((await issue([id])).status, 403);
+    await eligible([...defaultNames, id]);
+
+    const sandbox = broker.sandbox({
+      endpoints: [{ integration: id, baseURLEnv: "CUSTOM_URL", apiKeyEnv: "CUSTOM_KEY" }],
+    });
+
+    const result = await sandbox.acquire(new AbortController().signal);
+    const token = result.env.CUSTOM_KEY;
+    assert.equal(result.env.CUSTOM_URL, `${url}${gateway}`);
+
+    const response = await runtime.dispatchFetch(
+      `${result.env.CUSTOM_URL}/widgets/123?token=page-cursor&key=record`,
+      {
+        method: "DELETE",
+        headers: {
+          "x-api-key": token,
+          "user-agent": "provider-tool/1.2.3",
+          "x-session-id": "conversation-id",
+          "x-mode": "guest-override",
+          "cf-aig-authorization": "guest-cf-value",
+          "x-token-copy": `copied ${token}`,
+          "x-forwarded-for": "192.0.2.1",
+          traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+          cookie: "secret=guest-cookie",
+        },
+        body: "{}",
+      },
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { fixture: true });
+    assert.equal(response.headers.get("x-page-count"), "2");
+
+    for (const name of ["set-cookie", "cf-aig-authorization", "x-reflected-credential"])
+      assert.equal(response.headers.get(name), null);
+
+    const forwarded = seen.at(-1)!;
+    assert.equal(forwarded.url.href, `${upstreamBase}/widgets/123?token=page-cursor&key=record`);
+    assert.equal(forwarded.method, "DELETE");
+    assert.equal(forwarded.body, "{}");
+    assert.equal(forwarded.headers.get("authorization"), `Bearer ${first}`);
+    assert.equal(forwarded.headers.get("cf-aig-authorization"), `Bearer ${gatewayKey}`);
+    assert.equal(forwarded.headers.get("x-mode"), "fixed-override");
+    assert.equal(forwarded.headers.get("x-session-id"), "conversation-id");
+    assert.equal(forwarded.headers.get("user-agent"), "provider-tool/1.2.3");
+
+    for (const name of ["x-api-key", "x-token-copy", "x-forwarded-for", "traceparent", "cookie"])
+      assert.equal(forwarded.headers.get(name), null);
+
+    for (const suffix of ["", "/"]) {
+      assert.equal((await access(`${gateway}${suffix}`, token)).status, 200);
+      assert.equal(seen.at(-1)?.url.href, `${upstreamBase}${suffix}`);
+    }
+
+    const initial = seen.length;
+
+    for (const suffix of ["//outside", "/a%2Fb", "/a%5Cb", "/%252e%252e", `?cursor=${token}`]) {
+      assert.equal((await access(`${gateway}${suffix}`, token)).status, 404);
+    }
+
+    assert.equal((await access("/gateway/openai/v1/models", token)).status, 403);
+    assert.equal(seen.length, initial);
+    assert.equal((await access(`${gateway}/redirect`, token)).status, 502);
+    assert.deepEqual(
+      seen.slice(initial).map(({ url: requestURL }) => requestURL.pathname),
+      ["/nested/v1/redirect"],
+    );
+
+    const invalidRotation = await admin(
+      `/integrations/${id}/credential`,
+      "PUT",
+      JSON.stringify({
+        source: "encrypted-store",
+        values: { "x-mode": "invalid-non-secret-slot" },
+      }),
+    );
+
+    assert.equal(invalidRotation.status, 400);
+    assert.equal(
+      (
+        await adminClient.integrations.rotate(id, {
+          source: "encrypted-store",
+          values: { AUTHORIZATION: rotated },
+        })
+      ).credentialVersion,
+      2,
+    );
+    assert.equal((await access(`${gateway}/widgets/123`, token)).status, 200);
+    assert.equal(seen.at(-1)?.headers.get("authorization"), `Bearer ${rotated}`);
+    assert.equal(seen.at(-1)?.headers.get("cf-aig-authorization"), `Bearer ${gatewayKey}`);
+
+    const storage = await runtime.unsafeGetDurableObjectStorage("broker", "GrantRegistry", {
+      name: "grant-registry",
+    });
+
+    const rows = await storage.exec(
+      "SELECT endpoint, credential FROM integrations WHERE id = ?",
+      id,
+    );
+
+    assert.ok(![first, rotated, gatewayKey].some((value) => JSON.stringify(rows).includes(value)));
+
+    const fixtureStream = await access(`${gateway}/stream`, token);
+    assert.equal(fixtureStream.headers.get("content-type"), "text/event-stream");
+    const reader = fixtureStream.body!.getReader();
+    const initialChunk = await reader.read();
+    assert.match(new TextDecoder().decode(initialChunk.value), /first/);
+    sendStreamTail?.();
+    assert.match(new TextDecoder().decode((await reader.read()).value), /DONE/);
+    assert.equal((await reader.read()).done, true);
+
+    const lookup = await storage.exec(
+      "SELECT id FROM grants WHERE hash = ?",
+      await tokenHash(token),
+    );
+
+    const grantId = lookup[0].id;
+
+    for (let i = 0; i < 30; i++) {
+      if (!(await storage.exec("SELECT id FROM leases WHERE grant_id = ?", grantId)).length) break;
+      await delay(20);
+    }
+
+    assert.deepEqual(await storage.exec("SELECT id FROM leases WHERE grant_id = ?", grantId), []);
+
+    await storage.exec(
+      "UPDATE integrations SET endpoint = replace(endpoint, 'nested', 'tampered') WHERE id = ?",
+      id,
+    );
+    const beforeTamper = seen.length;
+    assert.equal((await access(gateway, token)).status, 503);
+    assert.equal(seen.length, beforeTamper);
+    await adminClient.integrations.setEnabled(id, false);
+    assert.equal((await access(gateway, token)).status, 401);
+  } finally {
+    await adminClient.integrations.delete(id);
+    await eligible(defaultNames);
+  }
+});
+
+test("HTTP endpoint at an upstream origin root supports literal-only configuration", async () => {
+  const id = "literal-api";
+  const item = `/integrations/${id}`;
+  const url = "https://upstream.example.com";
+  const credential = { source: "encrypted-store", values: {} };
+
+  try {
+    const created = await admin(
+      "/integrations",
+      "POST",
+      JSON.stringify({
+        id,
+        kind: "http",
+        endpoint: { baseURL: `${url}/`, headers: [{ name: "x-mode", value: "literal" }] },
+        credential,
+      }),
+    );
+
+    assert.equal(created.status, 201);
+    await eligible([...defaultNames, id]);
+    const { token } = await grant([id]);
+    const response = await access(`/gateway/${id}`, token, "PROPFIND");
+    assert.equal(response.status, 200);
+    assert.equal(seen.at(-1)?.url.href, `${url}/`);
+    assert.equal(seen.at(-1)?.method, "PROPFIND");
+    assert.equal(seen.at(-1)?.headers.get("authorization"), null);
+    assert.equal(seen.at(-1)?.headers.get("x-mode"), "literal");
+    const rotation = await admin(`${item}/credential`, "PUT", JSON.stringify(credential));
+    assert.equal(rotation.status, 200);
+    assert.equal((await rotation.json()).credentialVersion, 2);
+  } finally {
+    await admin(item, "DELETE");
     await eligible(defaultNames);
   }
 });

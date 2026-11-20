@@ -29,8 +29,11 @@ export {
   type BrokerIntegration,
   type BrokerIntegrationKind,
   type BrokerIntegrationCredential,
+  type BrokerEndpointCredential,
   type BrokerIntegrationInput,
 } from "./admin.js";
+
+export type { BrokerEndpoint, BrokerEndpointHeader } from "./endpoint.js";
 
 export type CredentialBrokerAuth =
   | { apiKey: string }
@@ -54,11 +57,18 @@ export interface BrokerGrant {
   readonly integrations: readonly string[];
 }
 
+export interface SandboxEndpoint {
+  integration: string;
+  baseURLEnv: string;
+  apiKeyEnv: string;
+}
+
 export interface SandboxIntegrations {
   github?: string;
   anthropic?: string;
   openai?: string;
   openrouter?: string;
+  endpoints?: readonly SandboxEndpoint[];
   ttlSeconds?: number;
 }
 
@@ -255,9 +265,76 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     }
   }
 
-  function sandbox({ github, anthropic, openai, openrouter, ttlSeconds }: SandboxIntegrations) {
+  function sandbox({
+    github,
+    anthropic,
+    openai,
+    openrouter,
+    endpoints = [],
+    ttlSeconds,
+  }: SandboxIntegrations) {
     const integrations = [github, anthropic, openai, openrouter].filter((id) => id !== undefined);
-    const request = validateRequest({ integrations, ttlSeconds });
+
+    if (
+      !Array.isArray(endpoints) ||
+      endpoints.some((binding) => !binding || typeof binding !== "object")
+    )
+      throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker endpoint bindings");
+
+    if (new Set(integrations).size !== integrations.length)
+      throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker grant request");
+
+    const variables = new Set<string>();
+
+    if (github !== undefined) {
+      for (const name of [
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GIT_CONFIG_COUNT",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
+        "GIT_CONFIG_KEY_2",
+        "GIT_CONFIG_VALUE_2",
+      ])
+        variables.add(name);
+    }
+
+    for (const [id, prefix] of [
+      [anthropic, "ANTHROPIC"],
+      [openai, "OPENAI"],
+      [openrouter, "OPENROUTER"],
+    ]) {
+      if (id === undefined) continue;
+      variables.add(`${prefix}_BASE_URL`);
+      variables.add(`${prefix}_API_KEY`);
+    }
+
+    const bindings = endpoints.map(({ integration, baseURLEnv, apiKeyEnv }) => {
+      for (const name of [baseURLEnv, apiKeyEnv]) {
+        if (
+          typeof name !== "string" ||
+          !/^[A-Z_][A-Z0-9_]{0,63}$/.test(name) ||
+          variables.has(name)
+        )
+          throw new CredentialBrokerError(
+            "INVALID_ARGUMENT",
+            "Invalid or duplicate broker endpoint environment variable",
+          );
+        variables.add(name);
+      }
+
+      return { integration, baseURLEnv, apiKeyEnv };
+    });
+
+    const request = validateRequest({
+      integrations: [
+        ...new Set([...integrations, ...bindings.map(({ integration }) => integration)]),
+      ],
+      ttlSeconds,
+    });
 
     return {
       async acquire(signal: AbortSignal, traceParent?: string): Promise<SandboxGrant> {
@@ -292,6 +369,11 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         if (openrouter !== undefined) {
           env.OPENROUTER_BASE_URL = `${gateway(openrouter)}/v1`;
           env.OPENROUTER_API_KEY = grant.token;
+        }
+
+        for (const { integration, baseURLEnv, apiKeyEnv } of bindings) {
+          env[baseURLEnv] = gateway(integration);
+          env[apiKeyEnv] = grant.token;
         }
 
         return {

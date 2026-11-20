@@ -15,6 +15,13 @@
       "when": 1795019088768,
       "tag": "0001_integrations",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1795182436610,
+      "tag": "0002_configurable_endpoints",
+      "breakpoints": true
     }
   ]
 }

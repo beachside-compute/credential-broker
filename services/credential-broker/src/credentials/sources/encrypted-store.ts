@@ -1,3 +1,4 @@
+import { matchingEndpointValues, normalizeEndpointValues } from "../../../../../src/endpoint";
 import { z } from "zod";
 import type { IntegrationRevision } from "../../integrations/types";
 import { credentialValue } from "../source";
@@ -52,6 +53,22 @@ export async function sealCredential(
   integration: IntegrationRevision,
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
+  return seal(value, integration, keyring);
+}
+
+export function sealEndpointValues(
+  values: Record<string, string>,
+  integration: IntegrationRevision,
+  keyring: EncryptionKeyring,
+): Promise<EncryptedCredential> {
+  return seal(JSON.stringify(values), integration, keyring);
+}
+
+async function seal(
+  value: string,
+  integration: IntegrationRevision,
+  keyring: EncryptionKeyring,
+): Promise<EncryptedCredential> {
   const keyVersion = keyring.active;
   const nonce = crypto.getRandomValues(new Uint8Array(12));
 
@@ -75,31 +92,65 @@ export function encryptedStoreSource(
 ): CredentialSource<EncryptedCredential> {
   return {
     async resolve(reference) {
-      try {
-        const nonce = decode(reference.nonce);
-        const ciphertext = decode(reference.ciphertext);
+      const plaintext = await open(reference, integration, keyring, 4096);
+      const result = credentialValue.safeParse(plaintext);
 
-        if (nonce.length !== 12 || ciphertext.length < 17 || ciphertext.length > 4112) return;
-
-        const plaintext = await crypto.subtle.decrypt(
-          {
-            name: "AES-GCM",
-            iv: nonce,
-            additionalData: aad(integration, reference.keyVersion),
-            tagLength: 128,
-          },
-          await importKey(keyring, reference.keyVersion, "decrypt"),
-          ciphertext,
-        );
-
-        const result = credentialValue.safeParse(decoder.decode(plaintext));
-
-        return result.success ? { value: result.data } : undefined;
-      } catch {
-        return;
-      }
+      return result.success ? { value: result.data } : undefined;
     },
   };
+}
+
+export async function openEndpointValues(
+  reference: EncryptedCredential,
+  integration: IntegrationRevision,
+  keyring: EncryptionKeyring,
+): Promise<Record<string, string> | undefined> {
+  const { endpoint } = integration;
+
+  if (!endpoint) return;
+
+  const json = await open(reference, integration, keyring, 67_000);
+
+  if (json === undefined) return;
+
+  try {
+    const values = normalizeEndpointValues(JSON.parse(json));
+
+    return values && matchingEndpointValues(endpoint, values, "full") ? values : undefined;
+  } catch {
+    return;
+  }
+}
+
+async function open(
+  reference: EncryptedCredential,
+  integration: IntegrationRevision,
+  keyring: EncryptionKeyring,
+  maxBytes: number,
+): Promise<string | undefined> {
+  try {
+    if (reference.ciphertext.length > Math.ceil(((maxBytes + 16) * 4) / 3)) return;
+
+    const nonce = decode(reference.nonce);
+    const ciphertext = decode(reference.ciphertext);
+
+    if (nonce.length !== 12 || ciphertext.length < 17 || ciphertext.length > maxBytes + 16) return;
+
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: nonce,
+        additionalData: aad(integration, reference.keyVersion),
+        tagLength: 128,
+      },
+      await importKey(keyring, reference.keyVersion, "decrypt"),
+      ciphertext,
+    );
+
+    return decoder.decode(plaintext);
+  } catch {
+    return;
+  }
 }
 
 function aad(integration: IntegrationRevision, keyVersion: string) {
@@ -111,6 +162,7 @@ function aad(integration: IntegrationRevision, keyVersion: string) {
       integration.kind,
       integration.credentialVersion,
       keyVersion,
+      ...(integration.kind === "http" ? [integration.endpoint] : []),
     ]),
   );
 }
@@ -128,10 +180,11 @@ async function importKey(
 }
 
 function encode(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  let binary = "";
+
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function decode(value: string): Uint8Array<ArrayBuffer> {

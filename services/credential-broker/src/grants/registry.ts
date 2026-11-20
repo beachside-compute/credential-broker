@@ -82,12 +82,16 @@ export class GrantRegistry extends DurableObject {
     });
   }
 
-  credentialRevision(id: string): IntegrationRevision | undefined {
+  credentialRevision(
+    id: string,
+  ): (IntegrationRevision & { credential: CredentialReference }) | undefined {
     return this.db
       .select({
         id: integrations.id,
         identity: integrations.identity,
         kind: integrations.kind,
+        endpoint: integrations.endpoint,
+        credential: integrations.credential,
         credentialVersion: integrations.credentialVersion,
       })
       .from(integrations)
@@ -251,11 +255,7 @@ export class GrantRegistry extends DurableObject {
       .run();
   }
 
-  authorize(
-    hash: string,
-    selector: IntegrationSelector,
-    requiresAnthropic: boolean,
-  ): Authorization {
+  authorize(hash: string, selector: IntegrationSelector, usesApiKeyHeader: boolean): Authorization {
     const now = Date.now();
 
     return this.ctx.storage.transactionSync(() => {
@@ -283,11 +283,15 @@ export class GrantRegistry extends DurableObject {
 
       const [integration] = candidates;
 
-      if (candidates.length !== 1 || (selector.type === "ai" && integration.kind === "github")) {
+      if (
+        candidates.length !== 1 ||
+        (selector.type === "gateway" && integration.kind === "github")
+      ) {
         return { status: "forbidden" };
       }
 
-      if (requiresAnthropic && integration.kind !== "anthropic") return { status: "invalid" };
+      if (usesApiKeyHeader && integration.kind !== "anthropic" && integration.kind !== "http")
+        return { status: "invalid" };
 
       const window = Math.floor(now / minuteMs);
       const used = grant.rateWindow === window ? grant.rateCount : 0;
@@ -360,5 +364,6 @@ function metadata(integration: StoredIntegration): IntegrationMetadata {
     credentialSource: credential.source,
     createdAt: new Date(createdAt).toISOString(),
     updatedAt: new Date(updatedAt).toISOString(),
+    ...(integration.endpoint && { endpoint: integration.endpoint }),
   };
 }

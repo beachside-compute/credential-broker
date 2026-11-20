@@ -18,7 +18,7 @@ function run(command, args, cwd) {
 
 const types = `
 import { createCredentialBroker, createCredentialBrokerAdmin } from "@beachside/credential-client";
-import type { BrokerIntegrationCredential, SandboxGrant } from "@beachside/credential-client";
+import type { BrokerEndpoint, BrokerIntegrationCredential, SandboxGrant } from "@beachside/credential-client";
 
 const url = "https://broker.example.invalid";
 const apiKey = "fixture_credential_broker_control_key";
@@ -26,8 +26,17 @@ const issuer = createCredentialBroker({ url, auth: { apiKey } });
 const admin = createCredentialBrokerAdmin({ url, apiKey });
 const credential: BrokerIntegrationCredential = { source: "encrypted-store", value: "fixture" };
 await admin.integrations.create({ id: "model", kind: "openai", credential });
+const endpoint: BrokerEndpoint = {
+  baseURL: "https://api.example.com/v1",
+  headers: [{ name: "authorization", secret: true, prefix: "Bearer " }],
+};
+await admin.integrations.create({ id: "gateway", kind: "http", endpoint, credential: {
+  source: "encrypted-store", values: { authorization: "fixture" },
+} });
 const controller = new AbortController();
-const grant: SandboxGrant = await issuer.sandbox({ openai: "model" }).acquire(controller.signal);
+const grant: SandboxGrant = await issuer.sandbox({ openai: "model", endpoints: [
+  { integration: "gateway", baseURLEnv: "GATEWAY_URL", apiKeyEnv: "GATEWAY_TOKEN" },
+] }).acquire(controller.signal);
 await grant.revoke(controller.signal);
 `;
 

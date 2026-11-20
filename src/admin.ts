@@ -1,6 +1,13 @@
 /* oxlint-disable anti-slop/no-runtime-typeof -- Validate admin inputs and HTTP response fields at the boundary. */
 
 import {
+  matchingEndpointValues,
+  normalizeEndpoint,
+  normalizeEndpointValues,
+  type BrokerEndpoint,
+} from "./endpoint.js";
+
+import {
   assertStatus,
   brokerOrigin,
   CredentialBrokerError,
@@ -16,7 +23,7 @@ import {
   type Fetch,
 } from "./transport.js";
 
-const integrationKinds = ["github", "anthropic", "openai", "openrouter"] as const;
+const integrationKinds = ["github", "anthropic", "openai", "openrouter", "http"] as const;
 
 export type BrokerIntegrationKind = (typeof integrationKinds)[number];
 
@@ -24,16 +31,24 @@ export type BrokerIntegrationCredential =
   | { source: "encrypted-store"; value: string }
   | { source: "worker-secret"; binding: string };
 
-export interface BrokerIntegrationInput {
-  id: string;
-  kind: BrokerIntegrationKind;
-  credential: BrokerIntegrationCredential;
+export interface BrokerEndpointCredential {
+  source: "encrypted-store";
+  values: Record<string, string>;
 }
+
+export type BrokerIntegrationInput =
+  | {
+      id: string;
+      kind: Exclude<BrokerIntegrationKind, "http">;
+      credential: BrokerIntegrationCredential;
+    }
+  | { id: string; kind: "http"; endpoint: BrokerEndpoint; credential: BrokerEndpointCredential };
 
 export interface BrokerIntegration {
   readonly id: string;
   readonly kind: BrokerIntegrationKind;
   readonly enabled: boolean;
+  readonly endpoint?: BrokerEndpoint;
   readonly credentialSource: BrokerIntegrationCredential["source"];
   readonly credentialVersion: number;
   readonly createdAt: string;
@@ -86,6 +101,16 @@ function credentialInput(credential: BrokerIntegrationCredential): BrokerIntegra
     return { source: credential.source, binding: credential.binding };
 
   throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker integration credential");
+}
+
+function endpointCredential(credential: BrokerEndpointCredential): BrokerEndpointCredential {
+  const values =
+    credential?.source === "encrypted-store" && normalizeEndpointValues(credential.values);
+
+  if (!values)
+    throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker endpoint credentials");
+
+  return { source: "encrypted-store", values };
 }
 
 function validIdentifiers(ids: readonly unknown[]): ids is string[] {
@@ -143,8 +168,21 @@ function integrationMetadata(reply: unknown, expectedId?: string): BrokerIntegra
   )
     throw invalidResponse();
 
-  // Project only public fields even if the server sends an unexpected field.
-  return { id, kind, enabled, credentialSource, credentialVersion, createdAt, updatedAt };
+  const endpoint = kind === "http" && "endpoint" in reply && normalizeEndpoint(reply.endpoint);
+
+  if (kind === "http" && (!endpoint || credentialSource !== "encrypted-store"))
+    throw invalidResponse();
+
+  return {
+    id,
+    kind,
+    enabled,
+    credentialSource,
+    credentialVersion,
+    createdAt,
+    updatedAt,
+    ...(endpoint && { endpoint }),
+  };
 }
 
 /** Trusted operator client for runtime integrations and grant issuance eligibility. */
@@ -271,7 +309,22 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
             "Unsupported credential broker integration kind",
           );
 
-        const body = { id, kind: input.kind, credential: credentialInput(input.credential) };
+        let body: BrokerIntegrationInput;
+
+        if (input.kind === "http") {
+          const endpoint = normalizeEndpoint(input.endpoint);
+          const credential = endpointCredential(input.credential);
+
+          if (!endpoint || !matchingEndpointValues(endpoint, credential.values, "full"))
+            throw new CredentialBrokerError(
+              "INVALID_ARGUMENT",
+              "Invalid broker endpoint configuration",
+            );
+
+          body = { id, kind: input.kind, endpoint, credential };
+        } else {
+          body = { id, kind: input.kind, credential: credentialInput(input.credential) };
+        }
 
         return json(
           integrationPath,
@@ -284,7 +337,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
       },
       async rotate(
         id: string,
-        credential: BrokerIntegrationCredential,
+        credential: BrokerIntegrationCredential | BrokerEndpointCredential,
         call: BrokerRequestOptions = {},
       ) {
         return json(
@@ -293,7 +346,11 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
           200,
           call,
           (reply) => integrationMetadata(reply, id),
-          JSON.stringify(credentialInput(credential)),
+          JSON.stringify(
+            credential?.source === "encrypted-store" && "values" in credential
+              ? endpointCredential(credential)
+              : credentialInput(credential),
+          ),
         );
       },
       async setEnabled(id: string, enabled: boolean, call: BrokerRequestOptions = {}) {

@@ -1,3 +1,8 @@
+import {
+  matchingEndpointValues,
+  normalizeEndpoint,
+  normalizeEndpointValues,
+} from "../../../../src/endpoint";
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
@@ -5,7 +10,11 @@ import { administrator } from "../auth";
 import { integrationId, parseConfig } from "../config";
 import { credentialInput } from "../credentials/source";
 import type { CredentialInput } from "../credentials/source";
-import { sealCredential } from "../credentials/sources/encrypted-store";
+import {
+  openEndpointValues,
+  sealCredential,
+  sealEndpointValues,
+} from "../credentials/sources/encrypted-store";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import { workerSecretSource } from "../credentials/sources/worker-secret";
 import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "../http";
@@ -18,11 +27,26 @@ import type { IntegrationRevision } from "./types";
 
 const maxAdminBody = 16_384;
 
-const createInput = z.strictObject({
-  id: integrationId,
-  kind: integrationKind,
-  credential: credentialInput,
+const maxEndpointBody = 96_000;
+
+const endpointCredential = z.strictObject({
+  source: z.literal("encrypted-store"),
+  values: z.unknown(),
 });
+
+const createInput = z.union([
+  z.strictObject({
+    id: integrationId,
+    kind: integrationKind.exclude(["http"]),
+    credential: credentialInput,
+  }),
+  z.strictObject({
+    id: integrationId,
+    kind: z.literal("http"),
+    endpoint: z.unknown(),
+    credential: endpointCredential,
+  }),
+]);
 
 const stateInput = z.strictObject({ enabled: z.boolean() });
 
@@ -51,20 +75,28 @@ adminRoutes.get("/integrations", traceAdmin("admin.integration.list"), async (co
 );
 
 adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async (context) => {
-  const input = createInput.safeParse(await readJson(context.req.raw, maxAdminBody));
+  const input = createInput.safeParse(await readJson(context.req.raw, maxEndpointBody));
 
   if (!input.success) return failure(400, "invalid_integration");
 
   const { id, kind } = input.data;
   const now = Date.now();
-  const revision = { identity: crypto.randomUUID(), id, kind, credentialVersion: 1 };
+  const identity = crypto.randomUUID();
+  const keyring = context.get("keyring");
+  const endpoint = input.data.kind === "http" ? normalizeEndpoint(input.data.endpoint) : null;
+  const revision = { identity, id, kind, endpoint: endpoint ?? null, credentialVersion: 1 };
+  let credential;
 
-  const credential = await prepareCredential(
-    input.data.credential,
-    revision,
-    context.env,
-    context.get("keyring"),
-  );
+  if (input.data.kind === "http") {
+    const values = normalizeEndpointValues(input.data.credential.values);
+
+    if (!endpoint || !values || !matchingEndpointValues(endpoint, values, "full"))
+      return failure(400, "invalid_integration");
+
+    credential = await sealEndpointValues(values, revision, keyring);
+  } else {
+    credential = await prepareCredential(input.data.credential, revision, context.env, keyring);
+  }
 
   if (!credential) return failure(503, "credential_unavailable");
 
@@ -109,7 +141,10 @@ adminRoutes.put(
   traceAdmin("admin.integration.rotate"),
   async (context) => {
     const id = integrationId.safeParse(context.req.param("id"));
-    const input = credentialInput.safeParse(await readJson(context.req.raw, maxAdminBody));
+
+    const input = z
+      .union([credentialInput, endpointCredential])
+      .safeParse(await readJson(context.req.raw, maxEndpointBody));
 
     if (!id.success || !input.success) return failure(400, "invalid_credential");
 
@@ -118,12 +153,32 @@ adminRoutes.put(
 
     if (!revision) return failure(404, "integration_not_found");
 
-    const credential = await prepareCredential(
-      input.data,
-      { ...revision, credentialVersion: revision.credentialVersion + 1 },
-      context.env,
-      context.get("keyring"),
-    );
+    const next = { ...revision, credentialVersion: revision.credentialVersion + 1 };
+    const keyring = context.get("keyring");
+    let credential;
+
+    if (revision.kind === "http") {
+      const { endpoint, credential: previous } = revision;
+      const values = "values" in input.data && normalizeEndpointValues(input.data.values);
+
+      if (!endpoint || !values || !matchingEndpointValues(endpoint, values, "partial"))
+        return failure(400, "invalid_credential");
+
+      if (matchingEndpointValues(endpoint, values, "full")) {
+        credential = await sealEndpointValues(values, next, keyring);
+      } else {
+        const current =
+          previous.source === "encrypted-store" &&
+          (await openEndpointValues(previous, revision, keyring));
+
+        if (current)
+          credential = await sealEndpointValues({ ...current, ...values }, next, keyring);
+      }
+    } else {
+      if ("values" in input.data) return failure(400, "invalid_credential");
+
+      credential = await prepareCredential(input.data, next, context.env, keyring);
+    }
 
     if (!credential) return failure(503, "credential_unavailable");
 
