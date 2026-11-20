@@ -371,7 +371,7 @@ describe("credential broker running in workerd", () => {
     assert.equal((await issue(["openai"], "z".repeat(32))).status, 401);
     assert.equal((await issue(["unknown"])).status, 403);
     assert.equal((await issue(["openai", "openai"])).status, 400);
-    assert.equal((await issue(["openai"], apiKey, 3601)).status, 400);
+    assert.equal((await issue(["openai"], apiKey, 604_801)).status, 400);
 
     const record = await grant(["openai"]);
     assert.equal((await issue(["openai"], record.token)).status, 401);
@@ -1135,7 +1135,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 3 },
+        { count: 4 },
       ]);
 
       const path = "/gateway/openai/v1/models";
@@ -1718,7 +1718,10 @@ test("stores only sealed material, keeps rotation scope, and revokes on disable 
 
     const details = await admin(item);
     assert.equal(details.status, 200);
-    assert.deepEqual(meta.parse(await details.json()), created);
+    assert.deepEqual(meta.extend({ issuable: z.boolean() }).parse(await details.json()), {
+      ...created,
+      issuable: false,
+    });
     const catalog = await admin("/integrations");
     assert.equal(catalog.status, 200);
     const catalogJson = await catalog.text();
@@ -2003,7 +2006,7 @@ test("client and Worker agree on serialized admin and grant limits", async () =>
 
     const integrations = ids.slice(0, 16);
 
-    for (const ttlSeconds of [1, 3600]) {
+    for (const ttlSeconds of [1, 3600, 604_800]) {
       const granted = await broker.issue({ integrations, ttlSeconds });
       assert.deepEqual(granted.integrations, integrations);
       await broker.revoke(granted.id);
@@ -2011,7 +2014,7 @@ test("client and Worker agree on serialized admin and grant limits", async () =>
 
     for (const request of [
       { integrations, ttlSeconds: 0 },
-      { integrations, ttlSeconds: 3601 },
+      { integrations, ttlSeconds: 604_801 },
       { integrations: ids.slice(0, 17), ttlSeconds: 60 },
     ]) {
       const before = calls;
@@ -2023,4 +2026,117 @@ test("client and Worker agree on serialized admin and grant limits", async () =>
     await runtime.dispose();
     runtime = original;
   }
+});
+
+test("explains refused issuance, lists and renews grants, and reports status by role", async () => {
+  const url = "https://broker.test";
+  const broker = createCredentialBroker({ url, auth: { apiKey }, fetch: relayRequest });
+  const adminClient = createCredentialBrokerAdmin({ url, apiKey: adminKey, fetch: relayRequest });
+
+  const refusal = async (integrations: string[]) => {
+    const response = await issue(integrations);
+    assert.equal(response.status, 403);
+
+    return response.json();
+  };
+
+  assert.deepEqual(await refusal(["missing-one"]), {
+    error: "integration_forbidden",
+    reason: "not_found",
+    integrations: ["missing-one"],
+  });
+
+  await createIntegration("parked", "openai", { source: "encrypted-store", value: "parked-key" });
+  assert.deepEqual(await refusal(["openai", "parked"]), {
+    error: "integration_forbidden",
+    reason: "not_allowlisted",
+    integrations: ["parked"],
+  });
+
+  await assert.rejects(broker.issue({ integrations: ["parked"] }), {
+    code: "FORBIDDEN",
+    reason: "not_allowlisted",
+    message: /beachside-broker issuer allow parked/,
+  });
+
+  assert.ok((await adminClient.issuerPermissions.allow("parked")).integrations.includes("parked"));
+  assert.ok((await adminClient.issuerPermissions.allow("parked")).integrations.includes("parked"));
+  assert.equal((await adminClient.integrations.get("parked")).issuable, true);
+  await adminClient.integrations.setEnabled("parked", false);
+  assert.deepEqual(await refusal(["parked"]), {
+    error: "integration_forbidden",
+    reason: "disabled",
+    integrations: ["parked"],
+  });
+  await adminClient.integrations.setEnabled("parked", true);
+  assert.ok(!(await adminClient.issuerPermissions.deny("parked")).integrations.includes("parked"));
+  await assert.rejects(adminClient.issuerPermissions.allow("missing-one"), {
+    code: "NOT_FOUND",
+    message: /Integration missing-one was not found/,
+  });
+
+  const week = 604_800;
+
+  const granted = await broker.issue({
+    integrations: ["openai"],
+    ttlSeconds: week,
+    label: "box web",
+  });
+
+  assert.deepEqual(granted.kinds, { openai: "openai" });
+  assert.ok(Date.parse(granted.expiresAt) - Date.now() > (week - 60) * 1_000);
+
+  const response = await access("/gateway/openai/v1/models", granted.token);
+  assert.equal(response.status, 200);
+  await response.text();
+
+  const mine = await broker.list();
+  const listed = mine.find(({ id }) => id === granted.id);
+  assert.equal(listed?.label, "box web");
+  assert.deepEqual(listed?.integrations, ["openai"]);
+  assert.equal(listed?.requests, 1);
+  assert.ok(listed?.lastUsedAt);
+  assert.equal(listed?.owner, undefined);
+
+  const everyone = await adminClient.grants.list();
+  assert.equal(everyone.find(({ id }) => id === granted.id)?.owner, "broker-api-key");
+
+  const renewed = await broker.renew(granted.id, 60);
+  assert.ok(Date.parse(renewed.expiresAt) - Date.now() <= 60_000);
+  await assert.rejects(broker.renew(granted.id, week + 1), { code: "INVALID_ARGUMENT" });
+  assert.equal(
+    (
+      await runtime.dispatchFetch(`${url}/v1/grants/${granted.id}/renew`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({ ttlSeconds: week + 1 }),
+      })
+    ).status,
+    400,
+  );
+
+  await broker.revoke(granted.id);
+  await assert.rejects(broker.renew(granted.id, 60), { code: "NOT_FOUND" });
+
+  const sandbox = await broker
+    .sandbox({ endpoints: [{ integration: "openai", baseURLEnv: "BASE", apiKeyEnv: "KEY" }] })
+    .acquire(AbortSignal.timeout(5_000));
+
+  assert.equal(sandbox.env.BASE, `${url}/gateway/openai/v1`);
+  assert.ok(Date.parse(await sandbox.renew(120, AbortSignal.timeout(5_000))) > Date.now());
+  await sandbox.revoke(AbortSignal.timeout(5_000));
+
+  assert.equal((await broker.status()).role, "issuer");
+  const status = await adminClient.status();
+  assert.equal(status.role, "admin");
+  assert.equal(status.limits.maxGrantTtlSeconds, week);
+  assert.ok((status.counts?.integrations ?? 0) >= defaultNames.length);
+  assert.equal((await runtime.dispatchFetch(`${url}/v1/status`)).status, 401);
+
+  const config = await adminClient.config();
+  assert.equal(config.issuerKey, true);
+  assert.equal(config.githubActions?.audience, audience);
+  assert.equal(config.workerSecretBindings, kinds.length + 1);
+
+  await adminClient.integrations.delete("parked");
 });

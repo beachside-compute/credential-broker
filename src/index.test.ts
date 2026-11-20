@@ -396,3 +396,95 @@ test("maps configurable HTTP endpoints to caller-selected sandbox environment va
     "Invalid or duplicate",
   );
 });
+
+test("uses each integration's reported kind, so provider shorthands work with generic HTTP integrations", async () => {
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      const { integrations } = await request.json();
+
+      return Response.json(
+        {
+          id,
+          token,
+          expiresAt,
+          integrations,
+          kinds: { openrouter: "http", gpt: "openai", work: "openai", gh: "github" },
+        },
+        { status: 201 },
+      );
+    },
+  });
+
+  const grant = await broker
+    .sandbox({
+      github: "gh",
+      openrouter: "openrouter",
+      openai: "gpt",
+      endpoints: [{ integration: "work", baseURLEnv: "WORK_BASE_URL", apiKeyEnv: "WORK_KEY" }],
+    })
+    .acquire(new AbortController().signal);
+
+  expect(grant.env).toMatchObject({
+    OPENROUTER_BASE_URL: `${url}/gateway/openrouter`,
+    OPENAI_BASE_URL: `${url}/gateway/gpt/v1`,
+    WORK_BASE_URL: `${url}/gateway/work/v1`,
+  });
+  expect(grant.id).toBe(id);
+  expect(grant.integrations).toEqual(["gh", "gpt", "openrouter", "work"]);
+});
+
+test("refuses a GitHub shorthand that names a non-GitHub integration and revokes the grant", async () => {
+  const methods: string[] = [];
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch(request) {
+      methods.push(request.method);
+
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+
+      return Response.json(
+        { id, token, expiresAt, integrations: ["router"], kinds: { router: "http" } },
+        { status: 201 },
+      );
+    },
+  });
+
+  await expect(
+    broker.sandbox({ github: "router" }).acquire(new AbortController().signal),
+  ).rejects.toMatchObject({ code: "INVALID_ARGUMENT", message: expect.stringContaining("router") });
+  expect(methods).toEqual(["POST", "DELETE"]);
+});
+
+test("explains issuance refusals and accepts a loopback HTTP broker for local development", async () => {
+  const broker = createCredentialBroker({
+    url: "http://localhost:8787",
+    auth: { apiKey: key },
+    async fetch(request) {
+      expect(request.url).toBe("http://localhost:8787/v1/grants");
+
+      return Response.json(
+        { error: "integration_forbidden", reason: "not_allowlisted", integrations: ["router"] },
+        { status: 403 },
+      );
+    },
+  });
+
+  await expect(broker.issue({ integrations: ["router"] })).rejects.toMatchObject({
+    code: "FORBIDDEN",
+    reason: "not_allowlisted",
+    integrations: ["router"],
+    message: expect.stringContaining("issuer allow router"),
+  });
+
+  for (const remote of ["http://broker.example.com", "http://10.0.0.1"])
+    expect(() => createCredentialBroker({ url: remote, auth: { apiKey: key } })).toThrow(
+      "A valid HTTPS URL is required",
+    );
+
+  expect(() => broker.issue({ integrations: ["router"], ttlSeconds: 604_801 })).toThrow();
+});

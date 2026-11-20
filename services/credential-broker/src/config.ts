@@ -2,7 +2,14 @@ import { z } from "zod";
 
 export const integrationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
-export const maxGrantTtlSeconds = 3_600;
+/** Seven days, long enough for an always-on sandbox between renewals. */
+export const maxGrantTtlSeconds = 604_800;
+
+/** Printable ASCII without leading or trailing space, shown in grant listings. */
+export const grantLabel = z.string().regex(/^[\x21-\x7e](?:[\x20-\x7e]{0,126}[\x21-\x7e])?$/);
+
+/** Feature level of the broker HTTP API, reported by `GET /v1/status`. */
+export const apiVersion = 2;
 
 export const workerSecretBinding = z.templateLiteral([
   "CREDENTIAL_",

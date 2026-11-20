@@ -12,6 +12,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/commands.d.ts",
+      "import": "./dist/commands.js"
     }
   },
   "bin": {

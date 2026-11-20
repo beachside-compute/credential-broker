@@ -34,7 +34,9 @@ export type AdminOperation =
   | "admin.integration.rotate"
   | "admin.integration.delete"
   | "admin.issuer_permissions.read"
-  | "admin.issuer_permissions.update";
+  | "admin.issuer_permissions.update"
+  | "admin.grant.list"
+  | "admin.config.read";
 
 type Operation = "grant.create" | "grant.revoke" | "gateway" | AdminOperation;
 

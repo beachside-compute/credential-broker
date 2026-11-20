@@ -11,6 +11,10 @@ export const grants = sqliteTable(
     traceparent: text(),
     rateWindow: integer("rate_window").notNull().default(0),
     rateCount: integer("rate_count").notNull().default(0),
+    createdAt: integer("created_at").notNull().default(0),
+    label: text(),
+    requests: integer().notNull().default(0),
+    lastUsedAt: integer("last_used_at"),
   },
   (table) => [
     index("grants_expiration").on(table.expiresAt),

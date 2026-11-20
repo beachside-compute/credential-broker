@@ -93,38 +93,46 @@ Fill in the three values, then start the Worker from the repository root.
 bun run dev
 ```
 
-Wrangler runs the Worker and SQLite Durable Object locally. Use its local URL with your fixture admin or issuer key.
+Wrangler runs the Worker and SQLite Durable Object locally. The client and CLI accept plain HTTP for `localhost`, `127.0.0.1` and `[::1]`, so point them at the local URL with your fixture keys.
+
+```sh
+BEACHSIDE_BROKER_URL=http://localhost:8787 BEACHSIDE_BROKER_ADMIN_KEY=LOCAL_ADMIN_KEY bun run broker status
+```
 
 ## Manage integrations
 
-From the deployment checkout, use the HTTPS origin printed by Wrangler to open the integration setup wizard. Choose OpenRouter, name the integration `router-work`, and enter its upstream API key when prompted. The command runs the management CLI with the admin key from `.env.deploy`.
+From the deployment checkout, save the HTTPS origin printed by Wrangler as `BEACHSIDE_BROKER_URL` in `.env.deploy`, then open the integration setup wizard. Choose OpenRouter, keep the ID `openrouter`, and enter its upstream API key when prompted. The command runs the management CLI with the admin key from `.env.deploy`, and lets the issuer mint grants for the new integration unless you pass `--no-allow-issue`.
 
 ```sh
-bun run broker --url https://your-broker.example.com integration setup
+bun run broker status
+bun run broker integration setup
 ```
 
-The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`. Setup displays a confirmation. Add `--json` to write the integration metadata to stdout instead.
+The integration ID is the name a sandbox uses to request access. Enter a unique ID for a second key of the same provider. Add `--json` to write the integration metadata to stdout. You can also pass `--url` for one command, or set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` in the environment. The separately installed `beachside-broker` CLI and `beachside broker` in the Beachside CLI run the same commands.
 
-Set `BEACHSIDE_BROKER_URL=https://your-broker.example.com` in `.env.deploy` to reuse that origin for later commands. You can also set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` together in the environment. If you omit `--url`, the checkout command uses a configured URL and admin key from the same source.
-
-To permit grant issuance for a new `router-work` integration, review the current list and add the integration ID. Include the existing IDs you want to keep when calling `issuer set`.
+The issuance allowlist decides which integrations the issuer can mint grants for. `integration create --allow-issue` and the setup wizard add the new integration. Change it one ID at a time, or replace the whole list.
 
 ```sh
 bun run broker issuer show
-bun run broker issuer set router-work
+bun run broker issuer allow openrouter
+bun run broker issuer deny openrouter
+bun run broker issuer set openrouter github-work
 ```
 
-You can also use the separately installed `beachside-broker` CLI with `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` set on the trusted operator host.
+`integration list` shows each integration's state, whether it is allowed to issue, its upstream and credential version. `config show` prints the GitHub Actions trust policy from `BROKER_CONFIG`.
 
-### Issue a temporary grant
+### Issue and manage grants
 
 ```sh
-bun run broker grant issue router-work
+bun run broker grant issue openrouter --ttl 12h --label "sandbox web"
+bun run broker grant list
+bun run broker grant renew GRANT_ID --ttl 7d
+bun run broker grant revoke GRANT_ID
 ```
 
-Use `gatewayUrls["router-work"]` as the API base URL and `token` as the API key. The URL is ready to use for an OpenRouter integration created by setup. It already maps to the upstream API base. Use `gatewayUrls` with configurable HTTP integrations. Built-in provider and GitHub integrations use the [gateway settings](#use-the-gateways) below. Grant issuance defaults to 300 seconds. Use `--ttl <seconds>` to change the lifetime or `--token` to print only the token. Keep the output private.
+Use the base URL for each integration as the client's API base and the token as its API key. The broker reports each integration's kind, so the URL already maps to the upstream base for built-in and configurable integrations. Grants default to 15 minutes. `--ttl` takes seconds or a number with `s`, `m`, `h` or `d`, up to `7d`. `--token` prints only the token and `--json` the full record. Keep the output private.
 
-To revoke the grant, set `GRANT_ID` to the `id` from the JSON output and run `bun run broker grant revoke "$GRANT_ID"`. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
+`grant list` shows the issuer's active grants with label, expiry, request count and last use. `grant list --all` uses the admin key to show every grant and its issuing authority. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
 
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 
@@ -144,6 +152,10 @@ For a declared Worker secret, use `integration create <id> --provider <kind> --w
 | `DELETE /v1/admin/integrations/:id`         | Returns `204`, including if the name is absent.                                                 | `400` invalid ID                                                                                                                  |
 | `GET /v1/admin/issuer-permissions`          | Returns `{ "integrations": ["..."] }`.                                                          |                                                                                                                                   |
 | `PUT /v1/admin/issuer-permissions`          | Replaces the allowlist with `{ "integrations": ["..."] }`. An empty list disables new issuance. | `400` invalid input, `404 integration_not_found` for an unknown ID                                                                |
+| `PUT /v1/admin/issuer-permissions/:id`      | Adds one integration to the allowlist. Returns the list.                                        | `400` invalid ID, `404 integration_not_found`                                                                                     |
+| `DELETE /v1/admin/issuer-permissions/:id`   | Removes one integration from the allowlist. Returns the list.                                   | `400` invalid ID, `404 integration_not_found`                                                                                     |
+| `GET /v1/admin/grants`                      | Returns `{ "grants": [...] }` with every active grant and its `owner`.                          |                                                                                                                                   |
+| `GET /v1/admin/config`                      | Returns the GitHub Actions policy, the number of Worker secret bindings, and `issuerKey`.       |                                                                                                                                   |
 
 All admin routes can return `401 administrator_authentication_required` or `503 broker_unavailable`. For a Worker-secret reference, an undeclared binding and a declared binding with an absent or invalid secret both return `503 credential_unavailable`. Check the declared binding names and the provisioned Worker secrets on the operator host. API responses omit secret values and Worker binding names. HTTP integration metadata includes the configured URL, header names, literal values, and secret prefixes.
 
@@ -229,12 +241,15 @@ Supported events are `push`, `schedule`, `workflow_dispatch`, `workflow_run`, an
 
 ## Grant API
 
-| Request                 | Result                                                                                                                                                                      |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /v1/grants`       | Create a grant with body `{ "integrations": ["github-work"], "ttlSeconds": 900 }`. The response is `201` and has `id`, `token`, `expiresAt` (ISO 8601), and `integrations`. |
-| `DELETE /v1/grants/:id` | Revoke under the issuing workflow run or static issuer key. Repeated requests return `204`.                                                                                 |
+| Request                     | Result                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/grants`           | Create a grant with body `{ "integrations": ["github-work"], "ttlSeconds": 900, "label": "sandbox web" }` (`label` is optional). The response is `201` and has `id`, `token`, `expiresAt` (ISO 8601), `integrations`, and `kinds` (each integration's kind). A refused integration returns `403` with `reason` (`not_found`, `disabled`, `not_allowlisted` or `not_in_policy`) and the `integrations` it names. |
+| `DELETE /v1/grants/:id`     | Revoke under the issuing workflow run or static issuer key. Repeated requests return `204`.                                                                                                                                                                                                                                                                                                                     |
+| `POST /v1/grants/:id/renew` | Body `{ "ttlSeconds": 604800 }`. Moves an active grant's expiry. Returns the grant summary, or `404 grant_not_found` for an expired, revoked or foreign grant.                                                                                                                                                                                                                                                  |
+| `GET /v1/grants`            | Returns `{ "grants": [...] }`: the caller's active grants with `id`, `integrations`, `label`, `createdAt`, `expiresAt`, `requests` and `lastUsedAt`. Tokens are never listed.                                                                                                                                                                                                                                   |
+| `GET /v1/status`            | With the admin, issuer or a workflow token. Returns `apiVersion`, `role`, `limits.maxGrantTtlSeconds`, and for the admin key integration and grant counts.                                                                                                                                                                                                                                                      |
 
-Grants last between 1 and 3,600 seconds. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
+Grants last between 1 second and 7 days (604,800 seconds). An issuer can renew its own active grant to a new lifetime of up to 7 days from the renewal, keeping its token and scope. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
 
 By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Each grant allows 120 requests per UTC minute and eight concurrent gateway requests, including streams. A lost lease release can occupy a slot until expiry. A request over a bound receives HTTP `429`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
 

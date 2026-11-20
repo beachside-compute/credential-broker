@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { and, count, eq, gt, inArray, lte, min, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lte, min, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
@@ -8,6 +8,7 @@ import type { CredentialReference } from "../credentials/source";
 import { integrations, issuerIntegrations } from "../integrations/schema";
 import { maxIntegrations } from "../integrations/types";
 import type {
+  IntegrationKind,
   IntegrationMetadata,
   IntegrationRevision,
   IntegrationSelector,
@@ -31,10 +32,31 @@ export interface GrantRecord {
   owner: string;
   integrations: string[];
   expiresAt: number;
+  label?: string;
   traceparent?: string;
 }
 
-type Issuance = "created" | "forbidden" | "ambiguous_github" | "limit";
+/** Why issuance refused an integration, most actionable first. */
+export type IssuanceRefusal = "not_in_policy" | "not_found" | "disabled" | "not_allowlisted";
+
+type Issuance =
+  | { status: "created"; kinds: Record<string, IntegrationKind> }
+  | { status: "forbidden"; reason: IssuanceRefusal; integrations: string[] }
+  | { status: "ambiguous_github" }
+  | { status: "limit" };
+
+export interface GrantSummary {
+  id: string;
+  owner: string;
+  integrations: string[];
+  label: string | null;
+  createdAt: number;
+  expiresAt: number;
+  requests: number;
+  lastUsedAt: number | null;
+}
+
+type Renewal = { status: "renewed"; grant: GrantSummary } | { status: "not_found" };
 
 type IntegrationCreation = "exists" | "limit" | IntegrationMetadata;
 
@@ -194,23 +216,47 @@ export class GrantRegistry extends DurableObject {
     const now = Date.now();
 
     const result = this.ctx.storage.transactionSync((): Issuance => {
-      if (
-        principal.integrations &&
-        record.integrations.some((id) => !principal.integrations!.includes(id))
-      ) {
-        return "forbidden";
-      }
+      const outsidePolicy = principal.integrations
+        ? record.integrations.filter((id) => !principal.integrations!.includes(id))
+        : [];
 
-      const selected = this.db
-        .select({ identity: integrations.identity, kind: integrations.kind })
-        .from(issuerIntegrations)
-        .innerJoin(integrations, eq(issuerIntegrations.identity, integrations.identity))
-        .where(and(eq(integrations.enabled, true), inArray(integrations.id, record.integrations)))
+      if (outsidePolicy.length)
+        return { status: "forbidden", reason: "not_in_policy", integrations: outsidePolicy };
+
+      const known = this.db
+        .select({
+          id: integrations.id,
+          identity: integrations.identity,
+          kind: integrations.kind,
+          enabled: integrations.enabled,
+          allowed: issuerIntegrations.identity,
+        })
+        .from(integrations)
+        .leftJoin(issuerIntegrations, eq(issuerIntegrations.identity, integrations.identity))
+        .where(inArray(integrations.id, record.integrations))
         .all();
 
-      if (selected.length !== record.integrations.length) return "forbidden";
+      const refused = (reason: IssuanceRefusal, ids: string[]): Issuance | undefined =>
+        ids.length ? { status: "forbidden", reason, integrations: ids } : undefined;
 
-      if (selected.filter(({ kind }) => kind === "github").length > 1) return "ambiguous_github";
+      const refusal =
+        refused(
+          "not_found",
+          record.integrations.filter((id) => !known.some((row) => row.id === id)),
+        ) ??
+        refused(
+          "disabled",
+          known.filter(({ enabled }) => !enabled).map(({ id }) => id),
+        ) ??
+        refused(
+          "not_allowlisted",
+          known.filter(({ allowed }) => allowed === null).map(({ id }) => id),
+        );
+
+      if (refusal) return refusal;
+
+      if (known.filter(({ kind }) => kind === "github").length > 1)
+        return { status: "ambiguous_github" };
 
       // Bound all active rows, including simultaneous issuances from several workflow runs.
       const { total } = this.db
@@ -225,9 +271,9 @@ export class GrantRegistry extends DurableObject {
         .where(and(eq(grants.owner, record.owner), gt(grants.expiresAt, now)))
         .get()!;
 
-      if (total >= maxActiveGrants || owned >= maxActiveGrantsPerOwner) return "limit";
+      if (total >= maxActiveGrants || owned >= maxActiveGrantsPerOwner) return { status: "limit" };
 
-      const { id, hash, owner, expiresAt, traceparent } = record;
+      const { id, hash, owner, expiresAt, traceparent, label } = record;
       this.db
         .insert(grants)
         .values({
@@ -236,16 +282,119 @@ export class GrantRegistry extends DurableObject {
           owner,
           expiresAt,
           traceparent,
-          permissions: selected.map(({ identity }) => identity),
+          label,
+          createdAt: now,
+          permissions: known.map(({ identity }) => identity),
         })
         .run();
 
-      return "created";
+      return {
+        status: "created",
+        kinds: Object.fromEntries(known.map(({ id: name, kind }) => [name, kind])),
+      };
     });
 
-    if (result === "created") await this.scheduleCleanup(record.expiresAt);
+    if (result.status === "created") await this.scheduleCleanup(record.expiresAt);
 
     return result;
+  }
+
+  /** Active grants, newest first. Pass an owner to see only that issuer's grants. */
+  listGrants(owner?: string): GrantSummary[] {
+    const now = Date.now();
+
+    const names = new Map(
+      this.db
+        .select({ identity: integrations.identity, id: integrations.id })
+        .from(integrations)
+        .all()
+        .map(({ identity, id }) => [identity, id]),
+    );
+
+    return this.db
+      .select()
+      .from(grants)
+      .where(
+        owner === undefined
+          ? gt(grants.expiresAt, now)
+          : and(eq(grants.owner, owner), gt(grants.expiresAt, now)),
+      )
+      .orderBy(desc(grants.createdAt), grants.id)
+      .all()
+      .map((grant) => summary(grant, names));
+  }
+
+  /** Move an active grant's expiry to `expiresAt`, keeping its scope and token. */
+  async renew(id: string, owner: string, expiresAt: number): Promise<Renewal> {
+    const now = Date.now();
+
+    const renewed = this.db
+      .update(grants)
+      .set({ expiresAt })
+      .where(and(eq(grants.id, id), eq(grants.owner, owner), gt(grants.expiresAt, now)))
+      .returning()
+      .get();
+
+    if (!renewed) return { status: "not_found" };
+
+    await this.scheduleCleanup(expiresAt);
+
+    const names = new Map(
+      this.db
+        .select({ identity: integrations.identity, id: integrations.id })
+        .from(integrations)
+        .where(inArray(integrations.identity, renewed.permissions))
+        .all()
+        .map(({ identity, id: name }) => [identity, name]),
+    );
+
+    return { status: "renewed", grant: summary(renewed, names) };
+  }
+
+  /** Counts for the admin status view. */
+  counts() {
+    const now = Date.now();
+    const { total } = this.db.select({ total: count() }).from(integrations).get()!;
+    const { issuable } = this.db.select({ issuable: count() }).from(issuerIntegrations).get()!;
+
+    const { active } = this.db
+      .select({ active: count() })
+      .from(grants)
+      .where(gt(grants.expiresAt, now))
+      .get()!;
+
+    return { integrations: total, issuable, activeGrants: active };
+  }
+
+  allowIssuerIntegration(id: string): string[] | undefined {
+    return this.ctx.storage.transactionSync(() => {
+      const integration = this.findIntegration(id);
+
+      if (!integration) return;
+
+      this.db
+        .insert(issuerIntegrations)
+        .values({ identity: integration.identity })
+        .onConflictDoNothing()
+        .run();
+
+      return this.listIssuerIntegrations();
+    });
+  }
+
+  denyIssuerIntegration(id: string): string[] | undefined {
+    return this.ctx.storage.transactionSync(() => {
+      const integration = this.findIntegration(id);
+
+      if (!integration) return;
+
+      this.db
+        .delete(issuerIntegrations)
+        .where(eq(issuerIntegrations.identity, integration.identity))
+        .run();
+
+      return this.listIssuerIntegrations();
+    });
   }
 
   revoke(id: string, owner: string): void {
@@ -309,7 +458,12 @@ export class GrantRegistry extends DurableObject {
       const leaseId = crypto.randomUUID();
       this.db
         .update(grants)
-        .set({ rateWindow: window, rateCount: used + 1 })
+        .set({
+          rateWindow: window,
+          rateCount: used + 1,
+          requests: grant.requests + 1,
+          lastUsedAt: now,
+        })
         .where(eq(grants.id, grant.id))
         .run();
       this.db.insert(leases).values({ id: leaseId, grantId: grant.id }).run();
@@ -365,5 +519,22 @@ function metadata(integration: StoredIntegration): IntegrationMetadata {
     createdAt: new Date(createdAt).toISOString(),
     updatedAt: new Date(updatedAt).toISOString(),
     ...(integration.endpoint && { endpoint: integration.endpoint }),
+  };
+}
+
+function summary(
+  grant: typeof grants.$inferSelect,
+  names: ReadonlyMap<string, string>,
+): GrantSummary {
+  return {
+    id: grant.id,
+    owner: grant.owner,
+    // A deleted integration revokes its grants, so every identity still has a name.
+    integrations: grant.permissions.flatMap((identity) => names.get(identity) ?? []),
+    label: grant.label,
+    createdAt: grant.createdAt,
+    expiresAt: grant.expiresAt,
+    requests: grant.requests,
+    lastUsedAt: grant.lastUsedAt,
   };
 }

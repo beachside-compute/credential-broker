@@ -33,68 +33,73 @@ Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated d
 
 ## Add an OpenRouter key
 
-From the deployment checkout, run the integration setup command with the HTTPS origin printed by Wrangler. Choose OpenRouter, name the integration `router-work`, and enter its API key in the hidden prompt.
+Save the deployed origin in `.env.deploy` so later commands can find it, then check the broker and your key.
 
 ```sh
-bun run broker --url https://your-broker.example.com integration setup
+echo 'BEACHSIDE_BROKER_URL=https://your-broker.example.com' >> .env.deploy
+bun run broker status
 ```
 
-The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`. Setup displays a confirmation. Add `--json` to write the integration metadata to stdout instead.
-
-The command loads the admin key from `.env.deploy`. Add `BEACHSIDE_BROKER_URL=https://your-broker.example.com` to that file with your deployed URL so later commands can omit `--url`.
-
-Check which integrations the issuer can use.
+Run the integration setup command. Choose OpenRouter, press Enter to keep the ID `openrouter`, and enter its API key in the hidden prompt. Setup also lets the issuer mint grants for the new integration. Pass `--no-allow-issue` to allow it later with `issuer allow`.
 
 ```sh
-bun run broker issuer show
+bun run broker integration setup
 ```
 
-If the list is empty, allow grants for `router-work`.
+The integration ID is the name a sandbox uses to request access. Use a unique ID such as `openrouter-team` when you add a second key for the same provider. The same command offers other model gateways and custom HTTPS endpoints. See the [endpoint runbook](./services/credential-broker/README.md#configurable-https-endpoints) for unattended setup.
+
+The checkout command reads the admin and issuer keys from `.env.deploy`. On another machine, install the CLI with `npm install -g @beachside/credential-client` and set `BEACHSIDE_BROKER_URL` with `BEACHSIDE_BROKER_ADMIN_KEY` or `BEACHSIDE_BROKER_ISSUER_KEY`. The Beachside CLI also runs these commands as `beachside broker ...` with keys from its config.
+
+### Issue a grant
 
 ```sh
-bun run broker issuer set router-work
+bun run broker grant issue openrouter --ttl 1h --label "my laptop test"
 ```
 
-If the list already contains IDs, pass them alongside `router-work` to keep them. The same setup command also offers other providers and custom HTTPS endpoints. See the [endpoint runbook](./services/credential-broker/README.md#configurable-https-endpoints) for unattended setup and rotation.
-
-### Issue a temporary grant
+The output shows the grant ID, its expiry, the base URL for each integration, and the token. Use the base URL as the client's API base and the token as its API key. Grants last 15 minutes by default and up to 7 days (`--ttl 7d`). Add `--token` to print only the token, or `--json` for the full record. Keep the output private.
 
 ```sh
-bun run broker grant issue router-work
+bun run broker grant list
+bun run broker grant renew GRANT_ID --ttl 7d
+bun run broker grant revoke GRANT_ID
 ```
 
-Use `gatewayUrls["router-work"]` as the API base URL and `token` as the API key. The URL is ready to use for an OpenRouter integration created by setup. It already maps to the upstream API base. Grant issuance defaults to 300 seconds. Use `--ttl <seconds>` to change the lifetime or `--token` to print only the token. Keep the output private.
-
-To revoke the grant, set `GRANT_ID` to the `id` from the JSON output and run `bun run broker grant revoke "$GRANT_ID"`. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
+`grant list` shows your issuer's active grants with their label, expiry and request count. `grant list --all` uses the admin key to show every grant on the broker.
 
 ### Rotate or invalidate access
 
 Rotate an upstream credential while preserving its broker grants. Requests authorized after rotation use the replacement.
 
 ```sh
-bun run broker integration rotate router-work --credentials-stdin < /secure/path/replacement-headers.json
+bun run broker integration rotate openrouter --credentials-stdin < /secure/path/replacement-headers.json
 ```
 
-Disable the integration to revoke its broker grants. Re-enable it to allow fresh grants.
+Stop new grants for an integration while existing grants keep working, or disable it to revoke them too.
 
 ```sh
-bun run broker integration disable router-work
-bun run broker integration enable router-work
+bun run broker issuer deny openrouter
+bun run broker integration disable openrouter
+bun run broker integration enable openrouter
+bun run broker issuer allow openrouter
 ```
 
 To remove the integration entirely:
 
 ```sh
-bun run broker integration delete router-work
+bun run broker integration delete openrouter
 ```
 
 Deleting an integration also revokes its grants and removes it from the issuer allowlist. Requests already authorized may finish. Broker revocation leaves the upstream token active at GitHub or its provider. See the [deployment runbook](./services/credential-broker/README.md#manage-integrations) for lifecycle and key-rotation details.
+
+### Command output
+
+Commands print text for people and JSON with `--json`. Errors name the fix, for example `Integration openrouter is not allowed to issue grants. Allow it with ...`. Exit codes match the Beachside CLI: 0 success, 1 other failure, 2 usage, 3 not found, 5 authentication or permission, 6 outcome unknown (a write may have applied; check before retrying), 7 retryable.
 
 ## Use the client
 
 ![A sandbox calls the broker with a temporary grant. The broker swaps it for the upstream key, calls OpenRouter, and relays the response to the sandbox.](./docs/images/credential-broker-flow.png)
 
-The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds })` and `broker.revoke(grant.id)` from a trusted host. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. If a grant issuance response is lost, an issued grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
+The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds, label })`, `broker.renew(grant.id, ttlSeconds)`, `broker.list()` and `broker.revoke(grant.id)` from a trusted host. Grants last up to 7 days. `@beachside/credential-client/cli` exports `runBrokerCli` for tools that embed the commands. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. If a grant issuance response is lost, an issued grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
 
 For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/guides/credential-broker/).
 
@@ -104,7 +109,7 @@ For a configurable HTTP integration, map its gateway URL and temporary grant to 
 const credentials = broker.sandbox({
   endpoints: [
     {
-      integration: "router-work",
+      integration: "openrouter",
       baseURLEnv: "OPENROUTER_BASE_URL",
       apiKeyEnv: "OPENROUTER_API_KEY",
     },
@@ -112,7 +117,7 @@ const credentials = broker.sandbox({
 });
 ```
 
-If `router-work` has upstream base URL `https://openrouter.ai/api/v1`, the sandbox base URL ends at `/gateway/router-work`. Set the client to use that URL as its API base.
+The broker reports each integration's kind with the grant, so the base URL always matches what the client should call. The shorthand properties (`openrouter: "openrouter"`, `openai`, `anthropic`) work with integrations created by setup as well as the built-in kinds.
 
 For OpenCode v2, set the provider’s `baseURL` to the broker endpoint and its `apiKey` to the temporary grant. `OPENCODE_CONFIG_CONTENT` takes the nested JSON shown in the [OpenCode configuration example](./services/credential-broker/README.md#opencode).
 

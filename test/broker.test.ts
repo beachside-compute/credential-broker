@@ -112,6 +112,9 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
 
         expect(authorization).toBe(`Bearer ${adminKey}`);
 
+        if (request.method === "PUT" && path === "/v1/admin/issuer-permissions/openrouter")
+          return Response.json({ integrations: ["openrouter"] });
+
         if (request.method === "POST") {
           expect(await request.json()).toEqual({
             id: "openrouter",
@@ -153,7 +156,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
         return { status, stdout, stderr };
       };
 
-      const list = ["integration", "list"];
+      const list = ["integration", "list", "--json"];
       const unpaired = await run(list, { BEACHSIDE_BROKER_URL: origin });
       expect(unpaired.status).toBe(1);
       expect(unpaired.stderr).toContain("--url");
@@ -170,6 +173,12 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           authorization: `Bearer ${adminKey}`,
         })),
       );
+      const human = await run(["integration", "list"]);
+      expect(human.status, human.stderr).toBe(0);
+      expect(human.stdout).toContain(
+        "No integrations yet. Add one with `bun run broker integration setup`.",
+      );
+      requests.length = 0;
 
       for (const json of [false, true]) {
         const prompts = [
@@ -224,14 +233,13 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           expect(transcript).not.toContain("broker.sandbox");
 
           if (json) {
-            expect(JSON.parse(stdout)).toEqual(metadata);
+            expect(JSON.parse(stdout)).toEqual({ ...metadata, issuable: true });
             expect(transcript).not.toContain("Created integration openrouter.");
           } else {
             expect(stdout).toBe("");
             expect(transcript).toContain("Created integration openrouter.");
-            expect(transcript).toContain("create temporary grants for this integration");
-            expect(transcript).toContain("issuer show");
-            expect(transcript).toContain("issuer set with your existing IDs plus openrouter");
+            expect(transcript).toContain("The issuer can now mint grants for openrouter");
+            expect(transcript).toContain("bun run broker grant issue openrouter");
           }
         } finally {
           clearTimeout(timeout);
@@ -250,7 +258,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
         `${settings}BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`,
       );
 
-      const issued = await run(["--url", origin, ...issue], {
+      const issued = await run(["--url", origin, ...issue, "--json"], {
         BEACHSIDE_BROKER_ADMIN_KEY: adminKey,
       });
 
@@ -262,23 +270,28 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       const raw = await run([...issue, "--ttl", "60", "--token"]);
       expect(raw.status, raw.stderr).toBe(0);
       expect(raw.stdout).toBe(`${grant.token}\n`);
+      const weekly = await run([...issue, "--ttl", "7d", "--label", "box web"]);
+      expect(weekly.status, weekly.stderr).toBe(0);
+      expect(weekly.stdout).toContain(`base url  openrouter: ${origin}/gateway/openrouter`);
+      expect(weekly.stdout).toContain(`bun run broker grant revoke ${grant.id}`);
       expect(grantRequests).toEqual([
-        { integrations: ["openrouter"], ttlSeconds: 300 },
+        { integrations: ["openrouter"], ttlSeconds: 900 },
         { integrations: ["openrouter"], ttlSeconds: 60 },
+        { integrations: ["openrouter"], ttlSeconds: 604_800, label: "box web" },
       ]);
-      const revoked = await run(["grant", "revoke", grant.id]);
+      const revoked = await run(["grant", "revoke", grant.id, "--json"]);
       expect(revoked.status, revoked.stderr).toBe(0);
-      expect(JSON.parse(revoked.stdout)).toEqual({ revoked: true });
+      expect(JSON.parse(revoked.stdout)).toEqual({ revoked: true, id: grant.id });
       expect(requests.at(-1)).toEqual({
         path: `/v1/grants/${grant.id}`,
         authorization: `Bearer ${issuerKey}`,
       });
       const beforeInvalid = requests.length;
 
-      for (const ttl of ["0", "3601", "5.5", "1e3"]) {
+      for (const ttl of ["0", "604801", "8d", "5.5", "1e3"]) {
         const invalid = await run([...issue, "--ttl", ttl]);
-        expect(invalid.status).toBe(1);
-        expect(invalid.stderr).toContain("--ttl must be 1 to 3600 seconds");
+        expect(invalid.status).toBe(2);
+        expect(invalid.stderr).toContain("--ttl must be 1s to 7d");
       }
 
       writeFileSync(secretFile, `BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`);

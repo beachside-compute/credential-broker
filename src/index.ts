@@ -3,6 +3,9 @@
 import {
   assertStatus,
   bearerToken,
+  brokerFailure,
+  maxGrantTtlSeconds,
+  refusalMessage,
   brokerOrigin,
   CredentialBrokerError,
   defaultFetch,
@@ -19,10 +22,21 @@ import {
   type Fetch,
   type BrokerRequestOptions,
 } from "./transport.js";
+import {
+  brokerStatus,
+  grantId,
+  grantLabel,
+  grantListing,
+  grantSummary,
+  type BrokerGrantSummary,
+  type BrokerStatus,
+} from "./grants.js";
 
-export { CredentialBrokerError } from "./transport.js";
+export { CredentialBrokerError, maxGrantTtlSeconds } from "./transport.js";
 
-export type { BrokerRequestOptions } from "./transport.js";
+export type { BrokerRequestOptions, IssuanceRefusal } from "./transport.js";
+
+export type { BrokerGrantSummary, BrokerStatus } from "./grants.js";
 
 export {
   createCredentialBrokerAdmin,
@@ -48,14 +62,21 @@ export interface CredentialBrokerOptions {
 
 export interface BrokerGrantRequest {
   integrations: readonly string[];
+  /** 1 second to 7 days. Defaults to 900. */
   ttlSeconds?: number;
+  /** A name shown in grant listings, such as the sandbox the grant belongs to. */
+  label?: string;
 }
+
+export type BrokerIntegrationKindName = "github" | "anthropic" | "openai" | "openrouter" | "http";
 
 export interface BrokerGrant {
   readonly id: string;
   readonly token: string;
   readonly expiresAt: string;
   readonly integrations: readonly string[];
+  /** Each integration's kind. Brokers before API version 2 omit it. */
+  readonly kinds?: Readonly<Record<string, BrokerIntegrationKindName>>;
 }
 
 export interface SandboxEndpoint {
@@ -70,31 +91,54 @@ export interface SandboxIntegrations {
   openai?: string;
   openrouter?: string;
   endpoints?: readonly SandboxEndpoint[];
+  /** 1 second to 7 days. Defaults to 900. */
   ttlSeconds?: number;
+  /** A name shown in grant listings. */
+  label?: string;
 }
 
 export interface SandboxGrant {
+  readonly id: string;
+  readonly integrations: readonly string[];
   readonly env: Readonly<Record<string, string>>;
   readonly expiresAt: string;
   revoke(signal: AbortSignal, traceParent?: string): Promise<void>;
+  /** Move expiry to `ttlSeconds` from now (up to 7 days) and return the new expiry. */
+  renew(ttlSeconds: number, signal: AbortSignal, traceParent?: string): Promise<string>;
 }
 
-const grantId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const kindNames: readonly BrokerIntegrationKindName[] = [
+  "github",
+  "anthropic",
+  "openai",
+  "openrouter",
+  "http",
+];
 
-function validateRequest({ integrations, ttlSeconds = 900 }: BrokerGrantRequest) {
+function validTtl(ttlSeconds: number): boolean {
+  return Number.isSafeInteger(ttlSeconds) && ttlSeconds >= 1 && ttlSeconds <= maxGrantTtlSeconds;
+}
+
+function validateRequest({ integrations, ttlSeconds = 900, label }: BrokerGrantRequest) {
   if (
     !Array.isArray(integrations) ||
     !integrations.length ||
     integrations.length > 16 ||
     integrations.some((id) => typeof id !== "string" || !integrationName.test(id)) ||
     new Set(integrations).size !== integrations.length ||
-    !Number.isSafeInteger(ttlSeconds) ||
-    ttlSeconds < 1 ||
-    ttlSeconds > 3600
+    !validTtl(ttlSeconds) ||
+    (label !== undefined && (typeof label !== "string" || !grantLabel.test(label)))
   )
     throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker grant request");
 
-  return { integrations: [...integrations], ttlSeconds };
+  return { integrations: [...integrations], ttlSeconds, ...(label !== undefined && { label }) };
+}
+
+/** The base URL a client should use for one integration, given its kind. */
+export function integrationBaseURL(base: URL, id: string, kind: BrokerIntegrationKindName) {
+  const gateway = gatewayBaseURL(base, id);
+
+  return kind === "openai" || kind === "openrouter" ? `${gateway}/v1` : gateway;
 }
 
 /** Resolve a fresh GitHub Actions identity token per broker request. Run on the trusted host. */
@@ -147,8 +191,8 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
 
   async function management(
     path: string,
-    method: "POST" | "DELETE",
-    expected: 201 | 204,
+    method: "GET" | "POST" | "DELETE",
+    expected: 200 | 201 | 204,
     signal: AbortSignal,
     traceParent?: string,
     body?: string,
@@ -180,11 +224,60 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
       body,
     });
 
+    if (response.status === expected) return response;
+
     if (method === "POST" && response.status === 400) {
-      void response.body?.cancel().catch(() => undefined);
+      const { error } = await brokerFailure(response);
+
       throw new CredentialBrokerError(
         "INVALID_ARGUMENT",
-        "Credential broker rejected the grant request",
+        error === "multiple_github_integrations"
+          ? "A grant can include at most one GitHub integration"
+          : "Credential broker rejected the grant request",
+      );
+    }
+
+    if (response.status === 403) {
+      const { reason, integrations } = await brokerFailure(response);
+
+      if (reason && integrations?.length)
+        throw new CredentialBrokerError(
+          "FORBIDDEN",
+          refusalMessage(reason, integrations),
+          reason,
+          integrations,
+        );
+      throw new CredentialBrokerError("FORBIDDEN", "Credential request was denied");
+    }
+
+    if (response.status === 401) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new CredentialBrokerError(
+        "UNAUTHENTICATED",
+        "apiKey" in auth
+          ? "The broker rejected the issuer key. Use BROKER_ISSUER_KEY from the deployment, not the admin key"
+          : "The broker rejected the GitHub Actions identity. Check the audience and the workflow policy in BROKER_CONFIG",
+      );
+    }
+
+    if (response.status === 404) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new CredentialBrokerError(
+        "NOT_FOUND",
+        path === "/v1/status"
+          ? "This broker does not support status. Redeploy it from the latest credential-broker release"
+          : "The grant was not found. It may have expired, been revoked, or belong to another issuer",
+      );
+    }
+
+    if (response.status === 429) {
+      const { error } = await brokerFailure(response);
+
+      throw new CredentialBrokerError(
+        "RATE_LIMIT",
+        error === "grant_limit"
+          ? "The broker has reached its active grant limit. Revoke unused grants or wait for them to expire"
+          : "Credential endpoint is rate limiting requests",
       );
     }
 
@@ -218,6 +311,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
           "Credential broker returned an invalid grant",
         );
       const { id, token, expiresAt, integrations } = reply;
+      const kinds = "kinds" in reply ? reply.kinds : undefined;
 
       if (
         typeof id !== "string" ||
@@ -235,7 +329,24 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
           "Credential broker returned an invalid grant",
         );
 
-      return { id, token, expiresAt, integrations: body.integrations };
+      const parsedKinds =
+        kinds && typeof kinds === "object" && !Array.isArray(kinds)
+          ? Object.fromEntries(
+              Object.entries(kinds).flatMap(([name, kind]) => {
+                const known = kindNames.find((value) => value === kind);
+
+                return body.integrations.includes(name) && known ? [[name, known]] : [];
+              }),
+            )
+          : undefined;
+
+      return {
+        id,
+        token,
+        expiresAt,
+        integrations: body.integrations,
+        ...(parsedKinds && { kinds: parsedKinds }),
+      };
     } catch (error) {
       if (options.signal?.aborted)
         throw new CredentialBrokerError("WAIT_ABORTED", "Credential grant request was cancelled");
@@ -266,6 +377,71 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     }
   }
 
+  async function withBudget<T>(
+    options: BrokerRequestOptions,
+    label: string,
+    work: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const budget = withRequestSignal(options.signal);
+
+    try {
+      return await work(budget.signal);
+    } catch (error) {
+      if (options.signal?.aborted)
+        throw new CredentialBrokerError("WAIT_ABORTED", `${label} was cancelled`);
+
+      if (budget.timeout.aborted) throw new CredentialBrokerError("TIMEOUT", `${label} timed out`);
+      throw error;
+    }
+  }
+
+  /** Active grants issued by this issuer key or workflow run, newest first. */
+  async function list(options: BrokerRequestOptions = {}): Promise<BrokerGrantSummary[]> {
+    return withBudget(options, "Credential grant listing", async (signal) => {
+      const response = await management("/v1/grants", "GET", 200, signal, options.traceParent);
+
+      return grantListing(await waitForSignal(signal, () => jsonRecord(response)), false);
+    });
+  }
+
+  /** Move an active grant's expiry to `ttlSeconds` from now, up to 7 days. Returns the new expiry. */
+  async function renew(
+    id: string,
+    ttlSeconds: number,
+    options: BrokerRequestOptions = {},
+  ): Promise<BrokerGrantSummary> {
+    if (typeof id !== "string" || !grantId.test(id))
+      throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker grant identifier");
+
+    if (!validTtl(ttlSeconds))
+      throw new CredentialBrokerError(
+        "INVALID_ARGUMENT",
+        "Grant lifetime must be 1 second to 7 days",
+      );
+
+    return withBudget(options, "Credential grant renewal", async (signal) => {
+      const response = await management(
+        `/v1/grants/${id}/renew`,
+        "POST",
+        200,
+        signal,
+        options.traceParent,
+        JSON.stringify({ ttlSeconds }),
+      );
+
+      return grantSummary(await waitForSignal(signal, () => jsonRecord(response)), false);
+    });
+  }
+
+  /** Check the broker URL and key: the role the key has and the broker's limits. */
+  async function status(options: BrokerRequestOptions = {}): Promise<BrokerStatus> {
+    return withBudget(options, "Credential broker status", async (signal) => {
+      const response = await management("/v1/status", "GET", 200, signal, options.traceParent);
+
+      return brokerStatus(await waitForSignal(signal, () => jsonRecord(response)));
+    });
+  }
+
   function sandbox({
     github,
     anthropic,
@@ -273,6 +449,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
     openrouter,
     endpoints = [],
     ttlSeconds,
+    label,
   }: SandboxIntegrations) {
     const integrations = [github, anthropic, openai, openrouter].filter((id) => id !== undefined);
 
@@ -335,12 +512,27 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         ...new Set([...integrations, ...bindings.map(({ integration }) => integration)]),
       ],
       ttlSeconds,
+      label,
     });
 
     return {
       async acquire(signal: AbortSignal, traceParent?: string): Promise<SandboxGrant> {
         const grant = await issue(request, { signal, traceParent });
         const env: Record<string, string> = {};
+
+        // A broker that reports kinds lets each variable match its integration, including a
+        // generic HTTP integration selected through a provider shorthand. Older brokers fall back
+        // to the shorthand's built-in kind.
+        const url = (id: string, fallback: BrokerIntegrationKindName) =>
+          integrationBaseURL(base, id, grant.kinds?.[id] ?? fallback);
+
+        if (github !== undefined && grant.kinds && grant.kinds[github] !== "github") {
+          await revoke(grant.id, { signal, traceParent }).catch(() => undefined);
+          throw new CredentialBrokerError(
+            "INVALID_ARGUMENT",
+            `Integration ${github} is not a GitHub integration. Pass it in endpoints instead`,
+          );
+        }
 
         if (github !== undefined) {
           env.GH_HOST = base.host;
@@ -357,33 +549,37 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         }
 
         if (anthropic !== undefined) {
-          env.ANTHROPIC_BASE_URL = gatewayBaseURL(base, anthropic);
+          env.ANTHROPIC_BASE_URL = url(anthropic, "anthropic");
           env.ANTHROPIC_API_KEY = grant.token;
         }
 
         if (openai !== undefined) {
-          env.OPENAI_BASE_URL = `${gatewayBaseURL(base, openai)}/v1`;
+          env.OPENAI_BASE_URL = url(openai, "openai");
           env.OPENAI_API_KEY = grant.token;
         }
 
         if (openrouter !== undefined) {
-          env.OPENROUTER_BASE_URL = `${gatewayBaseURL(base, openrouter)}/v1`;
+          env.OPENROUTER_BASE_URL = url(openrouter, "openrouter");
           env.OPENROUTER_API_KEY = grant.token;
         }
 
         for (const { integration, baseURLEnv, apiKeyEnv } of bindings) {
-          env[baseURLEnv] = gatewayBaseURL(base, integration);
+          env[baseURLEnv] = url(integration, "http");
           env[apiKeyEnv] = grant.token;
         }
 
         return {
+          id: grant.id,
+          integrations: grant.integrations,
           env,
           expiresAt: grant.expiresAt,
           revoke: (signal, traceParent) => revoke(grant.id, { signal, traceParent }),
+          renew: async (ttl, signal, traceParent) =>
+            (await renew(grant.id, ttl, { signal, traceParent })).expiresAt,
         };
       },
     };
   }
 
-  return { issue, revoke, sandbox };
+  return { issue, revoke, renew, list, status, sandbox };
 }

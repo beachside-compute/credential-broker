@@ -17,8 +17,15 @@ async function broker() {
     args.splice(0, 2);
   }
 
-  const env = { ...process.env };
-  const grant = args[0] === "grant";
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    BEACHSIDE_BROKER_CLI_PREFIX: "bun run broker",
+  };
+
+  // Grant commands use the issuer key, except `grant list --all`, which reads every grant.
+  const grant =
+    args.find((argument) => !argument.startsWith("-")) === "grant" && !args.includes("--all");
+
   const key = grant ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY";
   const fileKey = grant ? "BROKER_ISSUER_KEY" : "BROKER_ADMIN_KEY";
   delete env[grant ? "BEACHSIDE_BROKER_ADMIN_KEY" : "BEACHSIDE_BROKER_ISSUER_KEY"];

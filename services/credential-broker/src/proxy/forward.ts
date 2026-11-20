@@ -31,12 +31,17 @@ const upstreamHeaders = [
   "x-ratelimit-used",
 ];
 
-export function failure(status: number, error: string, challenge = false): Response {
+export function failure(
+  status: number,
+  error: string,
+  challenge = false,
+  detail?: { reason: string; integrations: string[] },
+): Response {
   const headers = new Headers({ "cache-control": "no-store" });
 
   if (challenge) headers.set("www-authenticate", 'Basic realm="Beachside Git"');
 
-  return Response.json({ error }, { status, headers });
+  return Response.json({ error, ...detail }, { status, headers });
 }
 
 export async function upstream(

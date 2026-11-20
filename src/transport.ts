@@ -22,15 +22,102 @@ export class CredentialBrokerError extends Error {
       | "WAIT_ABORTED"
       | "UNAVAILABLE",
     message: string,
+    /** Why the broker refused grant issuance, when it said so. */
+    readonly reason?: IssuanceRefusal,
+    /** The integrations the refusal names. */
+    readonly integrations?: readonly string[],
   ) {
     super(message);
     this.name = "CredentialBrokerError";
   }
 }
 
+/** Why a broker refused to issue a grant for some integrations. */
+export type IssuanceRefusal = "not_in_policy" | "not_found" | "disabled" | "not_allowlisted";
+
+const refusals: readonly IssuanceRefusal[] = [
+  "not_in_policy",
+  "not_found",
+  "disabled",
+  "not_allowlisted",
+];
+
+/** The command-line prefix used in hints. Embedding CLIs replace it, for example with `beachside broker`. */
+let hintPrefix = "beachside-broker";
+
+export function setHintPrefix(prefix: string): void {
+  hintPrefix = prefix;
+}
+
+export function hint(command: string): string {
+  return `${hintPrefix} ${command}`;
+}
+
+export function refusalMessage(reason: IssuanceRefusal, ids: readonly string[]): string {
+  const names = ids.join(", ");
+  const plural = ids.length > 1;
+
+  switch (reason) {
+    case "not_found":
+      return `No integration named ${names} exists on this broker. List them with \`${hint("integration list")}\``;
+    case "disabled":
+      return `Integration ${names} ${plural ? "are" : "is"} disabled. Enable ${plural ? "them" : "it"} with \`${hint(`integration enable ${ids[0]}`)}\``;
+    case "not_allowlisted":
+      return `Integration ${names} ${plural ? "are" : "is"} not allowed to issue grants. Allow ${plural ? "them" : "it"} with \`${hint(`issuer allow ${ids.join(" ")}`)}\``;
+    case "not_in_policy":
+      return `This GitHub Actions workflow's broker policy does not include ${names}. Add ${plural ? "them" : "it"} to the workflow's integrations in BROKER_CONFIG and redeploy`;
+  }
+}
+
+/** Read a broker error body: only known codes, reasons and integration names cross. */
+export async function brokerFailure(response: Response): Promise<{
+  error?: string;
+  reason?: IssuanceRefusal;
+  integrations?: string[];
+}> {
+  if (!response.headers.get("content-type")?.startsWith("application/json")) {
+    void response.body?.cancel().catch(() => undefined);
+
+    return {};
+  }
+
+  try {
+    const text = await response.text();
+
+    if (text.length > 4_096) return {};
+
+    const body: unknown = JSON.parse(text);
+
+    if (!body || typeof body !== "object") return {};
+
+    const error =
+      "error" in body && typeof body.error === "string" && /^[a-z_]{1,64}$/.test(body.error)
+        ? body.error
+        : undefined;
+
+    const reason = "reason" in body ? refusals.find((value) => value === body.reason) : undefined;
+
+    const integrations =
+      "integrations" in body &&
+      Array.isArray(body.integrations) &&
+      body.integrations.length <= 16 &&
+      body.integrations.every((id) => typeof id === "string" && integrationName.test(id))
+        ? body.integrations.map(String)
+        : undefined;
+
+    return { error, reason, integrations };
+  } catch {
+    // Never echo a malformed body.
+    return {};
+  }
+}
+
 export const defaultFetch: Fetch = (request) => fetch(request);
 
 export const integrationName = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** Seven days. The broker refuses longer grants. */
+export const maxGrantTtlSeconds = 604_800;
 
 export const sandboxToken = /^bsg_[a-f0-9]{64}$/;
 
@@ -59,8 +146,30 @@ export function requireApiKey(key: string): void {
     throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker API key");
 }
 
+const loopback = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** HTTPS, or plain HTTP to a loopback host for a local `wrangler dev` broker. */
+function brokerURL(input: string): URL {
+  try {
+    const url = new URL(input);
+
+    if (
+      url.protocol === "http:" &&
+      loopback.has(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.hash
+    )
+      return url;
+  } catch {
+    // Fall through to the HTTPS parser and its sanitized error.
+  }
+
+  return httpsURL(input);
+}
+
 export function brokerOrigin(input: string): URL {
-  const base = httpsURL(input);
+  const base = brokerURL(input);
 
   if (base.pathname !== "/" || base.search)
     throw new CredentialBrokerError("INVALID_ARGUMENT", "Use the credential broker HTTPS origin");

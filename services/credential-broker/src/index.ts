@@ -1,13 +1,14 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { grantIdPattern, newGrantToken, tokenHash } from "./grants/tokens";
-import { orchestrator } from "./auth";
-import { integrationId, maxGrantTtlSeconds, parseConfig } from "./config";
+import { administrator, orchestrator } from "./auth";
+import { apiVersion, grantLabel, integrationId, maxGrantTtlSeconds, parseConfig } from "./config";
 import type { ResolvedCredential } from "./credentials/source";
 import { workerSecretSource } from "./credentials/sources/worker-secret";
 import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
 import { failure, upstream, withCompletion } from "./proxy/forward";
 import { GrantRegistry } from "./grants/registry";
+import { grantView } from "./grants/view";
 import { route, sandboxToken, upstreamRoute } from "./proxy/routes";
 import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "./http";
 import type { Worker } from "./http";
@@ -17,10 +18,15 @@ import { finishSpan, grantOrigin, parseTraceparent, startSpan } from "./observab
 
 export { GrantRegistry };
 
+const ttlSeconds = z.number().int().min(1).max(maxGrantTtlSeconds);
+
 const issueRequest = z.strictObject({
   integrations: z.array(integrationId).min(1).max(16),
-  ttlSeconds: z.number().int().min(1).max(maxGrantTtlSeconds),
+  ttlSeconds,
+  label: grantLabel.optional(),
 });
+
+const renewRequest = z.strictObject({ ttlSeconds });
 
 const app = new Hono<Worker>();
 
@@ -60,7 +66,7 @@ app.post("/v1/grants", async (context) => {
       return failure(status, "invalid_grant_request");
     }
 
-    const { integrations, ttlSeconds } = input.data;
+    const { integrations, ttlSeconds, label } = input.data;
 
     const token = newGrantToken();
     const id = crypto.randomUUID();
@@ -73,24 +79,28 @@ app.post("/v1/grants", async (context) => {
         owner: principal.owner,
         integrations,
         expiresAt,
+        label,
         traceparent: grantOrigin(span, parent),
       },
       principal,
     );
 
-    if (result === "forbidden") {
+    if (result.status === "forbidden") {
       status = 403;
 
-      return failure(status, "integration_forbidden");
+      return failure(status, "integration_forbidden", false, {
+        reason: result.reason,
+        integrations: result.integrations,
+      });
     }
 
-    if (result === "ambiguous_github") {
+    if (result.status === "ambiguous_github") {
       status = 400;
 
       return failure(status, "multiple_github_integrations");
     }
 
-    if (result === "limit") {
+    if (result.status === "limit") {
       status = 429;
 
       return failure(status, "grant_limit");
@@ -99,12 +109,79 @@ app.post("/v1/grants", async (context) => {
     status = 201;
 
     return privateJson(
-      { id, token, expiresAt: new Date(expiresAt).toISOString(), integrations },
+      {
+        id,
+        token,
+        expiresAt: new Date(expiresAt).toISOString(),
+        integrations,
+        kinds: result.kinds,
+      },
       status,
     );
   } finally {
     finishSpan(span, status);
   }
+});
+
+app.get("/v1/status", async (context) => {
+  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const request = context.req.raw;
+  const limits = { maxGrantTtlSeconds };
+
+  if (await administrator(request, context.env.BROKER_ADMIN_KEY)) {
+    managementKeyring(context.env);
+
+    return privateJson({
+      apiVersion,
+      role: "admin",
+      limits,
+      counts: await registry(context.env).counts(),
+    });
+  }
+
+  const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
+
+  if (!principal) return failure(401, "authentication_required");
+
+  return privateJson({
+    apiVersion,
+    role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
+    limits,
+  });
+});
+
+app.get("/v1/grants", async (context) => {
+  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const principal = await orchestrator(context.req.raw, config, context.env.BROKER_ISSUER_KEY);
+
+  if (!principal) return failure(401, "orchestrator_authentication_required");
+
+  const grants = await registry(context.env).listGrants(principal.owner);
+
+  return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
+});
+
+app.post("/v1/grants/:id/renew", async (context) => {
+  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const request = context.req.raw;
+  const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
+
+  if (!principal) return failure(401, "orchestrator_authentication_required");
+
+  const id = context.req.param("id");
+  const input = renewRequest.safeParse(await readJson(request, 1_024));
+
+  if (!grantIdPattern.test(id) || !input.success) return failure(400, "invalid_grant_request");
+
+  const result = await registry(context.env).renew(
+    id,
+    principal.owner,
+    Date.now() + input.data.ttlSeconds * 1_000,
+  );
+
+  if (result.status === "not_found") return failure(404, "grant_not_found");
+
+  return privateJson(grantView(result.grant, false));
 });
 
 app.delete("/v1/grants/:id", async (context) => {

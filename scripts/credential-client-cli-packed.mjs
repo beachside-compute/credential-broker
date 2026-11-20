@@ -170,14 +170,14 @@ try {
   };
 
   const verify = async (args, expected, input) => {
-    const result = await run(args, input);
+    const result = await run([...args, "--json"], input);
     safe(result);
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), expected);
   };
 
   const create = ["integration", "create", "github-work", "--provider", "github", "--secret-stdin"];
-  await verify(create, metadata, `${initial}\n`);
+  await verify(create, { ...metadata, issuable: false }, `${initial}\n`);
   await verify(
     ["integration", "rotate", "github-work", "--secret-stdin"],
     {
@@ -191,12 +191,12 @@ try {
   safe(conflict);
   assert.equal(conflict.code, 1);
   assert.equal(conflict.stdout, "");
-  assert.match(conflict.stderr, /^CONFLICT /);
+  assert.match(conflict.stderr, /^CONFLICT: /);
 
   const createHttp = ["integration", "create", "api-work", "--provider", "http", "--config-stdin"];
   await verify(
     createHttp,
-    httpMetadata,
+    { ...httpMetadata, issuable: false },
     JSON.stringify({
       endpoint,
       credential: { source: "encrypted-store", values: { authorization: initial } },
@@ -223,10 +223,10 @@ try {
     {
       args: [...createHttp, "--secret-stdin"],
       input: initial,
-      message: "HTTP integration creation requires",
+      message: "HTTP integrations take only --config-stdin",
     },
     { args: ["integration", "list", `--${initial}`], message: "Invalid command options" },
-    { args: ["configuration", "show", "--secret", initial], message: "Choose a command group" },
+    { args: ["configuration", "show"], message: "Unknown command" },
     {
       args: ["integration", "rotate", "github-work", "--secret", initial],
       message: "Invalid command options",
@@ -235,18 +235,21 @@ try {
       args: ["integration", "rotate", "github-work", "--worker-secret"],
       message: "Invalid command options",
     },
-    { args: [...rotate, "--provider", "github"], message: "--provider is only accepted" },
+    {
+      args: [...rotate, "--provider", "github"],
+      message: "--provider is not accepted by integration rotate",
+    },
     {
       args: [...rotate, "--worker-secret", "CREDENTIAL_GITHUB"],
       message: "Select exactly one credential source",
     },
     {
       args: ["integration", "list", "--secret-stdin"],
-      message: "Credential options are only accepted",
+      message: "--secret-stdin is not accepted by integration list",
     },
     {
       args: ["issuer", "show", "--worker-secret", "CREDENTIAL_GITHUB"],
-      message: "Credential options are only accepted",
+      message: "--worker-secret is not accepted by issuer show",
     },
     { args: rotate, input: `${longest}x\n`, message: "Credential on stdin exceeds 4096 bytes" },
     { args: rotate, input: `${longest}x`, message: "Credential on stdin exceeds 4096 bytes" },
@@ -255,9 +258,9 @@ try {
   for (const { args, input, message } of invalidOptions) {
     const invalid = await run(args, input);
     safe(invalid);
-    assert.equal(invalid.code, 1);
+    assert.equal(invalid.code, 2);
     assert.equal(invalid.stdout, "");
-    assert.ok(invalid.stderr.startsWith(`INVALID_ARGUMENT ${message}`), invalid.stderr);
+    assert.ok(invalid.stderr.startsWith(`INVALID_ARGUMENT: ${message}`), invalid.stderr);
   }
 
   assert.deepEqual(routes, [
