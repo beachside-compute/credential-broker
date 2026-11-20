@@ -100,7 +100,7 @@ try {
     assert.equal(manifest.name, packed.name);
     assert.equal(manifest.version, packed.version);
     assert.equal(manifest.private, false);
-    assert.deepEqual(manifest.dependencies ?? {}, {});
+    assert.deepEqual(manifest.dependencies, { "@clack/prompts": "1.9.0" });
     assert.deepEqual(manifest.peerDependencies ?? {}, {});
     run(
       process.execPath,
