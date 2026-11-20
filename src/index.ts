@@ -7,6 +7,7 @@ import {
   CredentialBrokerError,
   defaultFetch,
   fetchRequest,
+  gatewayBaseURL,
   httpsURL,
   integrationName,
   jsonRecord,
@@ -340,7 +341,6 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
       async acquire(signal: AbortSignal, traceParent?: string): Promise<SandboxGrant> {
         const grant = await issue(request, { signal, traceParent });
         const env: Record<string, string> = {};
-        const gateway = (id: string) => `${base.origin}/gateway/${id}`;
 
         if (github !== undefined) {
           env.GH_HOST = base.host;
@@ -357,22 +357,22 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         }
 
         if (anthropic !== undefined) {
-          env.ANTHROPIC_BASE_URL = gateway(anthropic);
+          env.ANTHROPIC_BASE_URL = gatewayBaseURL(base, anthropic);
           env.ANTHROPIC_API_KEY = grant.token;
         }
 
         if (openai !== undefined) {
-          env.OPENAI_BASE_URL = `${gateway(openai)}/v1`;
+          env.OPENAI_BASE_URL = `${gatewayBaseURL(base, openai)}/v1`;
           env.OPENAI_API_KEY = grant.token;
         }
 
         if (openrouter !== undefined) {
-          env.OPENROUTER_BASE_URL = `${gateway(openrouter)}/v1`;
+          env.OPENROUTER_BASE_URL = `${gatewayBaseURL(base, openrouter)}/v1`;
           env.OPENROUTER_API_KEY = grant.token;
         }
 
         for (const { integration, baseURLEnv, apiKeyEnv } of bindings) {
-          env[baseURLEnv] = gateway(integration);
+          env[baseURLEnv] = gatewayBaseURL(base, integration);
           env[apiKeyEnv] = grant.token;
         }
 

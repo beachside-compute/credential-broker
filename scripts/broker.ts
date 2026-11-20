@@ -18,21 +18,26 @@ async function broker() {
   }
 
   const env = { ...process.env };
+  const grant = args[0] === "grant";
+  const key = grant ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY";
+  const fileKey = grant ? "BROKER_ISSUER_KEY" : "BROKER_ADMIN_KEY";
+  delete env[grant ? "BEACHSIDE_BROKER_ADMIN_KEY" : "BEACHSIDE_BROKER_ISSUER_KEY"];
+  delete env.BROKER_ADMIN_KEY;
+  delete env.BROKER_ISSUER_KEY;
 
   if (args.length && !args.includes("--help") && !args.includes("-h")) {
-    if (selectedURL || !env.BEACHSIDE_BROKER_URL || !env.BEACHSIDE_BROKER_ADMIN_KEY) {
+    if (selectedURL || !env.BEACHSIDE_BROKER_URL || !env[key]) {
       const file = loadDeploymentFile(resolve(root, ".env.deploy"));
-      env.BEACHSIDE_BROKER_ADMIN_KEY =
-        file?.BROKER_ADMIN_KEY ?? (selectedURL ? env.BEACHSIDE_BROKER_ADMIN_KEY : undefined);
+      env[key] = file?.[fileKey] ?? (selectedURL ? env[key] : undefined);
       env.BEACHSIDE_BROKER_URL = selectedURL ?? file?.BEACHSIDE_BROKER_URL;
     }
 
-    if (!env.BEACHSIDE_BROKER_URL || !env.BEACHSIDE_BROKER_ADMIN_KEY)
+    if (!env.BEACHSIDE_BROKER_URL || !env[key])
       return setupError(
-        "Run bun run broker --url https://your-broker.example.com <command> with your admin key in .env.deploy or the environment",
+        `Run bun run broker --url https://your-broker.example.com <command> with your ${grant ? "issuer" : "admin"} key in .env.deploy or the environment`,
       );
   } else {
-    delete env.BEACHSIDE_BROKER_ADMIN_KEY;
+    delete env[key];
   }
 
   const node = Bun.which("node");

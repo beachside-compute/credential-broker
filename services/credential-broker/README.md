@@ -103,6 +103,8 @@ From the deployment checkout, use the HTTPS origin printed by Wrangler to open t
 bun run broker --url https://your-broker.example.com integration setup
 ```
 
+The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`. Setup displays a confirmation. Add `--json` to write the integration metadata to stdout instead.
+
 Set `BEACHSIDE_BROKER_URL=https://your-broker.example.com` in `.env.deploy` to reuse that origin for later commands. You can also set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` together in the environment. If you omit `--url`, the checkout command uses a configured URL and admin key from the same source.
 
 To permit grant issuance for a new `router-work` integration, review the current list and add the integration ID. Include the existing IDs you want to keep when calling `issuer set`.
@@ -113,6 +115,16 @@ bun run broker issuer set router-work
 ```
 
 You can also use the separately installed `beachside-broker` CLI with `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` set on the trusted operator host.
+
+### Issue a temporary grant
+
+```sh
+bun run broker grant issue router-work
+```
+
+Use `gatewayUrls["router-work"]` as the API base URL and `token` as the API key. The URL is ready to use for an OpenRouter integration created by setup. It already maps to the upstream API base. Use `gatewayUrls` with configurable HTTP integrations. Built-in provider and GitHub integrations use the [gateway settings](#use-the-gateways) below. Grant issuance defaults to 300 seconds. Use `--ttl <seconds>` to change the lifetime or `--token` to print only the token. Keep the output private.
+
+To revoke the grant, set `GRANT_ID` to the `id` from the JSON output and run `bun run broker grant revoke "$GRANT_ID"`. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
 
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 

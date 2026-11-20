@@ -39,6 +39,8 @@ From the deployment checkout, run the integration setup command with the HTTPS o
 bun run broker --url https://your-broker.example.com integration setup
 ```
 
+The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`. Setup displays a confirmation. Add `--json` to write the integration metadata to stdout instead.
+
 The command loads the admin key from `.env.deploy`. Add `BEACHSIDE_BROKER_URL=https://your-broker.example.com` to that file with your deployed URL so later commands can omit `--url`.
 
 Check which integrations the issuer can use.
@@ -54,6 +56,16 @@ bun run broker issuer set router-work
 ```
 
 If the list already contains IDs, pass them alongside `router-work` to keep them. The same setup command also offers other providers and custom HTTPS endpoints. See the [endpoint runbook](./services/credential-broker/README.md#configurable-https-endpoints) for unattended setup and rotation.
+
+### Issue a temporary grant
+
+```sh
+bun run broker grant issue router-work
+```
+
+Use `gatewayUrls["router-work"]` as the API base URL and `token` as the API key. The URL is ready to use for an OpenRouter integration created by setup. It already maps to the upstream API base. Grant issuance defaults to 300 seconds. Use `--ttl <seconds>` to change the lifetime or `--token` to print only the token. Keep the output private.
+
+To revoke the grant, set `GRANT_ID` to the `id` from the JSON output and run `bun run broker grant revoke "$GRANT_ID"`. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
 
 ### Rotate or invalidate access
 
