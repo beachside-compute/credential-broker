@@ -116,6 +116,16 @@ bun run broker issuer set router-work
 
 You can also use the separately installed `beachside-broker` CLI with `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` set on the trusted operator host.
 
+### Issue a temporary grant
+
+```sh
+bun run broker grant issue router-work
+```
+
+Use `gatewayUrls["router-work"]` as the API base URL and `token` as the API key. The URL is ready to use for an OpenRouter integration created by setup. It already maps to the upstream API base. Use `gatewayUrls` with configurable HTTP integrations. Built-in provider and GitHub integrations use the [gateway settings](#use-the-gateways) below. Grant issuance defaults to 300 seconds. Use `--ttl <seconds>` to change the lifetime or `--token` to print only the token. Keep the output private.
+
+To revoke the grant, set `GRANT_ID` to the `id` from the JSON output and run `bun run broker grant revoke "$GRANT_ID"`. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
+
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 
 Encrypted-store credentials are encrypted before the Worker sends their envelopes to SQLite. AES-256-GCM uses a fresh nonce for every write and authenticates the integration identity, credential version, and encryption key version. Use `integration rotate <id> --secret-stdin` with a replacement credential. Subsequent requests using an existing grant see the replacement. Requests that already passed authorization may finish with the prior credential.

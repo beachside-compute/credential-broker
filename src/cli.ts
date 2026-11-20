@@ -9,12 +9,19 @@ import {
   type BrokerIntegrationInput,
 } from "./admin.js";
 import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
+import { createCredentialBroker } from "./index.js";
 import { setupIntegration } from "./setup.js";
-import { CredentialBrokerError, integrationName } from "./transport.js";
+import {
+  brokerOrigin,
+  CredentialBrokerError,
+  gatewayBaseURL,
+  integrationName,
+} from "./transport.js";
 
 const help = `Manage runtime integrations and grant issuance for a Beachside credential broker.
 
-Set BEACHSIDE_BROKER_URL to the broker HTTPS origin and BEACHSIDE_BROKER_ADMIN_KEY to its admin key.
+Set BEACHSIDE_BROKER_URL to the broker HTTPS origin. Use BEACHSIDE_BROKER_ADMIN_KEY for management commands
+and BEACHSIDE_BROKER_ISSUER_KEY for grant commands.
 
 Commands
   beachside-broker integration setup [--json]
@@ -28,12 +35,16 @@ Commands
   beachside-broker integration delete <id>
   beachside-broker issuer show
   beachside-broker issuer set [integration-id...]
+  beachside-broker grant issue <integration-id...> [--ttl <seconds>] [--token]
+  beachside-broker grant revoke <grant-id>
 
 Issuer set replaces the grant issuance allowlist. Omit integration IDs to clear it.
 Pipe one credential value to --secret-stdin, optionally followed by a newline.
 For HTTP integrations, --config-stdin takes JSON with endpoint and credential fields.
 --credentials-stdin takes a JSON map of header names to replacement secrets.
 Interactive setup prints a confirmation. Add --json to write its metadata to stdout.
+Grant issue defaults to 300 seconds. Use --ttl for 1 to 3600 seconds. --token prints only the grant token.
+Use gatewayUrls in the grant JSON for configurable HTTPS integrations created with setup.
 Other commands print JSON metadata.`;
 
 function usageError(message: string): never {
@@ -120,14 +131,18 @@ async function main(args: string[]) {
   const [group, command, ...options] = args;
   const creates = group === "integration" && command === "create";
   const setup = group === "integration" && command === "setup";
+  const issuesGrant = group === "grant" && command === "issue";
   const usesCredential = creates || (group === "integration" && command === "rotate");
 
-  if (group !== "integration" && group !== "issuer")
-    return usageError("Choose a command group with integration or issuer");
+  if (group !== "integration" && group !== "issuer" && group !== "grant")
+    return usageError("Choose a command group with integration, issuer or grant");
 
   const { values, positionals } = parseCommandOptions(options);
 
   const rotates = group === "integration" && command === "rotate";
+
+  if (!issuesGrant && (values.ttl !== undefined || values.token))
+    return usageError("--ttl and --token are only accepted by grant issue");
 
   if (!setup && values.json) return usageError("--json is only accepted by integration setup");
 
@@ -144,6 +159,17 @@ async function main(args: string[]) {
     return usageError("Credential options are only accepted by integration create and rotate");
 
   const url = process.env.BEACHSIDE_BROKER_URL;
+
+  if (group === "grant") {
+    const apiKey = process.env.BEACHSIDE_BROKER_ISSUER_KEY;
+
+    if (!url || !apiKey)
+      return usageError("Set BEACHSIDE_BROKER_URL and BEACHSIDE_BROKER_ISSUER_KEY");
+    await grantCommand(command, positionals, values, brokerOrigin(url), apiKey);
+
+    return;
+  }
+
   const apiKey = process.env.BEACHSIDE_BROKER_ADMIN_KEY;
 
   if (!url || !apiKey) return usageError("Set BEACHSIDE_BROKER_URL and BEACHSIDE_BROKER_ADMIN_KEY");
@@ -165,6 +191,8 @@ function parseCommandOptions(args: string[]) {
       options: {
         provider: { type: "string" },
         json: { type: "boolean" },
+        ttl: { type: "string" },
+        token: { type: "boolean" },
         "secret-stdin": { type: "boolean" },
         "worker-secret": { type: "string" },
         "config-stdin": { type: "boolean" },
@@ -306,6 +334,50 @@ async function issuerCommand(
       return issuerPermissions.set(positionals);
     default:
       return usageError("Choose an issuer command. See beachside-broker --help");
+  }
+}
+
+async function grantCommand(
+  command: string | undefined,
+  positionals: string[],
+  values: ReturnType<typeof parseCommandOptions>["values"],
+  base: URL,
+  apiKey: string,
+) {
+  const broker = createCredentialBroker({ url: base.origin, auth: { apiKey } });
+
+  switch (command) {
+    case "issue": {
+      const ttl = values.ttl ?? "300";
+      const ttlSeconds = Number(ttl);
+
+      if (!/^[0-9]+$/.test(ttl) || ttlSeconds < 1 || ttlSeconds > 3_600)
+        return usageError("--ttl must be 1 to 3600 seconds");
+      const grant = await broker.issue({ integrations: positionals, ttlSeconds });
+
+      if (values.token) {
+        console.log(grant.token);
+      } else {
+        const gatewayUrls = Object.fromEntries(
+          grant.integrations.map((id) => [id, gatewayBaseURL(base, id)]),
+        );
+
+        console.log(JSON.stringify({ ...grant, gatewayUrls }));
+      }
+
+      return;
+    }
+
+    case "revoke": {
+      if (positionals.length !== 1) return usageError("Pass exactly one grant ID");
+      await broker.revoke(positionals[0]);
+      console.log(JSON.stringify({ revoked: true }));
+
+      return;
+    }
+
+    default:
+      return usageError("Choose grant issue or grant revoke. See beachside-broker --help");
   }
 }
 

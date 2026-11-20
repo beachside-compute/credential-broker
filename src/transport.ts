@@ -68,6 +68,10 @@ export function brokerOrigin(input: string): URL {
   return base;
 }
 
+export function gatewayBaseURL(base: URL, integration: string): string {
+  return `${base.origin}/gateway/${integration}`;
+}
+
 export async function jsonRecord(response: Response) {
   try {
     const data: unknown = await response.json();

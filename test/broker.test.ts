@@ -15,6 +15,15 @@ import { join, resolve } from "node:path";
 
 const adminKey = "private-broker-admin-fixture-0123456789";
 
+const issuerKey = "private-broker-issuer-fixture-123456789";
+
+const grant = {
+  id: "de07c688-48d2-4073-bb20-c6e5c2893f19",
+  token: `bsg_${"a".repeat(64)}`,
+  expiresAt: "2026-11-20T00:05:00.000Z",
+  integrations: ["openrouter"],
+};
+
 test("checkout command runs the Node CLI with the selected HTTPS origin and its protected admin key", async () => {
   const project = resolve(import.meta.dir, "..");
   const root = mkdtempSync(join(tmpdir(), "broker-checkout-cli-"));
@@ -77,16 +86,31 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
     };
 
     const requests: { path: string; authorization: string | null }[] = [];
+    const grantRequests: object[] = [];
 
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       tls: { key: Bun.file(key), cert: Bun.file(cert) },
       async fetch(request) {
-        requests.push({
-          path: new URL(request.url).pathname,
-          authorization: request.headers.get("authorization"),
-        });
+        const path = new URL(request.url).pathname;
+        const authorization = request.headers.get("authorization");
+        requests.push({ path, authorization });
+
+        if (path.startsWith("/v1/grants")) {
+          expect(authorization).toBe(`Bearer ${issuerKey}`);
+
+          if (request.method === "DELETE" && path === `/v1/grants/${grant.id}`)
+            return new Response(null, { status: 204 });
+
+          expect(path).toBe("/v1/grants");
+          expect(request.method).toBe("POST");
+          grantRequests.push(await request.json());
+
+          return Response.json(grant, { status: 201 });
+        }
+
+        expect(authorization).toBe(`Bearer ${adminKey}`);
 
         if (request.method === "POST") {
           expect(await request.json()).toEqual({
@@ -123,6 +147,8 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
 
         expect(stdout).not.toContain(adminKey);
         expect(stderr).not.toContain(adminKey);
+        expect(stdout).not.toContain(issuerKey);
+        expect(stderr).not.toContain(issuerKey);
 
         return { status, stdout, stderr };
       };
@@ -212,6 +238,54 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           child.terminal?.close();
         }
       }
+
+      const issue = ["grant", "issue", "openrouter"];
+      const beforeGrants = requests.length;
+      const missingIssuer = await run(issue, { BEACHSIDE_BROKER_ADMIN_KEY: adminKey });
+      expect(missingIssuer.status).toBe(1);
+      expect(missingIssuer.stderr).toContain("issuer key");
+      expect(requests).toHaveLength(beforeGrants);
+      writeFileSync(
+        secretFile,
+        `${settings}BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`,
+      );
+
+      const issued = await run(["--url", origin, ...issue], {
+        BEACHSIDE_BROKER_ADMIN_KEY: adminKey,
+      });
+
+      expect(issued.status, issued.stderr).toBe(0);
+      expect(JSON.parse(issued.stdout)).toEqual({
+        ...grant,
+        gatewayUrls: { openrouter: `${origin}/gateway/openrouter` },
+      });
+      const raw = await run([...issue, "--ttl", "60", "--token"]);
+      expect(raw.status, raw.stderr).toBe(0);
+      expect(raw.stdout).toBe(`${grant.token}\n`);
+      expect(grantRequests).toEqual([
+        { integrations: ["openrouter"], ttlSeconds: 300 },
+        { integrations: ["openrouter"], ttlSeconds: 60 },
+      ]);
+      const revoked = await run(["grant", "revoke", grant.id]);
+      expect(revoked.status, revoked.stderr).toBe(0);
+      expect(JSON.parse(revoked.stdout)).toEqual({ revoked: true });
+      expect(requests.at(-1)).toEqual({
+        path: `/v1/grants/${grant.id}`,
+        authorization: `Bearer ${issuerKey}`,
+      });
+      const beforeInvalid = requests.length;
+
+      for (const ttl of ["0", "3601", "5.5", "1e3"]) {
+        const invalid = await run([...issue, "--ttl", ttl]);
+        expect(invalid.status).toBe(1);
+        expect(invalid.stderr).toContain("--ttl must be 1 to 3600 seconds");
+      }
+
+      writeFileSync(secretFile, `BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`);
+      const missingAdmin = await run(list, { BEACHSIDE_BROKER_ISSUER_KEY: issuerKey });
+      expect(missingAdmin.status).toBe(1);
+      expect(missingAdmin.stderr).toContain("admin key");
+      expect(requests).toHaveLength(beforeInvalid);
 
       expect(readdirSync(join(root, ".cache"))).toEqual([]);
     } finally {
