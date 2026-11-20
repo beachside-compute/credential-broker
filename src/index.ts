@@ -88,8 +88,9 @@ export interface SandboxEndpoint {
 export interface SandboxIntegrations {
   /**
    * Integrations whose variables follow their kind, as the broker reports it: GitHub sets up git
-   * and gh, Anthropic, OpenAI and OpenRouter set `<PROVIDER>_BASE_URL` and `<PROVIDER>_API_KEY`.
-   * A generic HTTP integration has no standard variables, so name them in `endpoints`.
+   * and gh, Anthropic, OpenAI and OpenRouter set `<PROVIDER>_BASE_URL` and `<PROVIDER>_API_KEY`,
+   * and a generic HTTP integration sets `<ID>_BASE_URL` and `<ID>_API_KEY` (`my-api` becomes
+   * `MY_API_*`). Use `endpoints` to pick other names.
    */
   integrations?: readonly string[];
   github?: string;
@@ -562,18 +563,19 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
               "This broker does not report integration kinds. Update it, or name each integration's variables in endpoints",
             );
 
-          if (kind === "http")
-            await refuse(
-              `Integration ${id} is a generic HTTP integration with no standard variables. Name them in endpoints, such as { integration: "${id}", baseURLEnv: "MY_API_BASE_URL", apiKeyEnv: "MY_API_KEY" }`,
-            );
-
           if (kind === "github") {
             if (gitHost !== undefined)
               await refuse(
                 `Only one GitHub integration can configure git in a sandbox; ${gitHost} and ${id} both do`,
               );
             gitHost = id;
-          } else if (kind) prefixes.push([id, kind.toUpperCase(), kind]);
+          } else if (kind)
+            // A generic HTTP integration has no provider of its own, so its ID names the variables.
+            prefixes.push([
+              id,
+              (kind === "http" ? id.replaceAll("-", "_") : kind).toUpperCase(),
+              kind,
+            ]);
         }
 
         for (const [id, prefix] of prefixes) {

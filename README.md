@@ -103,13 +103,19 @@ The root package exports `createCredentialBroker` and `createCredentialBrokerAdm
 
 For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/guides/credential-broker/).
 
-`broker.sandbox()` builds the environment a sandbox needs. Pass integrations by ID and each one is set up from the kind the broker reports: a GitHub integration configures `git` and `gh`, and an Anthropic, OpenAI or OpenRouter integration sets `<PROVIDER>_BASE_URL` and `<PROVIDER>_API_KEY`.
+`broker.sandbox()` builds the environment a sandbox needs. Pass integrations by ID and each one is set up from the kind the broker reports:
+
+| Kind                                      | Variables in the sandbox                                                                             |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `github`                                  | `git` and `gh` configuration (`GH_HOST`, `GH_ENTERPRISE_TOKEN`, `GIT_CONFIG_*`)                      |
+| `anthropic`, `openai`, `openrouter`       | `ANTHROPIC_*`, `OPENAI_*` or `OPENROUTER_*`: `_BASE_URL` and `_API_KEY`                              |
+| `http` (what `integration setup` creates) | `<ID>_BASE_URL` and `<ID>_API_KEY`, so `openrouter` sets `OPENROUTER_*` and `my-api` sets `MY_API_*` |
 
 ```ts
 const credentials = broker.sandbox({ integrations: ["github", "openrouter"], ttlSeconds: 3_600 });
 ```
 
-A generic HTTP integration has no standard variables, so map its gateway URL and temporary grant to the names your API client reads.
+To pick other names, map the integration's gateway URL and temporary grant to the variables your API client reads.
 
 ```ts
 const credentials = broker.sandbox({

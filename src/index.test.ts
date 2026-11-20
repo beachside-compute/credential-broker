@@ -485,6 +485,7 @@ test("sets each integration passed by id up from its reported kind, and refuses 
             api: "http",
             gpt: "openai",
             work: "openai",
+            anthropic: "http",
           },
         },
         { status: 201 },
@@ -493,7 +494,10 @@ test("sets each integration passed by id up from its reported kind, and refuses 
   });
 
   const signal = new AbortController().signal;
-  const grant = await broker.sandbox({ integrations: ["claude", "router", "gh"] }).acquire(signal);
+
+  const grant = await broker
+    .sandbox({ integrations: ["claude", "router", "gh", "api"] })
+    .acquire(signal);
 
   expect(grant.env).toMatchObject({
     ANTHROPIC_BASE_URL: `${url}/gateway/claude`,
@@ -502,11 +506,13 @@ test("sets each integration passed by id up from its reported kind, and refuses 
     OPENROUTER_API_KEY: token,
     GH_ENTERPRISE_TOKEN: token,
     GIT_CONFIG_COUNT: "3",
+    API_BASE_URL: `${url}/gateway/api`,
+    API_API_KEY: token,
   });
   expect(methods).toEqual(["POST"]);
 
   for (const [integrations, message] of [
-    [["api"], "Name them in endpoints"],
+    [["anthropic", "claude"], "Two integrations would set ANTHROPIC_BASE_URL"],
     [["gpt", "work"], "Two integrations would set OPENAI_BASE_URL"],
   ] as const) {
     methods.length = 0;
