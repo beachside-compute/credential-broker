@@ -1,10 +1,14 @@
 #!/usr/bin/env node
+/* oxlint-disable anti-slop/no-runtime-typeof -- Validate JSON objects read from stdin. */
 import { parseArgs } from "node:util";
 import {
   createCredentialBrokerAdmin,
   type BrokerIntegrationCredential,
   type BrokerIntegrationKind,
+  type BrokerIntegrationInput,
 } from "./admin.js";
+import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
+import { setupIntegration } from "./setup.js";
 import { CredentialBrokerError, integrationName } from "./transport.js";
 
 const help = `Manage runtime integrations and grant issuance for a Beachside credential broker.
@@ -12,10 +16,12 @@ const help = `Manage runtime integrations and grant issuance for a Beachside cre
 Set BEACHSIDE_BROKER_URL to the broker HTTPS origin and BEACHSIDE_BROKER_ADMIN_KEY to its admin key.
 
 Commands
+  beachside-broker integration setup
   beachside-broker integration list
   beachside-broker integration show <id>
   beachside-broker integration create <id> --provider <github|anthropic|openai|openrouter> (--secret-stdin | --worker-secret <binding>)
-  beachside-broker integration rotate <id> (--secret-stdin | --worker-secret <binding>)
+  beachside-broker integration create <id> --provider http --config-stdin
+  beachside-broker integration rotate <id> (--secret-stdin | --worker-secret <binding> | --credentials-stdin)
   beachside-broker integration disable <id>
   beachside-broker integration enable <id>
   beachside-broker integration delete <id>
@@ -24,26 +30,32 @@ Commands
 
 Issuer set replaces the grant issuance allowlist. Omit integration IDs to clear it.
 Pipe one credential value to --secret-stdin, optionally followed by a newline.
+For HTTP integrations, --config-stdin takes JSON with endpoint and credential fields.
+--credentials-stdin takes a JSON map of header names to replacement secrets.
 Successful commands print JSON metadata.`;
 
 function usageError(message: string): never {
   throw new CredentialBrokerError("INVALID_ARGUMENT", message);
 }
 
-async function readSecret() {
-  if (process.stdin.isTTY) usageError("Pipe a credential value to --secret-stdin");
+async function readStdin(limit: number, error: string) {
+  if (process.stdin.isTTY) usageError("Pipe the input to stdin");
   const chunks: Uint8Array[] = [];
   let total = 0;
 
   for await (const data of process.stdin) {
-    if (!(data instanceof Uint8Array)) usageError("Expected an upstream credential on stdin");
+    if (!(data instanceof Uint8Array)) usageError("Expected input on stdin");
     total += data.byteLength;
 
-    if (total > 4098) usageError("Credential on stdin exceeds 4096 bytes");
+    if (total > limit) usageError(error);
     chunks.push(data);
   }
 
-  const buffer = Buffer.concat(chunks);
+  return Buffer.concat(chunks);
+}
+
+async function readSecret() {
+  const buffer = await readStdin(4098, "Credential on stdin exceeds 4096 bytes");
   const newline = buffer.at(-1) === 0x0a;
   const suffixBytes = newline ? (buffer.at(-2) === 0x0d ? 2 : 1) : 0;
   const length = buffer.byteLength - suffixBytes;
@@ -70,7 +82,7 @@ async function credentialFromFlags(flags: {
   return usageError("Select exactly one credential source with --secret-stdin or --worker-secret");
 }
 
-function provider(value: string | undefined): BrokerIntegrationKind {
+function provider(value: string | undefined): Exclude<BrokerIntegrationKind, "http"> {
   switch (value) {
     case "github":
     case "anthropic":
@@ -112,6 +124,14 @@ async function main(args: string[]) {
 
   const { values, positionals } = parseCommandOptions(options);
 
+  const rotates = group === "integration" && command === "rotate";
+
+  if (!creates && values["config-stdin"])
+    return usageError("--config-stdin is only accepted by integration create");
+
+  if (!rotates && values["credentials-stdin"])
+    return usageError("--credentials-stdin is only accepted by integration rotate");
+
   if (!creates && values.provider !== undefined)
     return usageError("--provider is only accepted by integration create");
 
@@ -141,6 +161,8 @@ function parseCommandOptions(args: string[]) {
         provider: { type: "string" },
         "secret-stdin": { type: "boolean" },
         "worker-secret": { type: "string" },
+        "config-stdin": { type: "boolean" },
+        "credentials-stdin": { type: "boolean" },
       },
     });
   } catch {
@@ -149,29 +171,108 @@ function parseCommandOptions(args: string[]) {
   }
 }
 
+async function readJsonStdin(): Promise<object> {
+  const bytes = await readStdin(96_000, "JSON input on stdin exceeds 96000 bytes");
+
+  try {
+    const input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+
+    if (input && typeof input === "object" && !Array.isArray(input)) return input;
+  } catch {
+    // Never echo parser errors because they may contain the credential input.
+  }
+
+  return usageError("Expected a JSON object on stdin");
+}
+
+async function endpointFromStdin(id: string): Promise<BrokerIntegrationInput> {
+  const input = await readJsonStdin();
+
+  if (!("endpoint" in input && "credential" in input))
+    return usageError("Expected endpoint and credential JSON fields");
+  const endpoint = normalizeEndpoint(input.endpoint);
+  const credential = input.credential;
+
+  const values =
+    credential !== null &&
+    typeof credential === "object" &&
+    "source" in credential &&
+    credential.source === "encrypted-store" &&
+    "values" in credential &&
+    normalizeEndpointValues(credential.values);
+
+  if (!endpoint || !values) return usageError("Invalid broker endpoint configuration");
+
+  return { id, kind: "http", endpoint, credential: { source: "encrypted-store", values } };
+}
+
 type Admin = ReturnType<typeof createCredentialBrokerAdmin>;
 
 async function integrationCommand(
   command: string | undefined,
   positionals: string[],
-  values: { provider?: string; "secret-stdin"?: boolean; "worker-secret"?: string },
+  values: ReturnType<typeof parseCommandOptions>["values"],
   { integrations }: Admin,
 ) {
   switch (command) {
+    case "setup": {
+      noPositionals(positionals);
+      const config = await setupIntegration();
+      const created = await integrations.create(config);
+      console.error(
+        `To authorize issuance, run beachside-broker issuer show, then issuer set with the existing IDs plus ${created.id}.`,
+      );
+      console.error(
+        `In broker.sandbox({ endpoints: [{ integration: "${created.id}", baseURLEnv: "YOUR_BASE_URL", apiKeyEnv: "YOUR_API_KEY" }] }), use the environment names required by your client.`,
+      );
+
+      return created;
+    }
+
     case "list":
       noPositionals(positionals);
 
       return { integrations: await integrations.list() };
     case "show":
       return integrations.get(integrationId(positionals));
-    case "create":
+    case "create": {
+      const id = integrationId(positionals);
+
+      if (values.provider === "http") {
+        if (
+          !values["config-stdin"] ||
+          values["secret-stdin"] ||
+          values["worker-secret"] !== undefined
+        )
+          return usageError("HTTP integration creation requires only --config-stdin");
+
+        return integrations.create(await endpointFromStdin(id));
+      }
+
+      if (values["config-stdin"]) return usageError("--config-stdin requires --provider http");
+
       return integrations.create({
-        id: integrationId(positionals),
+        id,
         kind: provider(values.provider),
         credential: await credentialFromFlags(values),
       });
-    case "rotate":
-      return integrations.rotate(integrationId(positionals), await credentialFromFlags(values));
+    }
+
+    case "rotate": {
+      const id = integrationId(positionals);
+
+      if (!values["credentials-stdin"])
+        return integrations.rotate(id, await credentialFromFlags(values));
+
+      if (values["secret-stdin"] || values["worker-secret"] !== undefined)
+        return usageError("Select exactly one credential source when rotating");
+      const replacements = normalizeEndpointValues(await readJsonStdin());
+
+      if (!replacements) return usageError("Expected replacement header secrets on stdin");
+
+      return integrations.rotate(id, { source: "encrypted-store", values: replacements });
+    }
+
     case "enable":
     case "disable":
       return integrations.setEnabled(integrationId(positionals), command === "enable");

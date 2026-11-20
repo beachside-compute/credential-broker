@@ -1,0 +1,159 @@
+name: Release credential client
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Qualify and upload the tarball without publishing
+        required: true
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'beachside-compute/credential-broker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      dry-run: ${{ steps.plan.outputs.dryRun }}
+      create-tag: ${{ steps.plan.outputs.createTag }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      commit: ${{ steps.plan.outputs.commit }}
+      tree: ${{ steps.plan.outputs.tree }}
+      integrity: ${{ steps.artifact.outputs.integrity }}
+      artifact: ${{ steps.artifact.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+          no-cache: true
+      - id: plan
+        name: Plan release from protected history
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bun scripts/release.mjs plan
+      - uses: actions/setup-node@v6
+        if: steps.plan.outputs.release == 'true'
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install pinned npm and dependencies
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          npm install --global npm@11.15.0 --ignore-scripts --registry https://registry.npmjs.org
+          bun install --frozen-lockfile
+      - name: Run checks and qualify the public archive
+        if: steps.plan.outputs.release == 'true'
+        env:
+          RELEASE_ARCHIVE: ${{ runner.temp }}/credential-client.tgz
+        run: |
+          bun run check
+          bun run lint
+          bun run format:check
+          bun run test
+          git diff --exit-code HEAD
+          bun run package:smoke
+      - id: artifact
+        name: Record qualified archive integrity
+        if: steps.plan.outputs.release == 'true'
+        env:
+          RELEASE_ARCHIVE: ${{ runner.temp }}/credential-client.tgz
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          integrity=$(node scripts/release.mjs integrity "$RELEASE_ARCHIVE")
+          {
+            echo "integrity=$integrity"
+            echo "name=credential-client-${RELEASE_VERSION}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.release == 'true'
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ runner.temp }}/credential-client.tgz
+          if-no-files-found: error
+
+  tag:
+    needs: qualify
+    if: needs.qualify.outputs.create-tag == 'true' && needs.qualify.outputs.dry-run == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.qualify.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create matching tag if absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.qualify.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.qualify.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$RELEASE_COMMIT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${RELEASE_TAG}" -f sha="$RELEASE_COMMIT" >/dev/null
+          fi
+
+  publish:
+    needs: [qualify, tag]
+    if: |
+      !cancelled() && needs.qualify.result == 'success' &&
+      needs.qualify.outputs.release == 'true' && needs.qualify.outputs.dry-run == 'false' &&
+      (needs.tag.result == 'success' || needs.tag.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.qualify.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install pinned npm
+        run: npm install --global npm@11.15.0 --ignore-scripts --registry https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.qualify.outputs.artifact }}
+          path: ${{ runner.temp }}/qualified-client
+      - name: Publish qualified tarball with npm OIDC
+        env:
+          RELEASE_COMMIT: ${{ needs.qualify.outputs.commit }}
+          RELEASE_TREE: ${{ needs.qualify.outputs.tree }}
+          RELEASE_VERSION: ${{ needs.qualify.outputs.version }}
+          RELEASE_INTEGRITY: ${{ needs.qualify.outputs.integrity }}
+          RELEASE_ARCHIVE: ${{ runner.temp }}/qualified-client/credential-client.tgz
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/empty-npmrc
+          NPM_CONFIG_GLOBALCONFIG: ${{ runner.temp }}/empty-global-npmrc
+        run: |
+          unset NODE_AUTH_TOKEN NPM_TOKEN
+          touch "$NPM_CONFIG_USERCONFIG" "$NPM_CONFIG_GLOBALCONFIG"
+          node scripts/release.mjs publish "$RELEASE_ARCHIVE"

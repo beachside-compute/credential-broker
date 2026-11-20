@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,7 @@ function run(command, args, cwd) {
 
 const types = `
 import { createCredentialBroker, createCredentialBrokerAdmin } from "@beachside/credential-client";
-import type { BrokerIntegrationCredential, SandboxGrant } from "@beachside/credential-client";
+import type { BrokerEndpoint, BrokerIntegrationCredential, SandboxGrant } from "@beachside/credential-client";
 
 const url = "https://broker.example.invalid";
 const apiKey = "fixture_credential_broker_control_key";
@@ -26,17 +27,33 @@ const issuer = createCredentialBroker({ url, auth: { apiKey } });
 const admin = createCredentialBrokerAdmin({ url, apiKey });
 const credential: BrokerIntegrationCredential = { source: "encrypted-store", value: "fixture" };
 await admin.integrations.create({ id: "model", kind: "openai", credential });
+const endpoint: BrokerEndpoint = {
+  baseURL: "https://api.example.com/v1",
+  headers: [{ name: "authorization", secret: true, prefix: "Bearer " }],
+};
+await admin.integrations.create({ id: "gateway", kind: "http", endpoint, credential: {
+  source: "encrypted-store", values: { authorization: "fixture" },
+} });
 const controller = new AbortController();
-const grant: SandboxGrant = await issuer.sandbox({ openai: "model" }).acquire(controller.signal);
+const grant: SandboxGrant = await issuer.sandbox({ openai: "model", endpoints: [
+  { integration: "gateway", baseURLEnv: "GATEWAY_URL", apiKeyEnv: "GATEWAY_TOKEN" },
+] }).acquire(controller.signal);
 await grant.revoke(controller.signal);
 `;
 
 try {
+  const source = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+
   const [packed] = JSON.parse(
-    run("npm", ["pack", "--json", "--pack-destination", temporary], root),
+    run(
+      "npm",
+      ["pack", "--json", "--ignore-scripts", "--workspaces=false", "--pack-destination", temporary],
+      root,
+    ),
   );
 
   assert.equal(packed.name, "@beachside/credential-client", "Incorrect package identity");
+  assert.equal(packed.version, source.version);
   assert.ok(packed.files.some(({ path }) => path === "dist/index.d.ts"));
   assert.ok(packed.files.some(({ path }) => path === "dist/cli.js"));
   assert.ok(
@@ -80,6 +97,9 @@ try {
       ),
     );
 
+    assert.equal(manifest.name, packed.name);
+    assert.equal(manifest.version, packed.version);
+    assert.equal(manifest.private, false);
     assert.deepEqual(manifest.dependencies ?? {}, {});
     assert.deepEqual(manifest.peerDependencies ?? {}, {});
     run(
@@ -101,6 +121,9 @@ try {
     process.stdout.write(run(runtime, ["client.mjs"], directory));
     process.stdout.write(run(runtime, ["cli.mjs"], directory));
   }
+
+  if (process.env.RELEASE_ARCHIVE)
+    await copyFile(archive, process.env.RELEASE_ARCHIVE, constants.COPYFILE_EXCL);
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

@@ -1,3 +1,4 @@
+import { endpointBaseURL, safeEndpointPath } from "../../../../src/endpoint";
 import { bearer, grantTokenPattern } from "../grants/tokens";
 import type { IntegrationTarget } from "../integrations/types";
 
@@ -21,7 +22,9 @@ const repoWrite = new RegExp(
 
 const gitPath = new RegExp(`^(/${repo}/${repo})/(info/refs|git-upload-pack|git-receive-pack)$`);
 
-const aiPath = /^\/gateway\/([a-z][a-z0-9-]{0,31})(\/v1\/[A-Za-z0-9_.:/-]+)$/;
+const gatewayPath = /^\/gateway\/([a-z][a-z0-9-]{0,31})(\/.*)?$/;
+
+const gatewayBlockedMethods = new Set(["CONNECT", "TRACE", "TRACK"]);
 
 const safePath = /^(?:\/(?:[A-Za-z0-9_.~:-]|%(?:20|[89a-f][0-9a-f]))+)+\/?$/i;
 
@@ -29,31 +32,29 @@ const sensitiveQuery =
   /^(?:access[_-]?token|api[_-]?key|auth(?:orization)?|client[_-]?secret|credential|key|password|signature|token)$/i;
 
 export interface Route {
-  type: "api" | "git" | "ai";
+  type: "api" | "git" | "ai" | "http";
   integration: IntegrationTarget;
   url: URL;
 }
 
 export type RequestRoute =
   | { type: "api" | "git"; url: URL }
-  | { type: "ai"; id: string; path: string; search: string; method: string };
+  | { type: "gateway"; id: string; path: string; search: string; method: string };
 
 export function route(requestUrl: URL, method: string): RequestRoute | undefined {
   const { pathname, search } = requestUrl;
 
-  for (const key of requestUrl.searchParams.keys()) {
-    if (sensitiveQuery.test(key)) return;
+  const gateway = pathname.match(gatewayPath);
+
+  if (gateway) {
+    const [, id, path = ""] = gateway;
+
+    if (gatewayBlockedMethods.has(method.toUpperCase()) || !safeEndpointPath(path)) return;
+
+    return { type: "gateway", id, path, search, method };
   }
 
-  const ai = pathname.match(aiPath);
-
-  if (ai) {
-    const [, id, path] = ai;
-
-    if (!aiAllowed("anthropic", path, method) && !aiAllowed("openai", path, method)) return;
-
-    return { type: "ai", id, path, search, method };
-  }
+  if (hasSensitiveQuery(requestUrl.searchParams)) return;
 
   if (pathname === "/api/graphql" && method === "POST" && !search) {
     return { type: "api", url: new URL("https://api.github.com/graphql") };
@@ -94,18 +95,36 @@ export function upstreamRoute(
   request: RequestRoute,
   integration: IntegrationTarget,
 ): Route | undefined {
-  if (request.type !== "ai") {
+  if (request.type !== "gateway") {
     return integration.kind === "github" ? { ...request, integration } : undefined;
   }
 
   const { kind } = integration;
   const { path, search, method, id } = request;
 
-  if (kind === "github" || id !== integration.id || !aiAllowed(kind, path, method)) return;
+  if (kind === "github" || id !== integration.id) return;
+
+  if (kind === "http") {
+    const base = integration.endpoint && endpointBaseURL(integration.endpoint.baseURL);
+
+    return base
+      ? { type: "http", integration, url: new URL(`${base}${path}${search}`) }
+      : undefined;
+  }
+
+  if (!aiAllowed(kind, path, method) || hasSensitiveQuery(new URLSearchParams(search))) return;
 
   const prefix = kind === "openrouter" ? "/api" : "";
 
   return { type: "ai", integration, url: new URL(`${prefix}${path}${search}`, aiOrigins[kind]) };
+}
+
+function hasSensitiveQuery(params: URLSearchParams): boolean {
+  for (const key of params.keys()) {
+    if (sensitiveQuery.test(key)) return true;
+  }
+
+  return false;
 }
 
 function aiAllowed(kind: keyof typeof aiOrigins, path: string, method: string): boolean {
@@ -157,7 +176,7 @@ export function sandboxToken(request: Request, target: RequestRoute): string | u
 
   if (!token && target.type === "api") token = authorization?.match(/^token ([!-~]+)$/i)?.[1];
 
-  if (authorization === null && target.type === "ai") token = key ?? undefined;
+  if (authorization === null && target.type === "gateway") token = key ?? undefined;
 
   return token && grantTokenPattern.test(token) ? token : undefined;
 }
@@ -175,6 +194,8 @@ function gitBasic(authorization: string | null): string | undefined {
 }
 
 export function brokerLink(value: string, target: Route): string | undefined {
+  if (target.type === "http") return;
+
   const upstreamLink = URL.parse(value, target.url.href);
 
   if (

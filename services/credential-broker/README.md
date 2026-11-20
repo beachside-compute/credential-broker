@@ -1,6 +1,6 @@
 # Beachside credential broker
 
-The broker lets a sandbox use GitHub over HTTPS or call model APIs with expiring grants. Deploy it in your Cloudflare account. A SQLite-backed Durable Object stores the integration catalog, encrypted credentials, issuer permissions, and the grant registry. The Worker authorizes every request and supplies the selected credential to the fixed upstream. A sandbox receives only a grant and instructions for reaching the broker.
+The broker lets a sandbox use GitHub over HTTPS or call HTTPS APIs with expiring grants. Deploy it in your Cloudflare account. A SQLite-backed Durable Object stores the integration catalog, encrypted credentials, issuer permissions, and the grant registry. The Worker authorizes every request and supplies the selected credential to the fixed upstream. A sandbox receives only a grant and instructions for reaching the broker.
 
 ## Deploy
 
@@ -35,7 +35,7 @@ node dist/cli.js issuer set github-work
 node dist/cli.js integration list
 ```
 
-Create integrations with kind `github`, `anthropic`, `openai`, or `openrouter`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
+Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 
 Encrypted-store credentials are encrypted before the Worker sends their envelopes to SQLite. AES-256-GCM uses a fresh nonce for every write and authenticates the integration identity, credential version, and encryption key version. Use `integration rotate <id> --secret-stdin` with a replacement credential. Subsequent requests using an existing grant see the replacement. Requests that already passed authorization may finish with the prior credential.
 
@@ -54,9 +54,54 @@ For a declared Worker secret, use `integration create <id> --provider <kind> --w
 | `GET /v1/admin/issuer-permissions`          | Returns `{ "integrations": ["..."] }`.                                                          |                                                                                                                                   |
 | `PUT /v1/admin/issuer-permissions`          | Replaces the allowlist with `{ "integrations": ["..."] }`. An empty list disables new issuance. | `400` invalid input, `404 integration_not_found` for an unknown ID                                                                |
 
-All admin routes can return `401 administrator_authentication_required` or `503 broker_unavailable`. For a Worker-secret reference, an undeclared binding and a declared binding with an absent or invalid secret both return `503 credential_unavailable`. Check the declared binding names and the provisioned Worker secrets on the operator host. API responses omit binding values and configuration details.
+All admin routes can return `401 administrator_authentication_required` or `503 broker_unavailable`. For a Worker-secret reference, an undeclared binding and a declared binding with an absent or invalid secret both return `503 credential_unavailable`. Check the declared binding names and the provisioned Worker secrets on the operator host. API responses omit secret values and Worker binding names. HTTP integration metadata includes the configured URL, header names, literal values, and secret prefixes.
 
-A credential object is `{ "source": "encrypted-store", "value": "..." }` or `{ "source": "worker-secret", "binding": "CREDENTIAL_NAME" }`. Supply the admin key as a bearer token. The admin key cannot issue grants or access gateways.
+A credential object is `{ "source": "encrypted-store", "value": "..." }` or `{ "source": "worker-secret", "binding": "CREDENTIAL_NAME" }`. The `http` kind uses the endpoint and credential objects below. Supply the admin key as a bearer token. The admin key cannot issue grants or access gateways.
+
+### Configurable HTTPS endpoints
+
+Use `node dist/cli.js integration setup` from an interactive terminal or supply JSON on stdin. The Anthropic preset configures `anthropic-version: 2023-06-01` for messages clients. The create command reads the `endpoint` and `credential` fields from a protected file or secret-manager output.
+
+```sh
+node dist/cli.js integration create gateway-work --provider http --config-stdin < /secure/path/gateway-integration.json
+```
+
+For example, a Cloudflare AI Gateway configured with OpenAI as the upstream takes two independent credentials. Use the [Cloudflare provider-native base URL](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/).
+
+```json
+{
+  "endpoint": {
+    "baseURL": "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/openai",
+    "headers": [
+      { "name": "authorization", "secret": true, "prefix": "Bearer " },
+      { "name": "cf-aig-authorization", "secret": true, "prefix": "Bearer " }
+    ]
+  },
+  "credential": {
+    "source": "encrypted-store",
+    "values": {
+      "authorization": "OPENAI_KEY_FROM_SECRET_MANAGER",
+      "cf-aig-authorization": "CLOUDFLARE_TOKEN_FROM_SECRET_MANAGER"
+    }
+  }
+}
+```
+
+A configured header is either `{ "name": "authorization", "secret": true, "prefix": "Bearer " }` or `{ "name": "x-tenant", "value": "team-a" }`. Omit the prefix to send the secret verbatim. Header names are case-insensitive and unique. Keep secrets out of the base URL, literal values, and prefixes, which appear in admin metadata. Use up to eight headers with names of up to 64 characters. Use up to 128 printable ASCII characters for each prefix and up to 1,024 for each literal value. Secret values are 1–4,096 printable ASCII bytes with no leading or trailing space. HTTP integrations currently use encrypted-store credentials. Use `{ "source": "encrypted-store", "values": {} }` when the endpoint has no secret headers. The broker binds the encrypted values to the endpoint configuration, integration identity, and credential version.
+
+The admin create API takes the same JSON plus `"id": "gateway-work"` and `"kind": "http"`. The base URL requires a multi-label HTTPS DNS hostname, with no URL credentials, query, or fragment. The submitted and normalized URLs each have a 2,048-character limit. IP literals and hostnames ending in `.local`, `.localhost`, `.internal`, `.test`, `.invalid`, or `.example` are rejected. Administrators must trust the destination and its DNS. The broker validates URL syntax without resolving addresses or enforcing public DNS answers. The URL and header definitions are immutable. Review the integration and add it to the issuer allowlist when ready. To change the destination or header definitions, create a replacement integration and retire the old one.
+
+Update the admin client and CLI before creating HTTP integrations. An older admin client rejects metadata for this new kind.
+
+To rotate one or more headers, pipe in a JSON map that contains only the replacement values. The admin rotate API receives `{ "source": "encrypted-store", "values": {...} }`. Use `--secret-stdin` or `--worker-secret` for the built-in kinds. Omitted HTTP secret headers keep their current values and existing grants remain valid. For root key rotation, provide every secret value from its original source or rotate it to a fresh upstream value. An endpoint with no secret headers can be re-encrypted with an empty map.
+
+```sh
+node dist/cli.js integration rotate gateway-work --credentials-stdin < /secure/path/replacement-headers.json
+```
+
+A grant can call HTTP paths beneath the configured base. For example, a request to `/gateway/gateway-work/chat/completions` reaches `/v1/ACCOUNT_ID/GATEWAY_ID/openai/chat/completions` on the Cloudflare gateway. Use a bearer grant or `x-api-key`, with one authentication header per request. The broker consumes the grant header and strips hop-by-hop, forwarding, client identity, cookie, and known tracing headers, including `traceparent`, `baggage`, `sentry-trace`, `grpc-trace-bin`, and the `x-b3-*` and `x-datadog-*` families. It also strips guest `cf-*` headers. Administrators can configure `cf-aig-*` headers. Configured headers replace guest values. Ordinary application headers such as `x-request-id` and `x-correlation-id` pass through as application data. Configure provider-side scopes and limits for all methods and paths the upstream exposes. Trust the endpoint to keep injected values out of its response bodies, where the broker streams the upstream bytes directly.
+
+The broker blocks redirects, WebSocket upgrades, and CONNECT, TRACE, and TRACK. Paths reject encoded separators, double slashes, matrix parameters, and segments ending in a dot or whitespace. The HTTP gateway supports server-sent events and streaming bodies. Response filtering removes cookies, redirect targets, and configured secret header names. It also removes headers that match a raw secret, contain a prefixed secret, or contain a raw secret of at least eight characters. This filtering is best effort. Use trusted upstreams that keep credentials out of responses.
 
 ### Rotate an encryption key
 
@@ -106,12 +151,12 @@ By default the registry admits up to 1,000 active grants and up to 100 per issui
 
 Use the [credential client](../../README.md) for Beachside-managed environment variables and revocation. It gives each opted-in sandbox a distinct grant. The client also works outside Beachside, where its caller owns revocation.
 
-- **Git HTTPS** uses the broker remote `https://<broker-host>/<owner>/<repo>.git` and the grant password with username `x-access-token`. The client configures Git to rewrite `https://github.com/` remotes in the sandbox's command environment. Clone, fetch and push are supported over smart HTTP. SSH, Git LFS, and submodules on unrelated hosts use their own access paths.
+- **Git HTTPS** uses the broker remote `https://<broker-host>/<owner>/<repo>.git` and the grant password with username `x-access-token`. The client configures Git to rewrite `https://github.com/` remotes in the sandbox's command environment. Clone, fetch and push are supported over smart HTTP. Use the `.git` suffix for the GitHub owner `gateway` to disambiguate its repository from a configurable HTTP route. SSH, Git LFS, and submodules on unrelated hosts use their own access paths.
 - **GitHub CLI** uses `GH_HOST=<broker-host>` and `GH_ENTERPRISE_TOKEN=<grant>`. Give commands an explicit `--repo <broker-host>/<owner>/<repo>` if local remotes might resolve to another host. The broker maps GHES-style REST and GraphQL URLs to GitHub.com using the grant's single GitHub integration. Repo view, issue list/create, and PR list/create/comment have CLI fixtures. Canonical links returned by GitHub still point to GitHub.com. Browser views, auth login, workflows, releases, downloads, and endpoints outside the REST allowlist may require direct access. REST branch and commit reads accept single-component refs. Use GraphQL for refs containing slashes, such as `feature/login`. GraphQL forwards the queries and mutations allowed by the GitHub token.
 - **Anthropic** uses `ANTHROPIC_BASE_URL=https://<broker-host>/gateway/<integration>` and `ANTHROPIC_API_KEY=<grant>`. The gateway supports messages, token counts, and model metadata.
 - **OpenAI** and **OpenRouter** use `OPENAI_BASE_URL` or `OPENROUTER_BASE_URL` ending in `/gateway/<integration>/v1`. Supply the grant in the respective `*_API_KEY`. The gateway forwards model metadata, chat completions, responses creation, and embeddings where the upstream provider supports them. Files, key management, account endpoints, realtime WebSockets, and retrieval of stored responses are outside this gateway.
 
-The reverse gateway has a fixed upstream per integration kind. It filters request and response headers, forwards permitted requests with the upstream credential, and streams bodies and server-sent events. It can rewrite same-upstream read redirects and REST pagination links back through the gateway. Other redirects are rejected. The broker sends each write once. A transport error may still leave an upstream write applied.
+The built-in integrations use a fixed upstream per kind. It filters request and response headers, forwards permitted requests with the upstream credential, and streams bodies and server-sent events. Built-in gateways can rewrite supported same-upstream read redirects back through the broker. The GitHub gateway also rewrites supported REST pagination links. Other redirects are rejected. The broker sends each write once. A transport error may still leave an upstream write applied.
 
 ### OpenCode
 

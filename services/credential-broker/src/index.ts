@@ -5,7 +5,7 @@ import { orchestrator } from "./auth";
 import { integrationId, maxGrantTtlSeconds, parseConfig } from "./config";
 import type { ResolvedCredential } from "./credentials/source";
 import { workerSecretSource } from "./credentials/sources/worker-secret";
-import { encryptedStoreSource } from "./credentials/sources/encrypted-store";
+import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
 import { failure, upstream, withCompletion } from "./proxy/forward";
 import { GrantRegistry } from "./grants/registry";
 import { route, sandboxToken, upstreamRoute } from "./proxy/routes";
@@ -146,7 +146,8 @@ app.delete("/v1/grants/:id", async (context) => {
 
 app.all("*", async (context) => {
   const request = context.req.raw;
-  const incoming = route(new URL(request.url), request.method);
+  const requestUrl = new URL(request.url);
+  const incoming = route(requestUrl, request.method);
 
   if (!incoming) return failure(404, "unsupported_route");
 
@@ -158,7 +159,7 @@ app.all("*", async (context) => {
   const store = registry(context.env);
 
   const selector: IntegrationSelector =
-    incoming.type === "ai" ? { type: "ai", id: incoming.id } : { type: "github" };
+    incoming.type === "gateway" ? { type: "gateway", id: incoming.id } : { type: "github" };
 
   const authorized = await store.authorize(
     await tokenHash(token),
@@ -195,22 +196,43 @@ app.all("*", async (context) => {
   const { integration } = authorized;
   const target = upstreamRoute(incoming, integration);
 
-  if (!target) {
+  const blockedEndpoint =
+    target?.type === "http" &&
+    (request.headers.has("upgrade") ||
+      decodeURIComponent(requestUrl.pathname).includes(token) ||
+      [...requestUrl.searchParams].some(
+        ([name, value]) => name.includes(token) || value.includes(token),
+      ));
+
+  if (!target || blockedEndpoint) {
     complete(404);
 
     return failure(404, "unsupported_route");
   }
 
-  let credential: ResolvedCredential | undefined;
+  let credential: ResolvedCredential | { values: Record<string, string> } | undefined;
 
   try {
     const reference = integration.credential;
-    credential =
-      reference.source === "worker-secret"
-        ? await workerSecretSource(context.env).resolve(reference)
-        : await encryptedStoreSource(integration, managementKeyring(context.env)).resolve(
-            reference,
-          );
+
+    if (integration.kind === "http") {
+      if (reference.source === "encrypted-store") {
+        const values = await openEndpointValues(
+          reference,
+          integration,
+          managementKeyring(context.env),
+        );
+
+        if (values) credential = { values };
+      }
+    } else {
+      credential =
+        reference.source === "worker-secret"
+          ? await workerSecretSource(context.env).resolve(reference)
+          : await encryptedStoreSource(integration, managementKeyring(context.env)).resolve(
+              reference,
+            );
+    }
   } catch {
     complete(503);
 
@@ -224,7 +246,7 @@ app.all("*", async (context) => {
   }
 
   try {
-    const response = await upstream(request, target, credential);
+    const response = await upstream(request, target, credential, token);
 
     return withCompletion(response, (failed) => complete(response.status, failed));
   } catch {

@@ -32,6 +32,16 @@ const metadata = {
   updatedAt: "2026-11-18T00:00:00.000Z",
 };
 
+const endpoint = {
+  baseURL: "https://upstream.example.com/v1",
+  headers: [
+    { name: "authorization", secret: true, prefix: "Bearer " },
+    { name: "x-tenant", value: "fixture" },
+  ],
+};
+
+const httpMetadata = { ...metadata, id: "api-work", kind: "http", endpoint };
+
 const routes = [];
 
 let service;
@@ -51,6 +61,17 @@ async function handle(request, response) {
 
   switch (route) {
     case "POST /v1/admin/integrations":
+      if (input.kind === "http") {
+        assert.deepEqual(input, {
+          id: httpMetadata.id,
+          kind: "http",
+          endpoint,
+          credential: { source: "encrypted-store", values: { authorization: initial } },
+        });
+
+        return json(201, { ...httpMetadata, hiddenFixtureField: initial });
+      }
+
       if (routes.filter((seen) => seen === route).length > 1) {
         return json(409, { credential: initial, apiKey: adminKey });
       }
@@ -68,6 +89,13 @@ async function handle(request, response) {
       const credentialVersion = input.value === longest ? 3 : 2;
 
       return json(200, { ...metadata, credentialVersion, hiddenFixtureField: input.value });
+    case "PUT /v1/admin/integrations/api-work/credential":
+      assert.deepEqual(input, {
+        source: "encrypted-store",
+        values: { authorization: replacement },
+      });
+
+      return json(200, { ...httpMetadata, credentialVersion: 2, hiddenFixtureField: replacement });
     case "PUT /v1/admin/issuer-permissions":
       assert.deepEqual(input, { integrations: [metadata.id] });
 
@@ -165,6 +193,24 @@ try {
   assert.equal(conflict.stdout, "");
   assert.match(conflict.stderr, /^CONFLICT /);
 
+  const createHttp = ["integration", "create", "api-work", "--provider", "http", "--config-stdin"];
+  await verify(
+    createHttp,
+    httpMetadata,
+    JSON.stringify({
+      endpoint,
+      credential: { source: "encrypted-store", values: { authorization: initial } },
+    }),
+  );
+  await verify(
+    ["integration", "rotate", "api-work", "--credentials-stdin"],
+    {
+      ...httpMetadata,
+      credentialVersion: 2,
+    },
+    JSON.stringify({ authorization: replacement }),
+  );
+
   const rotate = ["integration", "rotate", "github-work", "--secret-stdin"];
 
   for (const suffix of ["", "\n", "\r\n"]) {
@@ -172,6 +218,13 @@ try {
   }
 
   const invalidOptions = [
+    { args: ["integration", "setup"], message: "Integration setup needs a terminal" },
+    { args: createHttp, input: `{ "credential": "${initial}`, message: "Expected a JSON object" },
+    {
+      args: [...createHttp, "--secret-stdin"],
+      input: initial,
+      message: "HTTP integration creation requires",
+    },
     { args: ["integration", "list", `--${initial}`], message: "Invalid command options" },
     { args: ["configuration", "show", "--secret", initial], message: "Choose a command group" },
     {
@@ -212,6 +265,8 @@ try {
     "PUT /v1/admin/integrations/github-work/credential",
     "PUT /v1/admin/issuer-permissions",
     "POST /v1/admin/integrations",
+    "POST /v1/admin/integrations",
+    "PUT /v1/admin/integrations/api-work/credential",
     "PUT /v1/admin/integrations/github-work/credential",
     "PUT /v1/admin/integrations/github-work/credential",
     "PUT /v1/admin/integrations/github-work/credential",

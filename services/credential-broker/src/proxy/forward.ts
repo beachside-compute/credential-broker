@@ -1,3 +1,5 @@
+import type { BrokerEndpointHeader } from "../../../../src/endpoint";
+import { reservedEndpointHeader } from "../../../../src/endpoint";
 import type { ResolvedCredential } from "../credentials/source";
 import { brokerLink } from "./routes";
 import type { Route } from "./routes";
@@ -40,21 +42,23 @@ export function failure(status: number, error: string, challenge = false): Respo
 export async function upstream(
   request: Request,
   target: Route,
-  credential: ResolvedCredential,
+  credential: ResolvedCredential | { values: Record<string, string> },
+  grant: string,
 ): Promise<Response> {
-  const headers = copyHeaders(request.headers, clientHeaders);
-  headers.set("user-agent", "Beachside-Credential-Broker/0.0.0");
+  const headers =
+    "values" in credential
+      ? endpointHeaders(
+          request.headers,
+          target.integration.endpoint?.headers ?? [],
+          credential.values,
+          grant,
+        )
+      : copyHeaders(request.headers, clientHeaders);
+
+  if (!headers.has("user-agent")) headers.set("user-agent", "Beachside-Credential-Broker/0.0.0");
   headers.set("accept-encoding", "identity");
 
-  if (target.type === "git") {
-    headers.set("authorization", `Basic ${btoa(`x-access-token:${credential.value}`)}`);
-  } else if (target.integration.kind === "anthropic") {
-    headers.set("x-api-key", credential.value);
-
-    if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
-  } else {
-    headers.set("authorization", `Bearer ${credential.value}`);
-  }
+  if ("value" in credential) setLegacyCredential(headers, target, credential.value);
 
   // No retries. In particular, a transport error says nothing about whether a write landed.
   const response = await fetch(target.url, {
@@ -65,7 +69,15 @@ export async function upstream(
     signal: request.signal,
   });
 
-  const responseHeaders = copyHeaders(response.headers, upstreamHeaders);
+  const responseHeaders =
+    "values" in credential
+      ? endpointResponseHeaders(
+          response.headers,
+          target.integration.endpoint?.headers ?? [],
+          credential.values,
+        )
+      : copyHeaders(response.headers, upstreamHeaders);
+
   responseHeaders.set("cache-control", "no-store");
   responseHeaders.set("x-content-type-options", "nosniff");
   responseHeaders.set("content-security-policy", "default-src 'none'; sandbox");
@@ -114,6 +126,114 @@ export async function upstream(
     headers: responseHeaders,
     encodeBody: "manual",
   });
+}
+
+function setLegacyCredential(headers: Headers, target: Route, value: string): void {
+  if (target.type === "git") {
+    headers.set("authorization", `Basic ${btoa(`x-access-token:${value}`)}`);
+  } else if (target.integration.kind === "anthropic") {
+    headers.set("x-api-key", value);
+
+    if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
+  } else {
+    headers.set("authorization", `Bearer ${value}`);
+  }
+}
+
+function connectionHeaders(headers: Headers): ReadonlySet<string> {
+  return new Set(
+    headers
+      .get("connection")
+      ?.toLowerCase()
+      .split(",")
+      .map((name) => name.trim()),
+  );
+}
+
+export function endpointHeaders(
+  incoming: Headers,
+  configured: readonly BrokerEndpointHeader[],
+  values: Record<string, string>,
+  grant: string,
+): Headers {
+  const headers = new Headers();
+  const nominated = connectionHeaders(incoming);
+
+  // Delete every transport/identity header and any alternate copy of the bearer value.
+  for (const [name, value] of incoming) {
+    if (
+      name === "authorization" ||
+      name === "x-api-key" ||
+      name.startsWith("cf-") ||
+      reservedEndpointHeader(name) ||
+      nominated.has(name) ||
+      name.includes(grant) ||
+      value.includes(grant)
+    )
+      continue;
+
+    headers.set(name, value);
+  }
+
+  for (const header of configured) {
+    headers.set(
+      header.name,
+      "secret" in header ? `${header.prefix ?? ""}${values[header.name]}` : header.value,
+    );
+  }
+
+  return headers;
+}
+
+const endpointResponseBlocked = new Set([
+  "alt-svc",
+  "authorization",
+  "clear-site-data",
+  "content-location",
+  "link",
+  "location",
+  "refresh",
+  "service-worker-allowed",
+  "www-authenticate",
+  "x-api-key",
+]);
+
+export function endpointResponseHeaders(
+  incoming: Headers,
+  configured: readonly BrokerEndpointHeader[],
+  values: Record<string, string>,
+): Headers {
+  const nominated = connectionHeaders(incoming);
+
+  const secrets = configured.flatMap((header) => {
+    if (!("secret" in header)) return [];
+    const raw = values[header.name];
+
+    return [{ raw, injected: `${header.prefix ?? ""}${raw}` }];
+  });
+
+  const headers = new Headers();
+
+  for (const [name, value] of incoming) {
+    if (
+      reservedEndpointHeader(name) ||
+      name.startsWith("cf-") ||
+      endpointResponseBlocked.has(name) ||
+      nominated.has(name) ||
+      Object.hasOwn(values, name) ||
+      secrets.some(
+        ({ raw, injected }) =>
+          value === raw ||
+          (raw.length >= 8 && (value.includes(raw) || name.includes(raw))) ||
+          (injected !== raw && value.includes(injected)),
+      )
+    )
+      continue;
+
+    headers.set(name, value);
+  }
+
+  return headers;
 }
 
 function copyHeaders(source: Headers, allowed: string[]): Headers {
