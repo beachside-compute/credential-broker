@@ -1,17 +1,18 @@
-import { randomBytes } from "node:crypto";
-import {
-  constants,
-  closeSync,
-  existsSync,
-  fstatSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { parseEnv } from "node:util";
-import { terminalPrompt, type Ask } from "../src/terminal.js";
+import { terminalPrompt } from "../src/terminal.js";
+import { confirmed, configureDeployment, loadDeploymentFile, setupError } from "./deployment-file";
 import { CredentialBrokerError } from "../src/transport.js";
+import { assertSeparateRoleKeys } from "../services/credential-broker/src/auth";
+import { isBrokerApiKey } from "../services/credential-broker/src/auth/api-key";
+import { parseConfig } from "../services/credential-broker/src/config";
+import { credentialValue } from "../services/credential-broker/src/credentials/source";
+import { encryptionKeyring } from "../services/credential-broker/src/credentials/sources/encrypted-store";
+import {
+  traceAuthorization,
+  traceEndpoint,
+} from "../services/credential-broker/src/observability/otlp";
 
 const repository = resolve(import.meta.dir, "..");
 
@@ -22,137 +23,106 @@ const brokerSecrets = [
   "BROKER_ISSUER_KEY",
   "BROKER_ENCRYPTION_KEYS",
   "BROKER_ENCRYPTION_KEY_VERSION",
-  "ALCHEMY_PASSWORD",
 ];
 
 const environmentFile = ".env.deploy";
 
-function setupError(message: string): never {
-  throw new CredentialBrokerError("INVALID_ARGUMENT", message);
-}
-
-export function loadDeploymentFile(path: string): NodeJS.ProcessEnv | undefined {
-  let file: number;
-
-  try {
-    file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
-
-    return setupError("Could not open .env.deploy as a regular file");
-  }
-
-  try {
-    const stat = fstatSync(file);
-
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0)
-      return setupError(".env.deploy must be a private regular file. Use chmod 600 .env.deploy");
-
-    try {
-      return parseEnv(readFileSync(file, "utf8"));
-    } catch {
-      return setupError("Could not read .env.deploy. Check the file's dotenv syntax");
-    }
-  } finally {
-    closeSync(file);
-  }
-}
-
-function randomKey(): string {
-  return randomBytes(32).toString("base64url");
-}
-
-function confirmed(value: string): boolean {
-  return ["y", "yes"].includes(value.trim().toLowerCase());
-}
-
-export async function configureDeployment(
-  path: string,
-  ask: Ask,
-  write: (message: string) => void,
-): Promise<boolean> {
-  if (loadDeploymentFile(path))
-    return setupError(".env.deploy already exists. Reuse or edit it to retain its keys");
-  write("Create deployment configuration for a Cloudflare Worker.\n");
-  const account = (await ask("Cloudflare account ID: ")).trim();
-
-  if (!/^[a-f0-9]{32}$/i.test(account))
-    return setupError("Enter a 32-character hexadecimal Cloudflare account ID");
-  const token = (await ask("Cloudflare API token: ", true)).trim();
-
-  if (!/^[A-Za-z0-9_-]{1,256}$/.test(token))
-    return setupError(
-      "Enter a Cloudflare API token containing only letters, digits, hyphens, or underscores",
-    );
-
-  if (!confirmed(await ask("Save .env.deploy with new broker and Alchemy keys? [y/N]: "))) {
-    write("Deployment setup cancelled.\n");
-
-    return false;
-  }
-
-  const stage = "production";
-  const active = "v1";
-
-  const contents = [
-    "# Private deployment configuration. Keep this file and the Alchemy state together.",
-    `CLOUDFLARE_ACCOUNT_ID=${account}`,
-    `CLOUDFLARE_API_TOKEN=${token}`,
-    `ALCHEMY_STAGE=${stage}`,
-    `ALCHEMY_PASSWORD=${randomKey()}`,
-    `BROKER_ADMIN_KEY=${randomKey()}`,
-    `BROKER_ISSUER_KEY=${randomKey()}`,
-    `BROKER_ENCRYPTION_KEYS='${JSON.stringify({ [active]: randomKey() })}'`,
-    `BROKER_ENCRYPTION_KEY_VERSION=${active}`,
-    "",
-  ].join("\n");
-
-  try {
-    writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
-  } catch {
-    return setupError(
-      "Could not create .env.deploy. Existing files are kept; check the path and permissions",
-    );
-  }
-
-  write(
-    "Saved .env.deploy. Keep it private and retain it with the Alchemy state for future deployments.\n",
-  );
-
-  return true;
-}
-
 function hasBrokerCredentials(env: NodeJS.ProcessEnv): boolean {
   return Boolean(
-    env.BROKER_ADMIN_KEY &&
-    env.BROKER_ENCRYPTION_KEYS &&
-    env.BROKER_ENCRYPTION_KEY_VERSION &&
-    env.ALCHEMY_PASSWORD,
+    env.BROKER_ADMIN_KEY && env.BROKER_ENCRYPTION_KEYS && env.BROKER_ENCRYPTION_KEY_VERSION,
   );
 }
 
-export function deploymentEnvironment(
+function alchemyEnvironment(
   inherited: NodeJS.ProcessEnv,
-  file: NodeJS.ProcessEnv,
+  file: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
-  if (!hasBrokerCredentials(file))
-    return setupError(
-      "Complete the broker keys and Alchemy password in .env.deploy before deploying",
-    );
   const env = { ...inherited, ...file };
 
-  // Pinned Alchemy otherwise prefers a legacy API key over the file's explicit API token.
-  if (file.CLOUDFLARE_API_TOKEN && !file.CLOUDFLARE_API_KEY) env.CLOUDFLARE_API_KEY = "";
+  if (!hasBrokerCredentials(env) || !env.ALCHEMY_PASSWORD)
+    return setupError("Alchemy deployment requires the existing broker keys and ALCHEMY_PASSWORD");
+
+  // Pinned Alchemy prefers a legacy API key even when the file supplies an API token.
+  if (file?.CLOUDFLARE_API_TOKEN && !file.CLOUDFLARE_API_KEY) env.CLOUDFLARE_API_KEY = "";
 
   return env;
 }
 
-export function launchDeployment(
-  root: string,
-  env: NodeJS.ProcessEnv,
-  args: string[],
-): Promise<number> {
-  const child = Bun.spawn([process.execPath, "run", "deploy", ...args], {
+function workerSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
+  const {
+    BROKER_ADMIN_KEY: admin,
+    BROKER_ISSUER_KEY: issuer,
+    BROKER_ENCRYPTION_KEYS: encoded,
+    BROKER_ENCRYPTION_KEY_VERSION: active,
+    BROKER_OTLP_TRACES_ENDPOINT: traceUrl,
+    BROKER_OTLP_AUTHORIZATION: collectorAuthorization,
+  } = env;
+
+  if (
+    !isBrokerApiKey(admin) ||
+    (issuer !== undefined && !isBrokerApiKey(issuer)) ||
+    !encoded ||
+    !active
+  )
+    return setupError(
+      "Configure valid broker role keys and an encryption keyring in .env.deploy or the environment",
+    );
+
+  const deployment = new Map([
+    ["BROKER_ADMIN_KEY", admin],
+    ["BROKER_ENCRYPTION_KEYS", encoded],
+    ["BROKER_ENCRYPTION_KEY_VERSION", active],
+  ]);
+
+  if (issuer) deployment.set("BROKER_ISSUER_KEY", issuer);
+
+  try {
+    const config = parseConfig(env.BROKER_CONFIG ?? "{}");
+
+    const keyring = encryptionKeyring({
+      BROKER_ENCRYPTION_KEYS: encoded,
+      BROKER_ENCRYPTION_KEY_VERSION: active,
+    });
+
+    assertSeparateRoleKeys(
+      { BROKER_ADMIN_KEY: admin, BROKER_ISSUER_KEY: issuer },
+      keyring.keys.values(),
+    );
+
+    if (!issuer && !config.githubActions)
+      return setupError("Configure a broker issuer key, GitHub Actions OIDC, or both");
+    deployment.set("BROKER_CONFIG", JSON.stringify(config));
+
+    for (const name of config.workerSecretBindings) {
+      const parsed = credentialValue.safeParse(env[name]);
+
+      if (!parsed.success) return setupError(`Provide a valid Worker secret binding for ${name}`);
+      deployment.set(name, parsed.data);
+    }
+
+    if (traceUrl !== undefined) {
+      deployment.set("BROKER_OTLP_TRACES_ENDPOINT", traceEndpoint(traceUrl));
+
+      if (collectorAuthorization !== undefined)
+        deployment.set("BROKER_OTLP_AUTHORIZATION", traceAuthorization(collectorAuthorization));
+    } else if (collectorAuthorization !== undefined) {
+      return setupError(
+        "Configure BROKER_OTLP_TRACES_ENDPOINT before adding collector authorization",
+      );
+    }
+  } catch (error) {
+    if (error instanceof CredentialBrokerError) throw error;
+
+    return setupError(
+      "Invalid broker policy, encryption keyring, role key separation, or trace configuration",
+    );
+  }
+
+  return Object.fromEntries(deployment);
+}
+
+async function runCommand(root: string, env: NodeJS.ProcessEnv, args: string[]): Promise<number> {
+  const child = Bun.spawn([process.execPath, "run", ...args], {
     cwd: resolve(root, servicePath),
     env,
     stdin: "inherit",
@@ -160,57 +130,159 @@ export function launchDeployment(
     stderr: "inherit",
   });
 
-  return child.exited;
+  const interrupt = () => {
+    child.kill("SIGINT");
+  };
+
+  const terminate = () => {
+    child.kill("SIGTERM");
+  };
+
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", terminate);
+
+  try {
+    return await child.exited;
+  } finally {
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", terminate);
+  }
+}
+
+async function needsWranglerLogin(root: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  const child = Bun.spawn([process.execPath, "run", "--silent", "wrangler", "whoami", "--json"], {
+    cwd: resolve(root, servicePath),
+    env,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+
+  const [status, reply] = await Promise.all([child.exited, Bun.readableStreamToText(child.stdout)]);
+
+  if (status === 0) return false;
+
+  try {
+    // Wrangler returns this structured result for a missing session. Other errors
+    // are left to deploy, which can refresh credentials and report useful diagnostics.
+    return JSON.parse(reply).loggedIn === false;
+  } catch {
+    return false;
+  }
+}
+
+async function deployWrangler(
+  root: string,
+  inherited: NodeJS.ProcessEnv,
+  settings: NodeJS.ProcessEnv,
+  args: string[],
+  setup: boolean,
+): Promise<number> {
+  const secrets = workerSecrets(settings);
+  const env = { ...inherited };
+
+  for (const name of Object.keys(env)) {
+    if (/^(?:BROKER_|CREDENTIAL_|ALCHEMY_)/.test(name)) delete env[name];
+  }
+
+  if (settings.CLOUDFLARE_API_TOKEN) env.CLOUDFLARE_API_TOKEN = settings.CLOUDFLARE_API_TOKEN;
+
+  if (settings.CLOUDFLARE_ACCOUNT_ID) env.CLOUDFLARE_ACCOUNT_ID = settings.CLOUDFLARE_ACCOUNT_ID;
+
+  if (setup && !env.CLOUDFLARE_API_TOKEN && (await needsWranglerLogin(root, env))) {
+    const login = await runCommand(root, env, ["wrangler", "login"]);
+
+    if (login !== 0) return login;
+  }
+
+  const directory = mkdtempSync(resolve(tmpdir(), "broker-wrangler-"));
+
+  try {
+    const path = resolve(directory, "secrets.json");
+    writeFileSync(path, JSON.stringify(secrets), { flag: "wx", mode: 0o600 });
+
+    return await runCommand(root, env, ["deploy:wrangler", ...args, "--secrets-file", path]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 async function deploy() {
   const args = process.argv.slice(2);
+  const alchemy = args[0] === "--alchemy";
+
+  if (alchemy) args.shift();
   const setupOnly = args[0] === "--setup-only";
+  const firstArgument = args[0];
   const envPath = resolve(repository, environmentFile);
   const inherited = process.env;
 
-  if (args[0] === "--help" || args[0] === "-h")
-    return launchDeployment(repository, inherited, args);
+  if (
+    args.length === 1 &&
+    (firstArgument === "--help" ||
+      firstArgument === "-h" ||
+      (!alchemy && firstArgument === "--dry-run"))
+  )
+    return runCommand(repository, inherited, [alchemy ? "deploy" : "deploy:wrangler", ...args]);
   const file = loadDeploymentFile(envPath);
+
+  if (alchemy)
+    return runCommand(repository, alchemyEnvironment(inherited, file), ["deploy", ...args]);
+
+  if (
+    args.some((argument) => argument === "--secrets-file" || argument.startsWith("--secrets-file="))
+  )
+    return setupError("Use bun run deploy:wrangler for a manually managed --secrets-file");
+  const settings = { ...inherited, ...file };
+  const statePath = resolve(repository, servicePath, settings.ALCHEMY_ROOT ?? ".", ".alchemy");
+
+  if (
+    file?.ALCHEMY_PASSWORD ||
+    file?.ALCHEMY_STAGE ||
+    (!file && settings.ALCHEMY_PASSWORD && settings.BROKER_ADMIN_KEY) ||
+    existsSync(statePath)
+  )
+    return setupError(
+      "Existing Alchemy deployment detected. Use bun run deploy:alchemy to retain its Worker and state",
+    );
 
   if (file) {
     if (setupOnly)
       return setupError(".env.deploy already exists. Reuse or edit it to retain its keys");
 
-    return launchDeployment(repository, deploymentEnvironment(inherited, file), args);
+    return deployWrangler(repository, inherited, settings, args, false);
   }
 
   if (!setupOnly && hasBrokerCredentials(inherited))
-    return launchDeployment(repository, inherited, args);
-  const statePath = resolve(repository, servicePath, inherited.ALCHEMY_ROOT ?? ".", ".alchemy");
+    return deployWrangler(repository, inherited, settings, args, false);
 
-  if (brokerSecrets.some((name) => inherited[name]) || existsSync(statePath))
+  if (brokerSecrets.some((name) => inherited[name]))
     return setupError(
-      "Existing broker credentials or Alchemy state found. Restore the deployment keys in .env.deploy or the environment before deploying",
+      "Existing broker keys found. Restore the deployment configuration in .env.deploy or the environment",
     );
 
   if (args.length > (setupOnly ? 1 : 0))
-    return setupError("Set up .env.deploy before passing Alchemy deployment options");
+    return setupError("Set up .env.deploy before passing Wrangler deployment options");
 
-  const shouldDeploy = await terminalPrompt(
+  const confirmDeploy = await terminalPrompt(
     "Deployment setup needs a terminal. Run bun run deploy:setup interactively or configure .env.deploy from .env.deploy.example",
     "Deployment setup cancelled",
     async (ask, write) => {
       if (!(await configureDeployment(envPath, ask, write))) return false;
 
-      return !setupOnly && confirmed(await ask("Deploy to Cloudflare now? [y/N]: "));
+      return (
+        !setupOnly &&
+        confirmed(await ask("Sign in to Cloudflare if needed and deploy now? [y/N]: "))
+      );
     },
   );
 
-  if (shouldDeploy) {
-    const created = loadDeploymentFile(envPath);
+  if (!confirmDeploy) return 0;
+  const created = loadDeploymentFile(envPath);
 
-    if (!created) return setupError(".env.deploy is missing. Restore it before deploying");
+  if (!created) return setupError(".env.deploy is missing. Restore it before deploying");
 
-    return launchDeployment(repository, deploymentEnvironment(inherited, created), args);
-  }
-
-  return 0;
+  return deployWrangler(repository, inherited, { ...inherited, ...created }, [], true);
 }
 
 if (import.meta.main) {

@@ -13,11 +13,11 @@ bun install --frozen-lockfile
 bun run deploy
 ```
 
-On a fresh checkout, `bun run deploy` opens a wizard that writes a private `.env.deploy` file and asks before deploying to Cloudflare. Have your account ID and API token ready. Run `bun run deploy:setup` to save the configuration for later, or start from the [deployment template](./.env.deploy.example). Use the deployed Worker HTTPS origin in the client.
+On a fresh checkout, the wizard generates three independent broker keys and saves them in a private `.env.deploy` file. Confirm deployment to continue through Wrangler's browser sign-in and deploy to Cloudflare. Future runs reuse the saved keys. Run `bun run deploy:setup` to save keys for later without signing in or deploying.
 
-For direct Cloudflare deployment, use `bun run deploy:wrangler`. For local Worker development, copy the [runtime template](./services/credential-broker/.dev.vars.example) to `services/credential-broker/.dev.vars`, set the local keys, and run `bun run dev`. See the [deployment runbook](./services/credential-broker/README.md) for setup and state details.
+Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
 
-Build the CLI locally with `bun run build`. On the operator host, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY`. Pipe an upstream credential from a protected file or your secret manager:
+Build the CLI locally with `bun run build`. In the operator shell, set `BEACHSIDE_BROKER_URL` to the deployed Worker HTTPS origin and `BEACHSIDE_BROKER_ADMIN_KEY` to the `BROKER_ADMIN_KEY` from `.env.deploy` or your secret manager. Then pipe an upstream credential from a protected file.
 
 ```sh
 node dist/cli.js integration create github-work --provider github --secret-stdin < /secure/path/github-token
