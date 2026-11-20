@@ -1,0 +1,59 @@
+{
+  "name": "@beachside/credential-client",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "beachside-broker": "./dist/cli.js"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json && bun run --cwd services/credential-broker check",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix .",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "test": "bun run --cwd services/credential-broker test && bun test src test",
+    "package:smoke": "bun run build && node scripts/package-smoke.mjs",
+    "deploy": "bun run --cwd services/credential-broker deploy"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beachside-compute/credential-broker.git"
+  },
+  "description": "Client for the Beachside credential broker.",
+  "homepage": "https://beachside.run/docs/guides/credential-broker/",
+  "bugs": {
+    "url": "https://github.com/beachside-compute/credential-broker/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "types": "./dist/index.d.ts",
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "services/*"
+  ],
+  "devDependencies": {
+    "@oxlint/plugins": "1.94.0",
+    "@types/bun": "1.4.2",
+    "oxfmt": "0.79.0",
+    "oxlint": "1.94.0",
+    "typescript": "5.9.3"
+  }
+}
