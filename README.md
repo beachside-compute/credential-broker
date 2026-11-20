@@ -97,4 +97,4 @@ bun run test
 bun run package:smoke
 ```
 
-Tests use Git, GitHub CLI, OpenSSL, and local workerd fixtures. CI runs the checks without deployment credentials. Before a client release, bump the root package version independently, refresh the lockfile, and run the checks and `npm pack --dry-run` from the repository root. Publication is a separate operator action.
+Tests use Git, GitHub CLI, OpenSSL, and local workerd fixtures. CI runs the checks without deployment credentials. The [release workflow](./docs/releasing.md) versions and publishes the public client independently of the Worker.

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,11 +42,18 @@ await grant.revoke(controller.signal);
 `;
 
 try {
+  const source = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+
   const [packed] = JSON.parse(
-    run("npm", ["pack", "--json", "--pack-destination", temporary], root),
+    run(
+      "npm",
+      ["pack", "--json", "--ignore-scripts", "--workspaces=false", "--pack-destination", temporary],
+      root,
+    ),
   );
 
   assert.equal(packed.name, "@beachside/credential-client", "Incorrect package identity");
+  assert.equal(packed.version, source.version);
   assert.ok(packed.files.some(({ path }) => path === "dist/index.d.ts"));
   assert.ok(packed.files.some(({ path }) => path === "dist/cli.js"));
   assert.ok(
@@ -89,6 +97,9 @@ try {
       ),
     );
 
+    assert.equal(manifest.name, packed.name);
+    assert.equal(manifest.version, packed.version);
+    assert.equal(manifest.private, false);
     assert.deepEqual(manifest.dependencies ?? {}, {});
     assert.deepEqual(manifest.peerDependencies ?? {}, {});
     run(
@@ -110,6 +121,9 @@ try {
     process.stdout.write(run(runtime, ["client.mjs"], directory));
     process.stdout.write(run(runtime, ["cli.mjs"], directory));
   }
+
+  if (process.env.RELEASE_ARCHIVE)
+    await copyFile(archive, process.env.RELEASE_ARCHIVE, constants.COPYFILE_EXCL);
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

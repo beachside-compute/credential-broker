@@ -1,0 +1,54 @@
+name: Prepare client version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New version of @beachside/credential-client, without a v prefix
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: version-prepare
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.repository == 'beachside-compute/credential-broker' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+          no-cache: true
+      - name: Prepare version PR and run CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          bun scripts/release.mjs version "$VERSION"
+          bun install --frozen-lockfile --ignore-scripts
+          git diff --exit-code -- bun.lock services/credential-broker/package.json
+          branch="release/v${VERSION}"
+          existing=$(gh pr list --base main --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add package.json
+            git commit -m "Release credential client v${VERSION}"
+            git push origin "HEAD:refs/heads/${branch}"
+            gh pr create --base main --head "$branch" --title "Release credential client v${VERSION}" \
+              --body "Bump the public credential client to ${VERSION}. The private Worker is unchanged."
+          fi
+          gh workflow run ci.yml --ref "$branch"
