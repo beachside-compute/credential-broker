@@ -27,7 +27,7 @@ function setupError(message: string): never {
 
 interface IntegrationPrompter {
   select<Value>(message: string, options: clack.Option<Value>[]): Promise<Value>;
-  text(message: string, placeholder?: string): Promise<string>;
+  text(message: string, defaultValue?: string): Promise<string>;
   password(message: string): Promise<string>;
   confirm(message: string): Promise<boolean>;
 }
@@ -55,8 +55,10 @@ export async function setupIntegration(): Promise<BrokerIntegrationInput> {
       async select(message, options) {
         return answer(await clack.select({ ...common, message, options }));
       },
-      async text(message, placeholder) {
-        return answer(await clack.text({ ...common, message, placeholder }));
+      async text(message, defaultValue) {
+        const placeholder = defaultValue && `Enter for ${defaultValue}, or type a unique ID`;
+
+        return answer(await clack.text({ ...common, message, placeholder, defaultValue }));
       },
       async password(message) {
         return answer(await clack.password({ ...common, message }));
@@ -84,7 +86,10 @@ export async function configureIntegration({
   const preset = presets.find(({ id }) => id === selected);
 
   if (!preset) return setupError("Choose a listed provider");
-  const id = (await text("Integration ID", preset.id)).trim() || preset.id;
+
+  const id =
+    (await text("Integration ID (name Beachside uses to request access)", preset.id)).trim() ||
+    preset.id;
 
   if (!integrationName.test(id)) return setupError("Invalid broker integration identifier");
 

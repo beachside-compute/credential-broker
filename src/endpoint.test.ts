@@ -24,14 +24,17 @@ test("validates normalized URL length and rejects ambiguous path and host forms"
 });
 
 function fixturePrompter(input: string[]): Parameters<typeof configureIntegration>[0] & {
+  textPrompts: { message: string; defaultValue?: string }[];
   passwords: string[];
   confirmations: string[];
 } {
+  const textPrompts: { message: string; defaultValue?: string }[] = [];
   const passwords: string[] = [];
   const confirmations: string[] = [];
   const next = () => input.shift() ?? "";
 
   return {
+    textPrompts,
     passwords,
     confirmations,
     async select(_, options) {
@@ -42,7 +45,9 @@ function fixturePrompter(input: string[]): Parameters<typeof configureIntegratio
 
       return choice.value;
     },
-    async text() {
+    async text(message, defaultValue) {
+      textPrompts.push({ message, defaultValue });
+
       return next();
     },
     async password(message) {
@@ -57,6 +62,23 @@ function fixturePrompter(input: string[]): Parameters<typeof configureIntegratio
     },
   };
 }
+
+test("OpenRouter setup explains the integration ID and defaults to openrouter on Enter", async () => {
+  const prompts = fixturePrompter(["openrouter", "", "fixture-openrouter-key", "y"]);
+  const config = await configureIntegration(prompts);
+
+  expect(prompts.textPrompts).toEqual([
+    {
+      message: "Integration ID (name Beachside uses to request access)",
+      defaultValue: "openrouter",
+    },
+  ]);
+  expect(config.id).toBe("openrouter");
+  expect(prompts.confirmations[0]).toContain("Create openrouter");
+
+  const second = fixturePrompter(["openrouter", "router-work", "fixture-openrouter-key", "y"]);
+  expect((await configureIntegration(second)).id).toBe("router-work");
+});
 
 test("Anthropic wizard configures the version, masks the key and rejects malformed inputs before confirmation", async () => {
   const prompts = fixturePrompter(["anthropic", "", "fixture-anthropic-key", "y"]);

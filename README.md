@@ -39,6 +39,8 @@ From the deployment checkout, run the integration setup command with the HTTPS o
 bun run broker --url https://your-broker.example.com integration setup
 ```
 
+The integration ID is the name Beachside uses to request access. Press Enter to use `openrouter` for this provider, or enter a unique ID for another key. The examples below use `router-work`.
+
 The command loads the admin key from `.env.deploy`. Add `BEACHSIDE_BROKER_URL=https://your-broker.example.com` to that file with your deployed URL so later commands can omit `--url`.
 
 Check which integrations the issuer can use.
