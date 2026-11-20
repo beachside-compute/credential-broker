@@ -20,11 +20,34 @@ node dist/cli.js issuer set github-work
 node dist/cli.js integration list
 ```
 
-The issuer allowlist starts empty. Setting it replaces the eligible integration set. Use `node dist/cli.js --help` for rotation and lifecycle commands. CLI responses contain metadata. Keep the separate issuer key or GitHub Actions identity on the orchestrator.
+The issuer allowlist starts empty. Setting it replaces the eligible integration set. CLI responses contain metadata. Keep the separate issuer key or GitHub Actions identity on the orchestrator.
+
+### Rotate or invalidate access
+
+Rotate an upstream credential while preserving its broker grants. Requests authorized after rotation use the replacement.
+
+```sh
+node dist/cli.js integration rotate github-work --secret-stdin < /secure/path/replacement-github-token
+```
+
+Disable the integration to revoke its broker grants. Re-enable it to allow fresh grants.
+
+```sh
+node dist/cli.js integration disable github-work
+node dist/cli.js integration enable github-work
+```
+
+To remove the integration entirely:
+
+```sh
+node dist/cli.js integration delete github-work
+```
+
+Deleting an integration also revokes its grants and removes it from the issuer allowlist. Requests already authorized may finish. Broker revocation leaves the upstream token active at GitHub or its provider. See the [deployment runbook](./services/credential-broker/README.md#manage-integrations) for lifecycle and key-rotation details.
 
 ## Use the client
 
-The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds })` and `broker.revoke(grant.id)` from a trusted host. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
+The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds })` and `broker.revoke(grant.id)` from a trusted host. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. If a grant issuance response is lost, an issued grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
 
 For Beachside integration, sandbox credential injection, GitHub CLI, OpenCode, and cleanup behavior, see the [Beachside credential broker guide](https://beachside.run/docs/guides/credential-broker/).
 

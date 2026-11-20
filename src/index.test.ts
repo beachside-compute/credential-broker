@@ -280,3 +280,82 @@ test("real Git rewrites GitHub HTTPS remotes and scopes its credential helper to
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("GitHub Actions OIDC reports incomplete configuration before parsing the endpoint", () => {
+  const endpoint = "https://runner.example.invalid/token";
+
+  for (const options of [
+    { audience: "broker", env: { ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runner-token" } },
+    { audience: "broker", env: { ACTIONS_ID_TOKEN_REQUEST_URL: endpoint } },
+    {
+      audience: "",
+      env: {
+        ACTIONS_ID_TOKEN_REQUEST_URL: endpoint,
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runner-token",
+      },
+    },
+  ]) {
+    expect(() => githubActionsOidc(options)).toThrow(
+      "GitHub Actions OIDC configuration is incomplete",
+    );
+  }
+
+  expect(() =>
+    githubActionsOidc({
+      audience: "broker",
+      env: {
+        ACTIONS_ID_TOKEN_REQUEST_URL: "http://not-https.invalid/token",
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runner-token",
+      },
+    }),
+  ).toThrow("A valid HTTPS URL is required");
+});
+
+test("cancellation bounds the grant body after a successful response status", async () => {
+  const controller = new AbortController();
+  const bodyRead = Promise.withResolvers<void>();
+  const bodyReleased = Promise.withResolvers<void>();
+  let closeBody = () => {};
+
+  let calls = 0;
+
+  const broker = createCredentialBroker({
+    url,
+    auth: { apiKey: key },
+    async fetch() {
+      calls++;
+
+      const body = new ReadableStream(
+        {
+          start(stream) {
+            closeBody = () => stream.close();
+            stream.enqueue(new TextEncoder().encode('{"token":'));
+          },
+          pull() {
+            bodyRead.resolve();
+
+            return bodyReleased.promise;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+
+      return new Response(body, { status: 201 });
+    },
+  });
+
+  const result = broker.issue({ integrations: ["github"] }, { signal: controller.signal });
+
+  try {
+    await bodyRead.promise;
+    controller.abort(new Error(key));
+    await expect(result).rejects.toMatchObject({
+      code: "WAIT_ABORTED",
+      message: "Credential grant request was cancelled",
+    });
+    expect(calls).toBe(1);
+  } finally {
+    closeBody();
+    bodyReleased.resolve();
+  }
+});

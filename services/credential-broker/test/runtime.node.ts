@@ -22,6 +22,7 @@ import {
   createCredentialBrokerAdmin,
   CredentialBrokerError,
 } from "../../../src/index";
+import { requireApiKey } from "../../../src/transport";
 import { assertSeparateRoleKeys } from "../src/auth";
 import { isBrokerApiKey, matchesKey } from "../src/auth/api-key";
 import { parseConfig } from "../src/config";
@@ -1500,4 +1501,144 @@ test("AES-GCM rejects tampering and binds identity, credential version and key v
       }),
     /Invalid broker encryption keyring configuration/,
   );
+});
+
+test("client and Worker agree on control-key format boundaries", () => {
+  for (const key of ["a".repeat(32), "a".repeat(256)]) {
+    assert.doesNotThrow(() => requireApiKey(key));
+    assert.equal(isBrokerApiKey(key), true);
+  }
+
+  for (const key of ["a".repeat(31), "a".repeat(257), `bsg_${"a".repeat(64)}`]) {
+    assert.throws(() => requireApiKey(key), { code: "INVALID_ARGUMENT" });
+    assert.equal(isBrokerApiKey(key), false);
+  }
+});
+
+test("client and Worker agree on serialized admin and grant limits", async () => {
+  const original = runtime;
+  runtime = startRuntime("contract-limits");
+
+  const url = "https://broker.test";
+  let calls = 0;
+
+  async function countedFetch(request: Request): Promise<Response> {
+    calls++;
+
+    return relayRequest(request);
+  }
+
+  const adminClient = createCredentialBrokerAdmin({ url, apiKey: adminKey, fetch: countedFetch });
+  const broker = createCredentialBroker({ url, auth: { apiKey }, fetch: countedFetch });
+  const ids = Array.from({ length: 100 }, (_, index) => `boundary-${index}`);
+  const encrypted = (value: string): CredentialInput => ({ source: "encrypted-store", value });
+
+  try {
+    for (const invalid of ["", "x".repeat(4097)]) {
+      const before = calls;
+      const payload = { id: ids[0], kind: "openai" as const, credential: encrypted(invalid) };
+      await assert.rejects(adminClient.integrations.create(payload), { code: "INVALID_ARGUMENT" });
+      assert.equal(calls, before);
+      assert.equal((await admin("/integrations", "POST", JSON.stringify(payload))).status, 400);
+    }
+
+    for (const binding of ["CREDENTIAL_A", `CREDENTIAL_${"A".repeat(80)}`]) {
+      const before = calls;
+
+      const payload = {
+        id: ids[0],
+        kind: "openai" as const,
+        credential: { source: "worker-secret" as const, binding },
+      };
+
+      await assert.rejects(adminClient.integrations.create(payload), { code: "UNAVAILABLE" });
+      assert.equal(calls, before + 1);
+
+      const result = await admin("/integrations", "POST", JSON.stringify(payload));
+      assert.equal(result.status, 503);
+      assert.deepEqual(await result.json(), { error: "credential_unavailable" });
+    }
+
+    for (const binding of ["CREDENTIAL_", `CREDENTIAL_${"A".repeat(81)}`]) {
+      const before = calls;
+
+      const payload = {
+        id: ids[0],
+        kind: "openai" as const,
+        credential: { source: "worker-secret" as const, binding },
+      };
+
+      await assert.rejects(adminClient.integrations.create(payload), { code: "INVALID_ARGUMENT" });
+      assert.equal(calls, before);
+      assert.equal((await admin("/integrations", "POST", JSON.stringify(payload))).status, 400);
+    }
+
+    for (const [index, id] of ids.entries()) {
+      // A quote needs JSON escaping, so this also covers the maximum serialized secret body.
+      const credential: CredentialInput =
+        index === 0
+          ? encrypted("x")
+          : index === 1
+            ? encrypted('"'.repeat(4096))
+            : { source: "worker-secret", binding: "CREDENTIAL_OPENAI" };
+
+      assert.equal(
+        (await adminClient.integrations.create({ id, kind: "openai", credential }))
+          .credentialVersion,
+        1,
+      );
+    }
+
+    assert.equal((await adminClient.integrations.list()).length, 100);
+    await assert.rejects(
+      adminClient.integrations.create({
+        id: "too-many",
+        kind: "openai",
+        credential: encrypted("x"),
+      }),
+      { code: "RATE_LIMIT" },
+    );
+
+    assert.deepEqual(await adminClient.issuerPermissions.set(ids), {
+      integrations: [...ids].sort(),
+    });
+    const oversizedPermissions = [...ids, "too-many"];
+    const beforePermissions = calls;
+    await assert.rejects(adminClient.issuerPermissions.set(oversizedPermissions), {
+      code: "INVALID_ARGUMENT",
+    });
+    assert.equal(calls, beforePermissions);
+    assert.equal(
+      (
+        await admin(
+          "/issuer-permissions",
+          "PUT",
+          JSON.stringify({ integrations: oversizedPermissions }),
+        )
+      ).status,
+      400,
+    );
+
+    const integrations = ids.slice(0, 16);
+
+    for (const ttlSeconds of [1, 3600]) {
+      const granted = await broker.issue({ integrations, ttlSeconds });
+      assert.deepEqual(granted.integrations, integrations);
+      await broker.revoke(granted.id);
+    }
+
+    for (const request of [
+      { integrations, ttlSeconds: 0 },
+      { integrations, ttlSeconds: 3601 },
+      { integrations: ids.slice(0, 17), ttlSeconds: 60 },
+    ]) {
+      const before = calls;
+      await assert.rejects(broker.issue(request), { code: "INVALID_ARGUMENT" });
+      assert.equal(calls, before);
+      assert.equal((await issue(request.integrations, apiKey, request.ttlSeconds)).status, 400);
+    }
+  } finally {
+    await runtime.dispose();
+    runtime = original;
+  }
 });

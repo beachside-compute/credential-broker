@@ -217,7 +217,7 @@ app.all("*", async (context) => {
     return failure(503, "credential_unavailable");
   }
 
-  if (!credential || (credential.expiresAt !== undefined && credential.expiresAt <= Date.now())) {
+  if (!credential) {
     complete(503);
 
     return failure(503, "credential_unavailable");

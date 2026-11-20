@@ -43,13 +43,16 @@ async function readSecret() {
     chunks.push(data);
   }
 
-  const value = Buffer.concat(chunks)
-    .toString("utf8")
-    .replace(/\r?\n$/, "");
+  const buffer = Buffer.concat(chunks);
+  const newline = buffer.at(-1) === 0x0a;
+  const suffixBytes = newline ? (buffer.at(-2) === 0x0d ? 2 : 1) : 0;
+  const length = buffer.byteLength - suffixBytes;
 
-  if (!value) usageError("Expected an upstream credential on stdin");
+  if (!length) usageError("Expected an upstream credential on stdin");
 
-  return value;
+  if (length > 4096) usageError("Credential on stdin exceeds 4096 bytes");
+
+  return buffer.toString("utf8", 0, length);
 }
 
 async function credentialFromFlags(flags: {
@@ -104,23 +107,15 @@ async function main(args: string[]) {
   const creates = group === "integration" && command === "create";
   const usesCredential = creates || (group === "integration" && command === "rotate");
 
-  const { values, positionals } = parseArgs({
-    args: options,
-    allowPositionals: true,
-    options: {
-      provider: { type: "string" },
-      "secret-stdin": { type: "boolean" },
-      "worker-secret": { type: "string" },
-    },
-  });
-
   if (group !== "integration" && group !== "issuer")
     return usageError("Choose a command group with integration or issuer");
 
-  if (
-    (!creates && values.provider !== undefined) ||
-    (!usesCredential && (values["secret-stdin"] || values["worker-secret"] !== undefined))
-  )
+  const { values, positionals } = parseCommandOptions(options);
+
+  if (!creates && values.provider !== undefined)
+    return usageError("--provider is only accepted by integration create");
+
+  if (!usesCredential && (values["secret-stdin"] || values["worker-secret"] !== undefined))
     return usageError("Credential options are only accepted by integration create and rotate");
 
   const url = process.env.BEACHSIDE_BROKER_URL;
@@ -135,6 +130,23 @@ async function main(args: string[]) {
       : await issuerCommand(command, positionals, admin);
 
   console.log(JSON.stringify(output));
+}
+
+function parseCommandOptions(args: string[]) {
+  try {
+    return parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        provider: { type: "string" },
+        "secret-stdin": { type: "boolean" },
+        "worker-secret": { type: "string" },
+      },
+    });
+  } catch {
+    // The parser may include caller-supplied option names or values in its error.
+    return usageError("Invalid command options. See beachside-broker --help");
+  }
 }
 
 type Admin = ReturnType<typeof createCredentialBrokerAdmin>;

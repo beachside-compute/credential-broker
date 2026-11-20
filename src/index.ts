@@ -93,15 +93,15 @@ export function githubActionsOidc(options: {
   fetch?: Fetch;
 }): CredentialBrokerAuth {
   const { audience, env, fetch: transport = defaultFetch } = options;
-  const url = httpsURL(env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "");
-  const token = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "";
+  const { ACTIONS_ID_TOKEN_REQUEST_URL: endpoint, ACTIONS_ID_TOKEN_REQUEST_TOKEN: token } = env;
 
-  if (!audience || !bearerToken.test(token))
+  if (!audience || !endpoint || !token || !bearerToken.test(token))
     throw new CredentialBrokerError(
       "INVALID_ARGUMENT",
       "GitHub Actions OIDC configuration is incomplete",
     );
 
+  const url = httpsURL(endpoint);
   url.searchParams.set("audience", audience);
 
   return {

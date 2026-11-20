@@ -43,16 +43,18 @@ For a declared Worker secret, use `integration create <id> --provider <kind> --w
 
 `integration disable <id>` and `integration delete <id>` revoke every grant that includes the integration. Re-enabling can admit fresh grants. Deleting and recreating a name creates a new identity and requires setting issuer permissions again. The admin API returns integration metadata, including the source kind and credential version. There is no API to retrieve plaintext or ciphertext.
 
-| Admin request                               | Input and result                                                                                 |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `GET /v1/admin/integrations`                | Returns `{ "integrations": [...] }` containing integration metadata.                             |
-| `POST /v1/admin/integrations`               | Body `{ "id": "...", "kind": "...", "credential": {...} }` returns metadata with `201`.          |
-| `GET /v1/admin/integrations/:id`            | Returns integration metadata.                                                                    |
-| `PATCH /v1/admin/integrations/:id`          | Body `{ "enabled": true }` or `{ "enabled": false }` returns updated metadata.                   |
-| `PUT /v1/admin/integrations/:id/credential` | Body is a credential object. Returns updated metadata. An overlapping rotation can return `409`. |
-| `DELETE /v1/admin/integrations/:id`         | Returns `204`, including if the name is absent.                                                  |
-| `GET /v1/admin/issuer-permissions`          | Returns `{ "integrations": ["..."] }`.                                                           |
-| `PUT /v1/admin/issuer-permissions`          | Replaces the allowlist with `{ "integrations": ["..."] }`. An empty list disables new issuance.  |
+| Admin request                               | Input and result                                                                                | Operation errors                                                                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/admin/integrations`                | Returns `{ "integrations": [...] }` containing integration metadata.                            |                                                                                                                                   |
+| `POST /v1/admin/integrations`               | Body `{ "id": "...", "kind": "...", "credential": {...} }` returns metadata with `201`.         | `400` invalid input, `409 integration_exists`, `429 integration_limit`, `503 credential_unavailable`                              |
+| `GET /v1/admin/integrations/:id`            | Returns integration metadata.                                                                   | `400` invalid ID, `404 integration_not_found`                                                                                     |
+| `PATCH /v1/admin/integrations/:id`          | Body `{ "enabled": true }` or `{ "enabled": false }` returns updated metadata.                  | `400` invalid input, `404 integration_not_found`                                                                                  |
+| `PUT /v1/admin/integrations/:id/credential` | Body is a credential object. Returns updated metadata.                                          | `400` invalid input, `404 integration_not_found`, `409 integration_changed` for a concurrent change, `503 credential_unavailable` |
+| `DELETE /v1/admin/integrations/:id`         | Returns `204`, including if the name is absent.                                                 | `400` invalid ID                                                                                                                  |
+| `GET /v1/admin/issuer-permissions`          | Returns `{ "integrations": ["..."] }`.                                                          |                                                                                                                                   |
+| `PUT /v1/admin/issuer-permissions`          | Replaces the allowlist with `{ "integrations": ["..."] }`. An empty list disables new issuance. | `400` invalid input, `404 integration_not_found` for an unknown ID                                                                |
+
+All admin routes can return `401 administrator_authentication_required` or `503 broker_unavailable`. For a Worker-secret reference, an undeclared binding and a declared binding with an absent or invalid secret both return `503 credential_unavailable`. Check the declared binding names and the provisioned Worker secrets on the operator host. API responses omit binding values and configuration details.
 
 A credential object is `{ "source": "encrypted-store", "value": "..." }` or `{ "source": "worker-secret", "binding": "CREDENTIAL_NAME" }`. Supply the admin key as a bearer token. The admin key cannot issue grants or access gateways.
 

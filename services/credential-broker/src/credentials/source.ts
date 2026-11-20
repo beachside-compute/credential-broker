@@ -28,7 +28,6 @@ export type CredentialReference = WorkerSecretReference | EncryptedCredential;
 
 export interface ResolvedCredential {
   value: string;
-  expiresAt?: number;
 }
 
 export interface CredentialSource<Reference> {

@@ -20,6 +20,8 @@ const initial = "fixture-upstream-first-value";
 
 const replacement = "fixture-upstream-replacement-value";
 
+const longest = "x".repeat(4096);
+
 const metadata = {
   id: "github-work",
   kind: "github",
@@ -61,9 +63,11 @@ async function handle(request, response) {
 
       return json(201, { ...metadata, hiddenFixtureField: initial });
     case "PUT /v1/admin/integrations/github-work/credential":
-      assert.deepEqual(input, { source: "encrypted-store", value: replacement });
+      assert.ok(input.value === replacement || input.value === longest);
+      assert.deepEqual(input, { source: "encrypted-store", value: input.value });
+      const credentialVersion = input.value === longest ? 3 : 2;
 
-      return json(200, { ...metadata, credentialVersion: 2, hiddenFixtureField: replacement });
+      return json(200, { ...metadata, credentialVersion, hiddenFixtureField: input.value });
     case "PUT /v1/admin/issuer-permissions":
       assert.deepEqual(input, { integrations: [metadata.id] });
 
@@ -133,7 +137,7 @@ try {
     });
 
   const safe = ({ stdout, stderr }) => {
-    for (const value of [initial, replacement, adminKey])
+    for (const value of [initial, replacement, longest, adminKey])
       assert.ok(!stdout.includes(value) && !stderr.includes(value), "CLI disclosed a credential");
   };
 
@@ -161,15 +165,56 @@ try {
   assert.equal(conflict.stdout, "");
   assert.match(conflict.stderr, /^CONFLICT /);
 
-  const invalid = await run(["integration", "rotate", "github-work", "--secret", initial]);
-  safe(invalid);
-  assert.equal(invalid.code, 1);
-  assert.equal(invalid.stdout, "");
+  const rotate = ["integration", "rotate", "github-work", "--secret-stdin"];
+
+  for (const suffix of ["", "\n", "\r\n"]) {
+    await verify(rotate, { ...metadata, credentialVersion: 3 }, longest + suffix);
+  }
+
+  const invalidOptions = [
+    { args: ["integration", "list", `--${initial}`], message: "Invalid command options" },
+    { args: ["configuration", "show", "--secret", initial], message: "Choose a command group" },
+    {
+      args: ["integration", "rotate", "github-work", "--secret", initial],
+      message: "Invalid command options",
+    },
+    {
+      args: ["integration", "rotate", "github-work", "--worker-secret"],
+      message: "Invalid command options",
+    },
+    { args: [...rotate, "--provider", "github"], message: "--provider is only accepted" },
+    {
+      args: [...rotate, "--worker-secret", "CREDENTIAL_GITHUB"],
+      message: "Select exactly one credential source",
+    },
+    {
+      args: ["integration", "list", "--secret-stdin"],
+      message: "Credential options are only accepted",
+    },
+    {
+      args: ["issuer", "show", "--worker-secret", "CREDENTIAL_GITHUB"],
+      message: "Credential options are only accepted",
+    },
+    { args: rotate, input: `${longest}x\n`, message: "Credential on stdin exceeds 4096 bytes" },
+    { args: rotate, input: `${longest}x`, message: "Credential on stdin exceeds 4096 bytes" },
+  ];
+
+  for (const { args, input, message } of invalidOptions) {
+    const invalid = await run(args, input);
+    safe(invalid);
+    assert.equal(invalid.code, 1);
+    assert.equal(invalid.stdout, "");
+    assert.ok(invalid.stderr.startsWith(`INVALID_ARGUMENT ${message}`), invalid.stderr);
+  }
+
   assert.deepEqual(routes, [
     "POST /v1/admin/integrations",
     "PUT /v1/admin/integrations/github-work/credential",
     "PUT /v1/admin/issuer-permissions",
     "POST /v1/admin/integrations",
+    "PUT /v1/admin/integrations/github-work/credential",
+    "PUT /v1/admin/integrations/github-work/credential",
+    "PUT /v1/admin/integrations/github-work/credential",
   ]);
   assert.deepEqual(errors, []);
 
