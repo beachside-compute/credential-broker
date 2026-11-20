@@ -8,12 +8,25 @@ Use Bun 1.4.4, Node.js 22 or later, and a Cloudflare account with permission to 
 
 ```sh
 bun install --frozen-lockfile
+bun run --cwd services/credential-broker wrangler login
+bun run deploy:setup
 bun run deploy
 ```
 
-On a fresh checkout, confirm generation of separate admin, issuer, and encryption keys. The wizard saves them in `.env.deploy` with mode `0600` and asks whether to deploy. Wrangler handles browser sign-in when needed and uses its normal account selection. For an unattended deployment, export `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
+For a remote terminal, use `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code. [Wrangler login options](https://developers.cloudflare.com/workers/wrangler/commands/general/#wrangler-login).
 
-Use `bun run deploy:setup` to save keys without signing in or deploying. Subsequent `bun run deploy` invocations reuse the saved keys. Keep secure backups of the keys for as long as the registry or its backups may need them. Run `bun run deploy --dry-run` to check the Worker bundle offline.
+`bun run deploy:setup` generates independent admin, issuer, and encryption keys in `.env.deploy` with mode `0600`. It runs without a terminal and leaves an existing private file unchanged. Keep secure backups of the keys for as long as the registry or its backups may need them. For unattended deployment, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
+
+`bun run deploy` reuses your deployment settings and passes them to Wrangler. Run `bun run deploy --dry-run` to check the Worker bundle offline.
+
+### Use a custom hostname
+
+Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). Choose a hostname in a Cloudflare zone on the account you deploy to. Set `workers_dev` to `false` to disable the default `workers.dev` hostname. [Cloudflare Worker Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
+
+```jsonc
+"routes": [{ "pattern": "broker.example.com", "custom_domain": true }],
+"workers_dev": false
+```
 
 ### Configure deployment bindings
 
@@ -32,7 +45,7 @@ For manual setup, use the [deployment template](../../.env.deploy.example) and g
 
 Configure a static issuer key, GitHub Actions OIDC, or both. The admin, issuer, and encryption keys must be distinct. The API keys use 32–256 base64url characters and exclude the reserved sandbox grant token format.
 
-The wizard passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings so the deployment settings take precedence over the defaults in `wrangler.jsonc`.
+The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings so the deployment settings take precedence over the defaults in `wrangler.jsonc`.
 
 Wrangler preserves previously deployed secrets omitted from a later upload. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
 
@@ -84,22 +97,22 @@ Wrangler runs the Worker and SQLite Durable Object locally. Use its local URL wi
 
 ## Manage integrations
 
-Run `bun run build` from the repository root to build the management CLI. In the operator shell, set `BEACHSIDE_BROKER_URL` to the deployed Worker HTTPS origin and `BEACHSIDE_BROKER_ADMIN_KEY` to the `BROKER_ADMIN_KEY` from `.env.deploy` or your secret manager. If you use `.env.deploy`, load the key without sourcing the file as a shell script.
+From the deployment checkout, use the HTTPS origin printed by Wrangler to open the integration setup wizard. Choose OpenRouter, name the integration `router-work`, and enter its upstream API key when prompted. The command runs the management CLI with the admin key from `.env.deploy`.
 
 ```sh
-export BEACHSIDE_BROKER_URL=https://your-broker.example.com
-export BEACHSIDE_BROKER_ADMIN_KEY="$(
-  node -p 'require("node:util").parseEnv(require("node:fs").readFileSync(".env.deploy", "utf8")).BROKER_ADMIN_KEY'
-)"
+bun run broker --url https://your-broker.example.com integration setup
 ```
 
-Pipe a credential from the operator's secret store to the CLI and approve its integration ID for issuance.
+Set `BEACHSIDE_BROKER_URL=https://your-broker.example.com` in `.env.deploy` to reuse that origin for later commands. You can also set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` together in the environment. If you omit `--url`, the checkout command uses a configured URL and admin key from the same source.
+
+To permit grant issuance for a new `router-work` integration, review the current list and add the integration ID. Include the existing IDs you want to keep when calling `issuer set`.
 
 ```sh
-node dist/cli.js integration create github-work --provider github --secret-stdin < /secure/path/github-token
-node dist/cli.js issuer set github-work
-node dist/cli.js integration list
+bun run broker issuer show
+bun run broker issuer set router-work
 ```
+
+You can also use the separately installed `beachside-broker` CLI with `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` set on the trusted operator host.
 
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 

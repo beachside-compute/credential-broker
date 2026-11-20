@@ -1,3 +1,4 @@
+import * as clack from "@clack/prompts";
 import type { BrokerIntegrationInput } from "./admin.js";
 import {
   endpointBaseURL,
@@ -8,7 +9,6 @@ import {
   maxEndpointHeaders,
   type BrokerEndpointHeader,
 } from "./endpoint.js";
-import { terminalPrompt, type Ask } from "./terminal.js";
 import { CredentialBrokerError, integrationName } from "./transport.js";
 
 const presets: readonly { id: string; name: string; baseURL?: string }[] = [
@@ -25,38 +25,81 @@ function setupError(message: string): never {
   throw new CredentialBrokerError("INVALID_ARGUMENT", message);
 }
 
-export async function setupIntegration(): Promise<BrokerIntegrationInput> {
-  return terminalPrompt(
-    "Integration setup needs a terminal. Use integration create --config-stdin for automation",
-    "Integration setup cancelled",
-    configureIntegration,
-  );
+interface IntegrationPrompter {
+  select<Value>(message: string, options: clack.Option<Value>[]): Promise<Value>;
+  text(message: string, placeholder?: string): Promise<string>;
+  password(message: string): Promise<string>;
+  confirm(message: string): Promise<boolean>;
 }
 
-export async function configureIntegration(
-  ask: Ask,
-  write: (message: string) => void,
-): Promise<Extract<BrokerIntegrationInput, { kind: "http" }>> {
-  for (const [index, preset] of presets.entries()) write(`${index + 1}. ${preset.name}\n`);
-  const preset = presets[Number(await ask("Provider number: ")) - 1];
+export async function setupIntegration(): Promise<BrokerIntegrationInput> {
+  const { stdin: input, stderr: output } = process;
 
-  if (!preset) return setupError("Choose a listed provider number");
-  const id = (await ask(`Integration ID [${preset.id}]: `)).trim() || preset.id;
+  if (!input.isTTY || !output.isTTY)
+    return setupError(
+      "Integration setup needs a terminal. Use integration create --config-stdin for automation",
+    );
+
+  const common = { input, output };
+
+  const answer = <Value>(value: Value | typeof clack.CANCEL_SYMBOL): Value => {
+    if (clack.isCancel(value)) return setupError("Integration setup cancelled");
+
+    return value;
+  };
+
+  clack.intro("Beachside broker integration setup", common);
+
+  try {
+    return await configureIntegration({
+      async select(message, options) {
+        return answer(await clack.select({ ...common, message, options }));
+      },
+      async text(message, placeholder) {
+        return answer(await clack.text({ ...common, message, placeholder }));
+      },
+      async password(message) {
+        return answer(await clack.password({ ...common, message }));
+      },
+      async confirm(message) {
+        return answer(await clack.confirm({ ...common, message, initialValue: false }));
+      },
+    });
+  } finally {
+    input.pause();
+  }
+}
+
+export async function configureIntegration({
+  select,
+  text,
+  password,
+  confirm,
+}: IntegrationPrompter): Promise<Extract<BrokerIntegrationInput, { kind: "http" }>> {
+  const selected = await select(
+    "Choose a provider",
+    presets.map(({ id, name }) => ({ value: id, label: name })),
+  );
+
+  const preset = presets.find(({ id }) => id === selected);
+
+  if (!preset) return setupError("Choose a listed provider");
+  const id = (await text("Integration ID", preset.id)).trim() || preset.id;
 
   if (!integrationName.test(id)) return setupError("Invalid broker integration identifier");
 
   let address = preset.baseURL;
 
   if (preset.id === "cloudflare") {
-    const account = (await ask("Cloudflare account ID: ")).trim();
-    const gateway = (await ask("Cloudflare gateway ID: ")).trim();
+    const account = (await text("Cloudflare account ID")).trim();
+    const gateway = (await text("Cloudflare gateway ID")).trim();
 
     if (!/^[a-f0-9]{32}$/i.test(account) || !/^[a-z0-9_-]{1,64}$/i.test(gateway))
       return setupError("Invalid Cloudflare account or gateway identifier");
     address = `https://gateway.ai.cloudflare.com/v1/${account}/${gateway}/openai`;
   }
 
-  const baseURL = endpointBaseURL(address ?? (await ask("Upstream HTTPS base URL: ")).trim());
+  const baseURL = endpointBaseURL(address ?? (await text("Upstream HTTPS base URL")).trim());
 
   if (!baseURL) return setupError("Invalid upstream HTTPS base URL");
 
@@ -66,7 +109,7 @@ export async function configureIntegration(
   const secret = async (name: string, prefix: string, label: string) => {
     if (!endpointSecretPrefix.test(prefix))
       return setupError("Secret prefix must contain at most 128 printable ASCII characters");
-    const value = await ask(label, true);
+    const value = await password(label);
 
     if (!endpointSecretValue.test(value))
       return setupError(
@@ -86,30 +129,31 @@ export async function configureIntegration(
 
   if (preset.id === "custom") {
     while (headers.length < maxEndpointHeaders) {
-      const name = (await ask("Header name (Enter to finish): ")).trim().toLowerCase();
+      const name = (await text("Header name (Enter to finish)")).trim().toLowerCase();
 
       if (!name) break;
 
       if (!endpointHeaderName(name) || headers.some((header) => header.name === name))
         return setupError("Invalid, reserved or duplicate header name");
 
-      const type = (await ask("Header type [secret/literal]: ")).trim().toLowerCase();
+      const type = await select("Header type", [
+        { value: "secret", label: "Secret" },
+        { value: "literal", label: "Literal" },
+      ]);
 
-      if (!type || type === "secret") {
-        const prefix = await ask("Secret prefix, including any space (Enter for none): ");
-        await secret(name, prefix, "Secret value: ");
-      } else if (type === "literal") {
-        literal(name, await ask("Non-secret literal value: "));
+      if (type === "secret") {
+        const prefix = await text("Secret prefix, including any space (Enter for none)");
+        await secret(name, prefix, "Secret value");
       } else {
-        return setupError("Choose secret or literal");
+        literal(name, await text("Non-secret literal value"));
       }
     }
   } else if (preset.id === "anthropic") {
-    await secret("x-api-key", "", "Anthropic API key: ");
+    await secret("x-api-key", "", "Anthropic API key");
     literal("anthropic-version", "2023-06-01");
   } else {
     if (preset.id === "kilo") {
-      const organization = (await ask("Kilo organization ID (Enter to skip): ")).trim();
+      const organization = (await text("Kilo organization ID (Enter to skip)")).trim();
 
       if (organization) literal("x-kilocode-organizationid", organization);
     }
@@ -117,18 +161,16 @@ export async function configureIntegration(
     await secret(
       "authorization",
       "Bearer ",
-      preset.id === "cloudflare" ? "OpenAI API key: " : "Provider API key: ",
+      preset.id === "cloudflare" ? "OpenAI API key" : "Provider API key",
     );
 
     if (preset.id === "cloudflare")
-      await secret("cf-aig-authorization", "Bearer ", "Cloudflare AI Gateway token: ");
+      await secret("cf-aig-authorization", "Bearer ", "Cloudflare AI Gateway token");
   }
 
-  write(
-    `Create ${id} for ${baseURL} with headers ${headers.map(({ name }) => name).join(", ") || "(none)"}?\n`,
-  );
+  const headerNames = headers.map(({ name }) => name).join(", ") || "(none)";
 
-  if ((await ask("Confirm [y/N]: ")).trim().toLowerCase() !== "y")
+  if (!(await confirm(`Create ${id} for ${baseURL} with headers ${headerNames}?`)))
     return setupError("Integration setup cancelled");
 
   return {

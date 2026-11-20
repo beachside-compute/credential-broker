@@ -1,8 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { terminalPrompt } from "../src/terminal.js";
-import { confirmed, configureDeployment, loadDeploymentFile, setupError } from "./deployment-file";
+import { generateDeploymentFile, loadDeploymentFile, setupError } from "./deployment-file";
 import { CredentialBrokerError } from "../src/transport.js";
 import { assertSeparateRoleKeys } from "../services/credential-broker/src/auth";
 import { isBrokerApiKey } from "../services/credential-broker/src/auth/api-key";
@@ -149,34 +148,11 @@ async function runCommand(root: string, env: NodeJS.ProcessEnv, args: string[]):
   }
 }
 
-async function needsWranglerLogin(root: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-  const child = Bun.spawn([process.execPath, "run", "--silent", "wrangler", "whoami", "--json"], {
-    cwd: resolve(root, servicePath),
-    env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-
-  const [status, reply] = await Promise.all([child.exited, Bun.readableStreamToText(child.stdout)]);
-
-  if (status === 0) return false;
-
-  try {
-    // Wrangler returns this structured result for a missing session. Other errors
-    // are left to deploy, which can refresh credentials and report useful diagnostics.
-    return JSON.parse(reply).loggedIn === false;
-  } catch {
-    return false;
-  }
-}
-
 async function deployWrangler(
   root: string,
   inherited: NodeJS.ProcessEnv,
   settings: NodeJS.ProcessEnv,
   args: string[],
-  setup: boolean,
 ): Promise<number> {
   const secrets = workerSecrets(settings);
   const env = { ...inherited };
@@ -188,12 +164,6 @@ async function deployWrangler(
   if (settings.CLOUDFLARE_API_TOKEN) env.CLOUDFLARE_API_TOKEN = settings.CLOUDFLARE_API_TOKEN;
 
   if (settings.CLOUDFLARE_ACCOUNT_ID) env.CLOUDFLARE_ACCOUNT_ID = settings.CLOUDFLARE_ACCOUNT_ID;
-
-  if (setup && !env.CLOUDFLARE_API_TOKEN && (await needsWranglerLogin(root, env))) {
-    const login = await runCommand(root, env, ["wrangler", "login"]);
-
-    if (login !== 0) return login;
-  }
 
   const directory = mkdtempSync(resolve(tmpdir(), "broker-wrangler-"));
 
@@ -229,6 +199,16 @@ async function deploy() {
   if (alchemy)
     return runCommand(repository, alchemyEnvironment(inherited, file), ["deploy", ...args]);
 
+  if (setupOnly) {
+    if (args.length !== 1) return setupError("bun run deploy:setup takes no options");
+
+    if (file) {
+      console.info("Keeping the existing .env.deploy.");
+
+      return 0;
+    }
+  }
+
   if (
     args.some((argument) => argument === "--secrets-file" || argument.startsWith("--secrets-file="))
   )
@@ -246,43 +226,27 @@ async function deploy() {
       "Existing Alchemy deployment detected. Use bun run deploy:alchemy to retain its Worker and state",
     );
 
-  if (file) {
-    if (setupOnly)
-      return setupError(".env.deploy already exists. Reuse or edit it to retain its keys");
-
-    return deployWrangler(repository, inherited, settings, args, false);
-  }
-
-  if (!setupOnly && hasBrokerCredentials(inherited))
-    return deployWrangler(repository, inherited, settings, args, false);
-
-  if (brokerSecrets.some((name) => inherited[name]))
-    return setupError(
-      "Existing broker keys found. Restore the deployment configuration in .env.deploy or the environment",
+  if (setupOnly) {
+    if (brokerSecrets.some((name) => inherited[name]))
+      return setupError(
+        "Broker settings already exist in the environment. Retain and reuse those keys",
+      );
+    const created = generateDeploymentFile(envPath);
+    console.info(
+      created
+        ? "Saved .env.deploy. Keep it private and back up its keys securely."
+        : "Keeping the existing .env.deploy.",
     );
 
-  if (args.length > (setupOnly ? 1 : 0))
-    return setupError("Set up .env.deploy before passing Wrangler deployment options");
+    return 0;
+  }
 
-  const confirmDeploy = await terminalPrompt(
-    "Deployment setup needs a terminal. Run bun run deploy:setup interactively or configure .env.deploy from .env.deploy.example",
-    "Deployment setup cancelled",
-    async (ask, write) => {
-      if (!(await configureDeployment(envPath, ask, write))) return false;
+  if (!file && !hasBrokerCredentials(inherited))
+    return setupError(
+      "Run bun run deploy:setup or supply the existing broker settings before deploying",
+    );
 
-      return (
-        !setupOnly &&
-        confirmed(await ask("Sign in to Cloudflare if needed and deploy now? [y/N]: "))
-      );
-    },
-  );
-
-  if (!confirmDeploy) return 0;
-  const created = loadDeploymentFile(envPath);
-
-  if (!created) return setupError(".env.deploy is missing. Restore it before deploying");
-
-  return deployWrangler(repository, inherited, { ...inherited, ...created }, [], true);
+  return deployWrangler(repository, inherited, settings, args);
 }
 
 if (import.meta.main) {

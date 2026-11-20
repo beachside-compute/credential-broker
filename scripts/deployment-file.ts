@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants, closeSync, fstatSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { parseEnv } from "node:util";
-import type { Ask } from "../src/terminal.js";
 import { CredentialBrokerError } from "../src/transport.js";
 
 export function setupError(message: string): never {
@@ -39,23 +38,8 @@ function randomKey(): string {
   return Buffer.from(randomBytes(32)).toString("base64url");
 }
 
-export function confirmed(value: string): boolean {
-  return ["y", "yes"].includes(value.trim().toLowerCase());
-}
-
-export async function configureDeployment(
-  path: string,
-  ask: Ask,
-  write: (message: string) => void,
-): Promise<boolean> {
-  if (loadDeploymentFile(path))
-    return setupError(".env.deploy already exists. Reuse or edit it to retain its keys");
-
-  if (!confirmed(await ask("Generate broker keys and save .env.deploy? [y/N]: "))) {
-    write("Deployment setup cancelled.\n");
-
-    return false;
-  }
+export function generateDeploymentFile(path: string): boolean {
+  if (loadDeploymentFile(path)) return false;
 
   const active = "v1";
 
@@ -70,13 +54,17 @@ export async function configureDeployment(
 
   try {
     writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
-  } catch {
-    return setupError(
-      "Could not create .env.deploy. Existing files are kept; check the path and permissions",
-    );
-  }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "EEXIST" &&
+      loadDeploymentFile(path)
+    )
+      return false;
 
-  write("Saved .env.deploy. Keep it private and reuse its keys for future deployments.\n");
+    return setupError("Could not create .env.deploy. Check the path and permissions");
+  }
 
   return true;
 }

@@ -6,46 +6,65 @@ A self-hosted credential broker for AI sandboxes. The Worker stores encrypted up
 
 ## Deploy and configure
 
-Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository, run:
+Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
 
-```sh
-bun install --frozen-lockfile
-bun run deploy
-```
+1. Install dependencies and sign in to Cloudflare.
 
-On a fresh checkout, the wizard generates three independent broker keys and saves them in a private `.env.deploy` file. Confirm deployment to continue through Wrangler's browser sign-in and deploy to Cloudflare. Future runs reuse the saved keys. Run `bun run deploy:setup` to save keys for later without signing in or deploying.
+   ```sh
+   bun install --frozen-lockfile
+   bun run --cwd services/credential-broker wrangler login
+   ```
+
+   On a remote machine, run `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code.
+
+2. Generate separate admin, issuer, and encryption keys in `.env.deploy`. Keep this file private and back up its keys securely. Rerunning setup keeps an existing file.
+
+   ```sh
+   bun run deploy:setup
+   ```
+
+3. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname), then deploy.
+
+   ```sh
+   bun run deploy
+   ```
 
 Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
 
-Build the CLI locally with `bun run build`. In the operator shell, set `BEACHSIDE_BROKER_URL` to the deployed Worker HTTPS origin and `BEACHSIDE_BROKER_ADMIN_KEY` to the `BROKER_ADMIN_KEY` from `.env.deploy` or your secret manager. Then pipe an upstream credential from a protected file.
+From the deployment checkout, run the integration setup command with the HTTPS origin printed by Wrangler. Choose OpenRouter, name the integration `router-work`, and enter its API key in the hidden prompt.
 
 ```sh
-node dist/cli.js integration create github-work --provider github --secret-stdin < /secure/path/github-token
-node dist/cli.js issuer set github-work
-node dist/cli.js integration list
+bun run broker --url https://your-broker.example.com integration setup
 ```
 
-The issuer allowlist starts empty. Setting it replaces the eligible integration set. CLI responses contain metadata. Keep the separate issuer key or GitHub Actions identity on the orchestrator.
+The command loads the admin key from `.env.deploy`. Save the deployed origin as `BEACHSIDE_BROKER_URL` in that file before running the commands below. Review the current issuer allowlist, then permit grants for `router-work`.
+
+```sh
+bun run broker issuer show
+bun run broker issuer set router-work
+```
+
+`issuer set` replaces the list. Include any existing IDs you want to keep.
 
 ### Rotate or invalidate access
 
 Rotate an upstream credential while preserving its broker grants. Requests authorized after rotation use the replacement.
 
 ```sh
-node dist/cli.js integration rotate github-work --secret-stdin < /secure/path/replacement-github-token
+bun run broker integration rotate router-work --credentials-stdin < /secure/path/replacement-headers.json
 ```
 
 Disable the integration to revoke its broker grants. Re-enable it to allow fresh grants.
 
 ```sh
-node dist/cli.js integration disable github-work
-node dist/cli.js integration enable github-work
+bun run broker integration disable router-work
+bun run broker integration enable router-work
 ```
 
 To remove the integration entirely:
 
 ```sh
-node dist/cli.js integration delete github-work
+bun run broker integration delete router-work
 ```
 
 Deleting an integration also revokes its grants and removes it from the issuer allowlist. Requests already authorized may finish. Broker revocation leaves the upstream token active at GitHub or its provider. See the [deployment runbook](./services/credential-broker/README.md#manage-integrations) for lifecycle and key-rotation details.
@@ -55,7 +74,7 @@ Deleting an integration also revokes its grants and removes it from the issuer a
 Run the interactive wizard from the operator terminal. It prompts for the integration credentials without echoing them.
 
 ```sh
-node dist/cli.js integration setup
+bun run broker integration setup
 ```
 
 Choose OpenRouter, Kilo AI Gateway, Vercel AI Gateway, Cloudflare AI Gateway, OpenAI, Anthropic, or a custom HTTPS endpoint. Each setup fixes the upstream base URL and the headers the broker supplies. The Cloudflare preset asks for the gateway token and the upstream OpenAI key separately.

@@ -26,6 +26,7 @@
     "format:check": "oxfmt --check .",
     "test": "bun run --cwd services/credential-broker test && bun test src test",
     "package:smoke": "bun run build && node scripts/package-smoke.mjs",
+    "broker": "bun scripts/broker.ts",
     "deploy": "bun scripts/deploy.ts",
     "deploy:alchemy": "bun scripts/deploy.ts --alchemy",
     "deploy:setup": "bun scripts/deploy.ts --setup-only",
@@ -53,6 +54,9 @@
   "workspaces": [
     "services/*"
   ],
+  "dependencies": {
+    "@clack/prompts": "1.9.0"
+  },
   "devDependencies": {
     "@oxlint/plugins": "1.94.0",
     "@types/bun": "1.4.2",

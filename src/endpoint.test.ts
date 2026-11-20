@@ -23,19 +23,44 @@ test("validates normalized URL length and rejects ambiguous path and host forms"
   expect(safeEndpointPath("/a%20b/v1.2")).toBe(true);
 });
 
-test("Anthropic wizard configures the version, masks the key and rejects malformed inputs before confirmation", async () => {
-  const answers = ["6", "", "fixture-anthropic-key", "y"];
-  const prompts: { label: string; secret: boolean }[] = [];
-  const output: string[] = [];
+function fixturePrompter(input: string[]): Parameters<typeof configureIntegration>[0] & {
+  passwords: string[];
+  confirmations: string[];
+} {
+  const passwords: string[] = [];
+  const confirmations: string[] = [];
+  const next = () => input.shift() ?? "";
 
-  const config = await configureIntegration(
-    async (label, secret = false) => {
-      prompts.push({ label, secret });
+  return {
+    passwords,
+    confirmations,
+    async select(_, options) {
+      const selected = next();
+      const choice = options.find(({ value }) => value === selected);
 
-      return answers.shift() ?? "";
+      if (!choice) throw new Error("The fixture must select a listed choice");
+
+      return choice.value;
     },
-    (message) => output.push(message),
-  );
+    async text() {
+      return next();
+    },
+    async password(message) {
+      passwords.push(message);
+
+      return next();
+    },
+    async confirm(message) {
+      confirmations.push(message);
+
+      return next() === "y";
+    },
+  };
+}
+
+test("Anthropic wizard configures the version, masks the key and rejects malformed inputs before confirmation", async () => {
+  const prompts = fixturePrompter(["anthropic", "", "fixture-anthropic-key", "y"]);
+  const config = await configureIntegration(prompts);
 
   expect(config.endpoint).toEqual({
     baseURL: "https://api.anthropic.com",
@@ -44,25 +69,25 @@ test("Anthropic wizard configures the version, masks the key and rejects malform
       { name: "anthropic-version", value: "2023-06-01" },
     ],
   });
-  expect(prompts.find(({ label }) => label.startsWith("Anthropic API key"))?.secret).toBe(true);
-  expect(output.join("\n")).not.toContain("fixture-anthropic-key");
+  expect(prompts.passwords).toEqual(["Anthropic API key"]);
+  expect(prompts.confirmations.join("\n")).toContain("x-api-key");
+  expect(prompts.confirmations.join("\n")).not.toContain("fixture-anthropic-key");
 
   for (const { input, error } of [
-    { input: ["6", "", " invalid"], error: "Secret must contain" },
+    { input: ["anthropic", "", " invalid"], error: "Secret must contain" },
     {
-      input: ["7", "", origin, "x-secret", "secret", "x".repeat(129)],
+      input: ["custom", "", origin, "x-secret", "secret", "x".repeat(129)],
       error: "Secret prefix must contain",
     },
     {
-      input: ["7", "", origin, "x-literal", "literal", "x".repeat(1025)],
+      input: ["custom", "", origin, "x-literal", "literal", "x".repeat(1025)],
       error: "Literal header value must contain",
     },
+    {
+      input: ["anthropic", "", "fixture-anthropic-key", "n"],
+      error: "Integration setup cancelled",
+    },
   ]) {
-    await expect(
-      configureIntegration(
-        async () => input.shift() ?? "",
-        () => {},
-      ),
-    ).rejects.toThrow(error);
+    await expect(configureIntegration(fixturePrompter(input))).rejects.toThrow(error);
   }
 });

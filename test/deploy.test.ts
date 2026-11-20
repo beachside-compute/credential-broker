@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { configureDeployment, loadDeploymentFile } from "../scripts/deployment-file";
+import { generateDeploymentFile, loadDeploymentFile } from "../scripts/deployment-file";
 
 const token = "fake-cloudflare-provisioning-token";
 
@@ -34,7 +34,6 @@ function provisionStub(root: string) {
   for (const file of [
     "scripts/deploy.ts",
     "scripts/deployment-file.ts",
-    "src/terminal.ts",
     "src/transport.ts",
     "src/endpoint.ts",
   ]) {
@@ -75,11 +74,6 @@ function provisionStub(root: string) {
       ...(command === "deploy" && path && { path, mode: statSync(path).mode & 0o777, bindings: JSON.parse(readFileSync(path, "utf8")) }),
     };
     appendFileSync("calls.jsonl", JSON.stringify(record) + "\\n");
-    if (command === "whoami") {
-      console.log(JSON.stringify({ loggedIn: process.env.SIGNED_IN === "yes" }));
-      if (process.env.SIGNED_IN !== "yes") process.exitCode = 1;
-    }
-    if (command === "login") process.exitCode = Number(process.env.LOGIN_STATUS ?? 0);
     if (command === "deploy") process.exitCode = Number(process.env.DEPLOY_STATUS ?? 0);
   `,
   );
@@ -90,52 +84,19 @@ function provisionStub(root: string) {
   };
 }
 
-async function runTerminal(command: string[], answers: string[][], env: NodeJS.ProcessEnv = {}) {
-  let output = "";
-  let answered = 0;
-
-  const child = Bun.spawn(command, {
-    env: { PATH: process.env.PATH, ...env },
-    terminal: {
-      data(terminal, data) {
-        output += Buffer.from(data).toString();
-        const prompt = answers[answered];
-
-        if (!prompt || !output.includes(prompt[0])) return;
-        answered++;
-        terminal.write(`${prompt[1]}\r`);
-      },
-    },
-  });
-
-  const timer = setTimeout(() => child.kill(), 5_000);
-
-  try {
-    const status = await child.exited;
-    expect(answered).toBe(answers.length);
-
-    return { status, output };
-  } finally {
-    clearTimeout(timer);
-    child.terminal?.close();
-  }
-}
-
-const confirmKeys = ["Generate broker keys", "y"];
-
-const confirmDeploy = ["deploy now?", "y"];
-
-test("writes a private dotenv file with independent keys and keeps existing bytes", () =>
+test("setup creates independent private keys without a terminal or Wrangler and keeps the file on repeat", () =>
   fixture(async (root) => {
+    const { service, command } = provisionStub(root);
     const path = join(root, ".env.deploy");
-    const output: string[] = [];
-    expect(
-      await configureDeployment(
-        path,
-        async () => "y",
-        (message) => output.push(message),
-      ),
-    ).toBe(true);
+    const options = { env: { PATH: process.env.PATH }, stdin: "ignore" } as const;
+    const missing = Bun.spawnSync(command, options);
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stderr.toString()).toContain("bun run deploy:setup");
+    expect(existsSync(path)).toBe(false);
+
+    const generated = Bun.spawnSync([...command, "--setup-only"], options);
+    expect(generated.exitCode).toBe(0);
+    expect(generated.stdout.toString()).toContain("Saved .env.deploy");
     expect(statSync(path).mode & 0o777).toBe(0o600);
     const env = loadDeploymentFile(path)!;
     expect(env.CLOUDFLARE_API_TOKEN).toBeUndefined();
@@ -153,104 +114,38 @@ test("writes a private dotenv file with independent keys and keeps existing byte
     for (const key of keys) {
       expect(key).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(Buffer.from(key, "base64url").byteLength).toBe(32);
-      expect(output.join("")).not.toContain(key);
+      expect(generated.stdout.toString()).not.toContain(key);
+      expect(generated.stderr.toString()).not.toContain(key);
     }
 
     const saved = readFileSync(path, "utf8");
-    await expect(
-      configureDeployment(
-        path,
-        async () => {
-          throw new Error("unexpected prompt");
-        },
-        () => {},
-      ),
-    ).rejects.toThrow("already exists");
+    const reuse = Bun.spawnSync([...command, "--setup-only"], options);
+    expect(reuse.exitCode).toBe(0);
+    expect(reuse.stdout.toString()).toContain("Keeping the existing .env.deploy");
     expect(readFileSync(path, "utf8")).toBe(saved);
+    expect(existsSync(join(service, "calls.jsonl"))).toBe(false);
   }));
 
-test("declining setup, concurrent files, exposed permissions, and symlinks cannot replace keys", () =>
+test("setup refuses to use exposed files or symlinks", () =>
   fixture(async (root) => {
     const path = join(root, ".env.deploy");
-    expect(
-      await configureDeployment(
-        path,
-        async () => "",
-        () => {},
-      ),
-    ).toBe(false);
-    expect(existsSync(path)).toBe(false);
-    await expect(
-      configureDeployment(
-        path,
-        async () => {
-          writeFileSync(path, "OTHER_OPERATOR=keep\n", { mode: 0o600 });
-
-          return "yes";
-        },
-        () => {},
-      ),
-    ).rejects.toThrow("Existing files are kept");
-    expect(readFileSync(path, "utf8")).toBe("OTHER_OPERATOR=keep\n");
+    writeFileSync(path, "OTHER_OPERATOR=keep\n");
     chmodSync(path, 0o644);
-    expect(() => loadDeploymentFile(path)).toThrow("private regular file");
+    expect(() => generateDeploymentFile(path)).toThrow("private regular file");
+    expect(readFileSync(path, "utf8")).toBe("OTHER_OPERATOR=keep\n");
     const target = join(root, "credentials");
     rmSync(path);
     writeFileSync(target, "CLOUDFLARE_API_TOKEN=fixture\n", { mode: 0o600 });
     symlinkSync(target, path);
-    expect(() => loadDeploymentFile(path)).toThrow("regular file");
-  }));
-
-test("a fresh terminal wizard signs in through Wrangler, deploys, redacts output and cleans the secret file", () =>
-  fixture(async (root) => {
-    const { service, command } = provisionStub(root);
-    const deploy = await runTerminal(command, [confirmKeys, confirmDeploy]);
-    expect(deploy.status).toBe(0);
-    const env = loadDeploymentFile(join(root, ".env.deploy"))!;
-
-    const calls = readFileSync(join(service, "calls.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-
-    expect(calls.map((call) => call.command)).toEqual(["whoami", "login", "deploy"]);
-    const upload = calls[2];
-    expect(upload.cwd).toBe(service);
-    expect(upload.args).toEqual(["--secrets-file", upload.path]);
-    expect(upload.mode).toBe(0o600);
-    expect(existsSync(dirname(upload.path))).toBe(false);
-    expect(upload.bindings).toEqual({ ...env, BROKER_CONFIG: '{"workerSecretBindings":[]}' });
-    expect(deploy.output).not.toContain(env.BROKER_ADMIN_KEY!);
-    expect(deploy.output).not.toContain(env.BROKER_ISSUER_KEY!);
-    expect(deploy.output).not.toContain(env.BROKER_ENCRYPTION_KEYS!);
-  }));
-
-test("setup-only and declined deployment do not authenticate, and declining a fresh save writes nothing", () =>
-  fixture(async (root) => {
-    const { service, command } = provisionStub(root);
-    const file = join(root, ".env.deploy");
-    const unattended = Bun.spawnSync(command, { env: { PATH: process.env.PATH }, stdin: "ignore" });
-    expect(unattended.exitCode).toBe(1);
-    expect(unattended.stderr.toString()).toContain("needs a terminal");
-    expect((await runTerminal(command, [["Generate broker keys", "n"]])).status).toBe(0);
-    expect(existsSync(file)).toBe(false);
-    expect((await runTerminal(command, [confirmKeys, ["deploy now?", "n"]])).status).toBe(0);
-    expect(existsSync(file)).toBe(true);
-    rmSync(file);
-    expect((await runTerminal([...command, "--setup-only"], [confirmKeys])).status).toBe(0);
-    expect(existsSync(file)).toBe(true);
-    expect(existsSync(join(service, "calls.jsonl"))).toBe(false);
+    expect(() => generateDeploymentFile(path)).toThrow("regular file");
+    expect(readFileSync(target, "utf8")).toBe("CLOUDFLARE_API_TOKEN=fixture\n");
   }));
 
 test("reuses saved keys and forwards only validated Worker bindings, even when Wrangler fails", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     const file = join(root, ".env.deploy");
-    await configureDeployment(
-      file,
-      async () => "y",
-      () => {},
-    );
+    generateDeploymentFile(file);
     const initial = loadDeploymentFile(file)!;
 
     const setting = {
@@ -288,6 +183,8 @@ test("reuses saved keys and forwards only validated Worker bindings, even when W
     expect(run.exitCode).toBe(19);
     const upload = JSON.parse(readFileSync(join(service, "calls.jsonl"), "utf8"));
     expect(upload.command).toBe("deploy");
+    expect(upload.cwd).toBe(service);
+    expect(upload.mode).toBe(0o600);
     expect(upload.args).toEqual(["--name", "fixture", "--secrets-file", upload.path]);
     expect(upload.inheritedRuntimeSecret).toBe(false);
     expect(upload.receivedToken && upload.receivedAccount).toBe(true);
@@ -305,38 +202,6 @@ test("reuses saved keys and forwards only validated Worker bindings, even when W
     expect(readFileSync(file, "utf8")).toBe(updated);
   }));
 
-test("reuses signed-in Wrangler sessions and leaves keys available after a failed login", async () => {
-  await fixture(async (root) => {
-    const { service, command } = provisionStub(root);
-    expect(
-      (await runTerminal(command, [confirmKeys, confirmDeploy], { SIGNED_IN: "yes" })).status,
-    ).toBe(0);
-
-    const calls = readFileSync(join(service, "calls.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-
-    expect(calls.map((call) => call.command)).toEqual(["whoami", "deploy"]);
-  });
-  await fixture(async (root) => {
-    const { service, command } = provisionStub(root);
-    expect(
-      (await runTerminal(command, [confirmKeys, confirmDeploy], { LOGIN_STATUS: "17" })).status,
-    ).toBe(17);
-
-    const calls = readFileSync(join(service, "calls.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-
-    expect(calls.map((call) => call.command)).toEqual(["whoami", "login"]);
-    expect(loadDeploymentFile(join(root, ".env.deploy"))?.BROKER_ADMIN_KEY).toMatch(
-      /^[A-Za-z0-9_-]{43}$/,
-    );
-  });
-});
-
 test("help and dry run are configuration-free and existing Alchemy state requires the explicit command", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
@@ -345,11 +210,7 @@ test("help and dry run are configuration-free and existing Alchemy state require
     expect(Bun.spawnSync([...command, "--help"], options).exitCode).toBe(0);
     expect(Bun.spawnSync([...command, "--dry-run"], options).exitCode).toBe(0);
     expect(existsSync(path)).toBe(false);
-    await configureDeployment(
-      path,
-      async () => "y",
-      () => {},
-    );
+    generateDeploymentFile(path);
     const old = `${readFileSync(path, "utf8")}ALCHEMY_STAGE=production\nALCHEMY_PASSWORD=fixture-existing-alchemy-secret\n`;
     writeFileSync(path, old);
     const rejected = Bun.spawnSync(command, options);
