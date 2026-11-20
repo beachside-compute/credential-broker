@@ -7,7 +7,9 @@
     "check": "tsc -p tsconfig.json",
     "test": "bun build ./test/runtime.node.ts ./test/tracing.node.ts --target=node --format=esm --packages=external --outdir=dist/test && node --test ./dist/test/runtime.node.js ./dist/test/tracing.node.js",
     "db:generate": "drizzle-kit generate",
-    "deploy": "alchemy deploy"
+    "deploy": "alchemy deploy",
+    "deploy:wrangler": "wrangler deploy",
+    "dev": "wrangler dev --local"
   },
   "dependencies": {
     "@opentelemetry/api": "1.9.1",
@@ -24,6 +26,7 @@
     "alchemy": "0.94.0",
     "drizzle-kit": "0.31.11",
     "esbuild": "0.28.1",
-    "miniflare": "5.20260925.0-alpha"
+    "miniflare": "5.20260925.0-alpha",
+    "wrangler": "4.165.0"
   }
 }

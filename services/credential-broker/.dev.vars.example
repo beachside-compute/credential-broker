@@ -1,0 +1,5 @@
+# Copy to .dev.vars and supply separate local-only values.
+# Use independent base64url encodings of 32 random bytes.
+BROKER_ADMIN_KEY=
+BROKER_ISSUER_KEY=
+BROKER_ENCRYPTION_KEYS='{"v1":""}'

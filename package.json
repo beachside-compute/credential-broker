@@ -26,7 +26,10 @@
     "format:check": "oxfmt --check .",
     "test": "bun run --cwd services/credential-broker test && bun test src test",
     "package:smoke": "bun run build && node scripts/package-smoke.mjs",
-    "deploy": "bun run --cwd services/credential-broker deploy"
+    "deploy": "bun scripts/deploy.ts",
+    "deploy:setup": "bun scripts/deploy.ts --setup-only",
+    "deploy:wrangler": "bun run --cwd services/credential-broker deploy:wrangler",
+    "dev": "bun run --cwd services/credential-broker dev"
   },
   "license": "Apache-2.0",
   "repository": {

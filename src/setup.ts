@@ -1,5 +1,3 @@
-import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
 import type { BrokerIntegrationInput } from "./admin.js";
 import {
   endpointBaseURL,
@@ -10,6 +8,7 @@ import {
   maxEndpointHeaders,
   type BrokerEndpointHeader,
 } from "./endpoint.js";
+import { terminalPrompt, type Ask } from "./terminal.js";
 import { CredentialBrokerError, integrationName } from "./transport.js";
 
 const presets: readonly { id: string; name: string; baseURL?: string }[] = [
@@ -26,50 +25,12 @@ function setupError(message: string): never {
   throw new CredentialBrokerError("INVALID_ARGUMENT", message);
 }
 
-type Ask = (label: string, secret?: boolean) => Promise<string>;
-
 export async function setupIntegration(): Promise<BrokerIntegrationInput> {
-  const { stdin, stderr } = process;
-
-  if (!stdin.isTTY || !stderr.isTTY)
-    return setupError(
-      "Integration setup needs a terminal. Use integration create --config-stdin for automation",
-    );
-
-  let masked = false;
-
-  const output = new Writable({
-    write(chunk: Uint8Array, _encoding, callback) {
-      if (masked) callback();
-      else stderr.write(chunk, callback);
-    },
-  });
-
-  const prompt = createInterface({ input: stdin, output, terminal: true, historySize: 0 });
-  const signal = new AbortController();
-  prompt.on("SIGINT", () => signal.abort());
-  prompt.on("close", () => signal.abort());
-
-  const ask: Ask = async (label, secret = false) => {
-    stderr.write(label);
-    masked = secret;
-
-    try {
-      return await prompt.question("", { signal: signal.signal });
-    } catch {
-      return setupError("Integration setup cancelled");
-    } finally {
-      masked = false;
-
-      if (secret) stderr.write("\n");
-    }
-  };
-
-  try {
-    return await configureIntegration(ask, (message) => stderr.write(message));
-  } finally {
-    prompt.close();
-  }
+  return terminalPrompt(
+    "Integration setup needs a terminal. Use integration create --config-stdin for automation",
+    "Integration setup cancelled",
+    configureIntegration,
+  );
 }
 
 export async function configureIntegration(
