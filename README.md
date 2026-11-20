@@ -10,9 +10,12 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository, run:
 
 ```sh
 bun install --frozen-lockfile
+bun run deploy
 ```
 
-Set the Worker provisioning variables in the [deployment runbook](./services/credential-broker/README.md), then run `bun run deploy`. Use the Worker HTTPS origin in the client.
+On a fresh checkout, `bun run deploy` opens a wizard that writes a private `.env.deploy` file and asks before deploying to Cloudflare. Have your account ID and API token ready. Run `bun run deploy:setup` to save the configuration for later, or start from the [deployment template](./.env.deploy.example). Use the deployed Worker HTTPS origin in the client.
+
+For direct Cloudflare deployment, use `bun run deploy:wrangler`. For local Worker development, copy the [runtime template](./services/credential-broker/.dev.vars.example) to `services/credential-broker/.dev.vars`, set the local keys, and run `bun run dev`. See the [deployment runbook](./services/credential-broker/README.md) for setup and state details.
 
 Build the CLI locally with `bun run build`. On the operator host, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY`. Pipe an upstream credential from a protected file or your secret manager:
 
@@ -85,7 +88,7 @@ For OpenCode v2, set the provider’s `baseURL` to the broker endpoint and its `
 
 ![OpenCode v2 OpenRouter settings use {env:OPENROUTER_BASE_URL} for baseURL and {env:OPENROUTER_API_KEY} for apiKey.](./docs/images/opencode-broker-configuration.png)
 
-The package will publish independently of the Beachside SDK as `@beachside/credential-client`. To try an unreleased revision, build it in a clone and run `npm pack`. Install the resulting tarball in the consuming project. It includes JavaScript, TypeScript declarations, and the `beachside-broker` executable.
+The npm package `@beachside/credential-client` releases independently of the Beachside SDK. To try an unreleased revision, build it in a clone and run `npm pack`. Install the resulting tarball in the consuming project. It includes JavaScript, TypeScript declarations, and the `beachside-broker` executable.
 
 ## Validate a change
 
