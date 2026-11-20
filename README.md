@@ -2,9 +2,7 @@
 
 A self-hosted credential broker for AI sandboxes. The Worker stores encrypted upstream credentials and issues short-lived grants scoped to named integrations. The credential client and management CLI work with Beachside and standalone orchestrators.
 
-![A sandbox calls the broker with a temporary grant. The broker swaps it for the upstream key, calls OpenRouter, and relays the response to the sandbox.](./docs/images/credential-broker-flow.png)
-
-## Deploy and configure
+## Deploy
 
 Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
 
@@ -23,7 +21,9 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
    bun run deploy:setup
    ```
 
-3. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname), then deploy.
+3. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname) in `wrangler.jsonc`.
+
+4. Deploy and copy the HTTPS URL Wrangler prints.
 
    ```sh
    bun run deploy
@@ -31,20 +31,29 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
 
 Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
 
+## Add an OpenRouter key
+
 From the deployment checkout, run the integration setup command with the HTTPS origin printed by Wrangler. Choose OpenRouter, name the integration `router-work`, and enter its API key in the hidden prompt.
 
 ```sh
 bun run broker --url https://your-broker.example.com integration setup
 ```
 
-The command loads the admin key from `.env.deploy`. Save the deployed origin as `BEACHSIDE_BROKER_URL` in that file before running the commands below. Review the current issuer allowlist, then permit grants for `router-work`.
+The command loads the admin key from `.env.deploy`. Add `BEACHSIDE_BROKER_URL=https://your-broker.example.com` to that file with your deployed URL so later commands can omit `--url`.
+
+Check which integrations the issuer can use.
 
 ```sh
 bun run broker issuer show
+```
+
+If the list is empty, allow grants for `router-work`.
+
+```sh
 bun run broker issuer set router-work
 ```
 
-`issuer set` replaces the list. Include any existing IDs you want to keep.
+If the list already contains IDs, pass them alongside `router-work` to keep them. The same setup command also offers other providers and custom HTTPS endpoints. See the [endpoint runbook](./services/credential-broker/README.md#configurable-https-endpoints) for unattended setup and rotation.
 
 ### Rotate or invalidate access
 
@@ -69,19 +78,9 @@ bun run broker integration delete router-work
 
 Deleting an integration also revokes its grants and removes it from the issuer allowlist. Requests already authorized may finish. Broker revocation leaves the upstream token active at GitHub or its provider. See the [deployment runbook](./services/credential-broker/README.md#manage-integrations) for lifecycle and key-rotation details.
 
-## Set up an HTTPS API
-
-Run the interactive wizard from the operator terminal. It prompts for the integration credentials without echoing them.
-
-```sh
-bun run broker integration setup
-```
-
-Choose OpenRouter, Kilo AI Gateway, Vercel AI Gateway, Cloudflare AI Gateway, OpenAI, Anthropic, or a custom HTTPS endpoint. Each setup fixes the upstream base URL and the headers the broker supplies. The Cloudflare preset asks for the gateway token and the upstream OpenAI key separately.
-
-Review `integration show <id>`, then use `issuer set` with the existing allowlist plus the new integration ID. For automation, use `integration create <id> --provider http --config-stdin`. See [configurable HTTPS endpoints](./services/credential-broker/README.md#configurable-https-endpoints) for the JSON format and header rotation.
-
 ## Use the client
+
+![A sandbox calls the broker with a temporary grant. The broker swaps it for the upstream key, calls OpenRouter, and relays the response to the sandbox.](./docs/images/credential-broker-flow.png)
 
 The root package exports `createCredentialBroker` and `createCredentialBrokerAdmin`. Call `broker.issue({ integrations, ttlSeconds })` and `broker.revoke(grant.id)` from a trusted host. Administration and grant-management calls have a 10-second budget that includes reading the response body. A timed-out write may have reached the broker. If a grant issuance response is lost, an issued grant remains until expiry or revocation. The issuer client can use a separate API key or [GitHub Actions OIDC](./services/credential-broker/README.md#authenticate-grant-issuance). The admin client manages integration and issuer policy metadata.
 
