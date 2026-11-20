@@ -83,9 +83,7 @@ If `router-work` has upstream base URL `https://openrouter.ai/api/v1`, the sandb
 
 For OpenCode v2, set the provider’s `baseURL` to the broker endpoint and its `apiKey` to the temporary grant. `OPENCODE_CONFIG_CONTENT` takes the nested JSON shown in the [OpenCode configuration example](./services/credential-broker/README.md#opencode).
 
-![OpenCode v2 provider settings point baseURL at the broker endpoint and use the temporary grant as apiKey.](./docs/images/opencode-broker-configuration.png)
-
-The OpenCode diagram uses the built-in OpenRouter integration, whose sandbox base URL ends in `/v1`.
+![OpenCode v2 OpenRouter settings use {env:OPENROUTER_BASE_URL} for baseURL and {env:OPENROUTER_API_KEY} for apiKey.](./docs/images/opencode-broker-configuration.png)
 
 The package will publish independently of the Beachside SDK as `@beachside/credential-client`. To try an unreleased revision, build it in a clone and run `npm pack`. Install the resulting tarball in the consuming project. It includes JavaScript, TypeScript declarations, and the `beachside-broker` executable.
 
