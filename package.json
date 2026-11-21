@@ -1,6 +1,6 @@
 {
   "name": "@beachside/credential-client",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "files": [
@@ -12,6 +12,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/commands.d.ts",
+      "import": "./dist/commands.js"
     }
   },
   "bin": {

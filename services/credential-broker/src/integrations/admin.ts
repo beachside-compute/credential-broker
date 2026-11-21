@@ -20,6 +20,7 @@ import { workerSecretSource } from "../credentials/sources/worker-secret";
 import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "../http";
 import type { Worker } from "../http";
 import { failure } from "../proxy/forward";
+import { grantView } from "../grants/view";
 import { finishSpan, parseTraceparent, startSpan } from "../observability/tracing";
 import type { AdminOperation } from "../observability/tracing";
 import { integrationKind, maxIntegrations } from "./types";
@@ -70,9 +71,32 @@ adminRoutes.use("*", async (context, next) => {
   await next();
 });
 
-adminRoutes.get("/integrations", traceAdmin("admin.integration.list"), async (context) =>
-  privateJson({ integrations: await registry(context.env).listIntegrations() }),
-);
+adminRoutes.get("/integrations", traceAdmin("admin.integration.list"), async (context) => {
+  const store = registry(context.env);
+  const issuable = new Set(await store.listIssuerIntegrations());
+  const list = await store.listIntegrations();
+
+  return privateJson({
+    integrations: list.map((item) => ({ ...item, issuable: issuable.has(item.id) })),
+  });
+});
+
+adminRoutes.get("/grants", traceAdmin("admin.grant.list"), async (context) => {
+  const grants = await registry(context.env).listGrants();
+
+  return privateJson({ grants: grants.map((grant) => grantView(grant, true)) });
+});
+
+adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
+  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+
+  // Binding names stay private. The workflow trust policy is configuration, not a secret.
+  return privateJson({
+    githubActions: config.githubActions ?? null,
+    workerSecretBindings: config.workerSecretBindings.length,
+    issuerKey: Boolean(context.env.BROKER_ISSUER_KEY),
+  });
+});
 
 adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async (context) => {
   const input = createInput.safeParse(await readJson(context.req.raw, maxEndpointBody));
@@ -120,9 +144,14 @@ adminRoutes.get("/integrations/:id", traceAdmin("admin.integration.read"), async
 
   if (!id.success) return failure(400, "invalid_integration_id");
 
-  const result = await registry(context.env).getIntegration(id.data);
+  const store = registry(context.env);
+  const result = await store.getIntegration(id.data);
 
-  return result ? privateJson(result) : failure(404, "integration_not_found");
+  if (!result) return failure(404, "integration_not_found");
+
+  const issuable = (await store.listIssuerIntegrations()).includes(result.id);
+
+  return privateJson({ ...result, issuable });
 });
 
 adminRoutes.patch("/integrations/:id", traceAdmin("admin.integration.update"), async (context) => {
@@ -216,6 +245,34 @@ adminRoutes.put(
     if (!input.success) return failure(400, "invalid_issuer_permissions");
 
     const integrations = await registry(context.env).setIssuerIntegrations(input.data.integrations);
+
+    return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
+  },
+);
+
+adminRoutes.put(
+  "/issuer-permissions/:id",
+  traceAdmin("admin.issuer_permissions.update"),
+  async (context) => {
+    const id = integrationId.safeParse(context.req.param("id"));
+
+    if (!id.success) return failure(400, "invalid_integration_id");
+
+    const integrations = await registry(context.env).allowIssuerIntegration(id.data);
+
+    return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
+  },
+);
+
+adminRoutes.delete(
+  "/issuer-permissions/:id",
+  traceAdmin("admin.issuer_permissions.update"),
+  async (context) => {
+    const id = integrationId.safeParse(context.req.param("id"));
+
+    if (!id.success) return failure(400, "invalid_integration_id");
+
+    const integrations = await registry(context.env).denyIssuerIntegration(id.data);
 
     return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
   },

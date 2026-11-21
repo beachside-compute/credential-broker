@@ -19,7 +19,16 @@ function run(command, args, cwd) {
 
 const types = `
 import { createCredentialBroker, createCredentialBrokerAdmin } from "@beachside/credential-client";
-import type { BrokerEndpoint, BrokerIntegrationCredential, SandboxGrant } from "@beachside/credential-client";
+import type {
+  BrokerDeploymentConfig,
+  BrokerEndpoint,
+  BrokerGrantSummary,
+  BrokerIntegrationCredential,
+  BrokerStatus,
+  BrokerWorkflowPolicy,
+  SandboxGrant,
+} from "@beachside/credential-client";
+import { runBrokerCli } from "@beachside/credential-client/cli";
 
 const url = "https://broker.example.invalid";
 const apiKey = "fixture_credential_broker_control_key";
@@ -39,6 +48,18 @@ const grant: SandboxGrant = await issuer.sandbox({ openai: "model", endpoints: [
   { integration: "gateway", baseURLEnv: "GATEWAY_URL", apiKeyEnv: "GATEWAY_TOKEN" },
 ] }).acquire(controller.signal);
 await grant.revoke(controller.signal);
+const status: BrokerStatus = await admin.status();
+const config: BrokerDeploymentConfig = await admin.config();
+const policies: readonly BrokerWorkflowPolicy[] = config.githubActions?.workflows ?? [];
+const everyone: BrokerGrantSummary[] = await admin.grants.list();
+const mine: BrokerGrantSummary[] = await issuer.list();
+const renewed: BrokerGrantSummary = await issuer.renew(mine[0]!.id, 60);
+const exitCode: number = await runBrokerCli(["--version"], {
+  env: {},
+  stdout: (text: string) => void text,
+  stderr: (text: string) => void text,
+});
+void [status, policies, everyone, renewed, exitCode];
 `;
 
 try {
@@ -56,6 +77,8 @@ try {
   assert.equal(packed.version, source.version);
   assert.ok(packed.files.some(({ path }) => path === "dist/index.d.ts"));
   assert.ok(packed.files.some(({ path }) => path === "dist/cli.js"));
+  assert.ok(packed.files.some(({ path }) => path === "dist/commands.js"));
+  assert.ok(packed.files.some(({ path }) => path === "dist/commands.d.ts"));
   assert.ok(
     packed.files.every(
       ({ path }) =>

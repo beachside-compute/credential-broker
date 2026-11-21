@@ -16,12 +16,20 @@ import {
   integrationName,
   jsonRecord,
   requireApiKey,
+  brokerFailure,
+  hint,
   traceParentPattern,
   waitForSignal,
   withRequestSignal,
   type BrokerRequestOptions,
   type Fetch,
 } from "./transport.js";
+import {
+  brokerStatus,
+  grantListing,
+  type BrokerGrantSummary,
+  type BrokerStatus,
+} from "./grants.js";
 
 const integrationKinds = ["github", "anthropic", "openai", "openrouter", "http"] as const;
 
@@ -46,6 +54,8 @@ export type BrokerIntegrationInput =
 
 export interface BrokerIntegration {
   readonly id: string;
+  /** Whether the issuer allowlist includes it. Listings and `get` report it. */
+  readonly issuable?: boolean;
   readonly kind: BrokerIntegrationKind;
   readonly enabled: boolean;
   readonly endpoint?: BrokerEndpoint;
@@ -182,6 +192,7 @@ function integrationMetadata(reply: unknown, expectedId?: string): BrokerIntegra
     createdAt,
     updatedAt,
     ...(endpoint && { endpoint }),
+    ...("issuable" in reply && typeof reply.issuable === "boolean" && { issuable: reply.issuable }),
   };
 }
 
@@ -199,6 +210,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
     call: BrokerRequestOptions,
     body: string | undefined,
     read: (response: Response, signal: AbortSignal) => Promise<T>,
+    subject?: string,
   ): Promise<T> {
     const budget = withRequestSignal(call.signal);
     const traceParent = call.traceParent;
@@ -215,28 +227,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
         body,
       });
 
-      if ([400, 404, 409, 413].includes(response.status)) {
-        void response.body?.cancel().catch(() => undefined);
-
-        if (response.status === 404)
-          throw new CredentialBrokerError(
-            "NOT_FOUND",
-            "Credential broker admin resource was not found",
-          );
-
-        if (response.status === 409)
-          throw new CredentialBrokerError(
-            "CONFLICT",
-            "Broker configuration changed or the integration already exists",
-          );
-
-        throw new CredentialBrokerError(
-          "INVALID_ARGUMENT",
-          "Credential broker rejected the admin request",
-        );
-      }
-
-      assertStatus(response, expected);
+      if (response.status !== expected) throw await adminFailure(response, subject);
 
       return await read(response, budget.signal);
     } catch (error) {
@@ -255,14 +246,21 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
 
   function json<T>(
     path: string,
-    method: "GET" | "POST" | "PUT" | "PATCH",
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     expected: 200 | 201,
     call: BrokerRequestOptions,
     parse: (reply: JsonReply) => T,
     body?: string,
+    subject?: string,
   ) {
-    return request(path, method, expected, call, body, async (response, signal) =>
-      parse(await waitForSignal(signal, () => jsonRecord(response))),
+    return request(
+      path,
+      method,
+      expected,
+      call,
+      body,
+      async (response, signal) => parse(await waitForSignal(signal, () => jsonRecord(response))),
+      subject,
     );
   }
 
@@ -298,7 +296,15 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
         });
       },
       async get(id: string, call: BrokerRequestOptions = {}) {
-        return json(itemPath(id), "GET", 200, call, (reply) => integrationMetadata(reply, id));
+        return json(
+          itemPath(id),
+          "GET",
+          200,
+          call,
+          (reply) => integrationMetadata(reply, id),
+          undefined,
+          id,
+        );
       },
       async create(input: BrokerIntegrationInput, call: BrokerRequestOptions = {}) {
         const id = requireId(input.id);
@@ -333,6 +339,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
           call,
           (reply) => integrationMetadata(reply, id),
           JSON.stringify(body),
+          id,
         );
       },
       async rotate(
@@ -351,6 +358,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
               ? endpointCredential(credential)
               : credentialInput(credential),
           ),
+          id,
         );
       },
       async setEnabled(id: string, enabled: boolean, call: BrokerRequestOptions = {}) {
@@ -367,6 +375,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
           call,
           (reply) => integrationMetadata(reply, id),
           JSON.stringify({ enabled }),
+          id,
         );
       },
       async delete(id: string, call: BrokerRequestOptions = {}) {
@@ -391,8 +400,178 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
           call,
           permissions,
           JSON.stringify({ integrations }),
+          integrations.join(", "),
+        );
+      },
+      /** Allow one integration to issue grants, keeping the rest of the list. */
+      async allow(id: string, call: BrokerRequestOptions = {}) {
+        return json(
+          `${permissionsPath}/${requireId(id)}`,
+          "PUT",
+          200,
+          call,
+          permissions,
+          undefined,
+          id,
+        );
+      },
+      /** Stop new grants for one integration. Existing grants stay valid until they end. */
+      async deny(id: string, call: BrokerRequestOptions = {}) {
+        return json(
+          `${permissionsPath}/${requireId(id)}`,
+          "DELETE",
+          200,
+          call,
+          permissions,
+          undefined,
+          id,
         );
       },
     },
+    grants: {
+      /** Every active grant on the broker, with its issuing authority. */
+      async list(call: BrokerRequestOptions = {}): Promise<BrokerGrantSummary[]> {
+        return json("/v1/admin/grants", "GET", 200, call, (reply) => grantListing(reply, true));
+      },
+    },
+    /** The deployment's GitHub Actions trust policy. Worker secret binding names stay private. */
+    async config(call: BrokerRequestOptions = {}): Promise<BrokerDeploymentConfig> {
+      return json("/v1/admin/config", "GET", 200, call, deploymentConfig);
+    },
+    /** Check the broker URL and admin key, with integration and grant counts. */
+    async status(call: BrokerRequestOptions = {}): Promise<BrokerStatus> {
+      return json("/v1/status", "GET", 200, call, brokerStatus, undefined, "status");
+    },
   };
+}
+
+export interface BrokerDeploymentConfig {
+  readonly githubActions: {
+    readonly audience: string;
+    readonly workflows: readonly BrokerWorkflowPolicy[];
+  } | null;
+  readonly workerSecretBindings: number;
+  readonly issuerKey: boolean;
+}
+
+type PolicyValue = string | readonly string[];
+
+/** One GitHub Actions workflow policy, as the broker's admin config reports it. */
+export type BrokerWorkflowPolicy = Readonly<Partial<Record<string, PolicyValue>>>;
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- A workflow policy from an untrusted HTTP body.
+function workflowPolicy(workflow: unknown): BrokerWorkflowPolicy {
+  if (!workflow || typeof workflow !== "object") throw invalidResponse();
+
+  return Object.fromEntries(
+    Object.entries(workflow).flatMap(([key, value]): [string, PolicyValue][] => {
+      if (typeof value === "string") return [[key, value]];
+
+      if (Array.isArray(value) && value.every((item) => typeof item === "string"))
+        return [[key, value.map(String)]];
+
+      return [];
+    }),
+  );
+}
+
+function deploymentConfig(reply: JsonReply): BrokerDeploymentConfig {
+  if (!("githubActions" in reply && "workerSecretBindings" in reply && "issuerKey" in reply))
+    throw invalidResponse();
+
+  const { githubActions, workerSecretBindings, issuerKey } = reply;
+
+  if (typeof workerSecretBindings !== "number" || typeof issuerKey !== "boolean")
+    throw invalidResponse();
+
+  if (githubActions === null) return { githubActions: null, workerSecretBindings, issuerKey };
+
+  if (
+    !githubActions ||
+    typeof githubActions !== "object" ||
+    !("audience" in githubActions) ||
+    typeof githubActions.audience !== "string" ||
+    !("workflows" in githubActions) ||
+    !Array.isArray(githubActions.workflows)
+  )
+    throw invalidResponse();
+
+  return {
+    githubActions: {
+      audience: githubActions.audience,
+      workflows: githubActions.workflows.map(workflowPolicy),
+    },
+    workerSecretBindings,
+    issuerKey,
+  };
+}
+
+const adminMessages = {
+  integration_not_found: (id) =>
+    `Integration ${id} was not found. List integrations with \`${hint("integration list")}\``,
+  integration_exists: (id) =>
+    `Integration ${id} already exists. Pick another ID, or rotate its credential with \`${hint(`integration rotate ${id}`)}\``,
+  integration_changed: () => "The integration changed during the request. Check it and retry",
+  integration_limit: () => "The broker already holds its limit of 100 integrations",
+  invalid_credential: () =>
+    "The broker rejected the credential. Built-in kinds take --secret-stdin or --worker-secret. HTTP integrations take --credentials-stdin with a JSON map of header names to new values",
+  invalid_integration: () => "The broker rejected the integration configuration",
+  invalid_integration_id: () =>
+    "Integration IDs use 1 to 32 lowercase letters, digits or hyphens, starting with a letter",
+  invalid_issuer_permissions: () => "The broker rejected the issuer allowlist",
+  credential_unavailable: () =>
+    "The Worker secret binding is not declared in BROKER_CONFIG.workerSecretBindings or has no value on the deployment",
+} satisfies Readonly<Record<string, (subject: string) => string>>;
+
+function adminMessage(error: string | undefined) {
+  for (const [code, message] of Object.entries(adminMessages)) if (code === error) return message;
+}
+
+async function adminFailure(response: Response, subject = "") {
+  const { error } = await brokerFailure(response);
+  const known = adminMessage(error);
+
+  switch (response.status) {
+    case 400:
+    case 413:
+      return new CredentialBrokerError(
+        "INVALID_ARGUMENT",
+        known ? known(subject) : "Credential broker rejected the admin request",
+      );
+    case 401:
+      return new CredentialBrokerError(
+        "UNAUTHENTICATED",
+        "The broker rejected the admin key. Use BROKER_ADMIN_KEY from the deployment, not the issuer key",
+      );
+    case 404:
+      return new CredentialBrokerError(
+        "NOT_FOUND",
+        known
+          ? known(subject)
+          : subject === "status"
+            ? "This broker does not support status. Redeploy it from the latest credential-broker release"
+            : "Credential broker admin resource was not found",
+      );
+    case 409:
+      return new CredentialBrokerError(
+        "CONFLICT",
+        known ? known(subject) : "Broker configuration changed or the integration already exists",
+      );
+    case 429:
+      return new CredentialBrokerError(
+        "RATE_LIMIT",
+        known ? known(subject) : "Credential endpoint is rate limiting requests",
+      );
+    case 503:
+      if (error === "credential_unavailable" && known)
+        return new CredentialBrokerError("UNAVAILABLE", known(subject));
+  }
+
+  try {
+    assertStatus(response, -1);
+  } catch (failure) {
+    return failure;
+  }
+
+  return invalidResponse();
 }

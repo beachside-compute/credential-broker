@@ -246,7 +246,16 @@ async function deploy() {
       "Run bun run deploy:setup or supply the existing broker settings before deploying",
     );
 
-  return deployWrangler(repository, inherited, settings, args);
+  const status = await deployWrangler(repository, inherited, settings, args);
+
+  if (status === 0 && !args.includes("--dry-run"))
+    console.info(
+      settings.BEACHSIDE_BROKER_URL
+        ? "Deployed. Check it with `bun run broker status`, then add an integration with `bun run broker integration setup`."
+        : "Deployed. Save the HTTPS origin Wrangler printed as BEACHSIDE_BROKER_URL in .env.deploy, then run `bun run broker status` and `bun run broker integration setup`.",
+    );
+
+  return status;
 }
 
 if (import.meta.main) {
