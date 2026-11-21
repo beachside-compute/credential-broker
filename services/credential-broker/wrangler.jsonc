@@ -4,15 +4,13 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-18",
   "workers_dev": true,
+  // Every version would otherwise get its own public URL sharing the keys and the registry.
+  "preview_urls": false,
   "durable_objects": {
     "bindings": [{ "name": "REGISTRY", "class_name": "GrantRegistry" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrantRegistry"] }],
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
-  "vars": {
-    "BROKER_CONFIG": "{}",
-    "BROKER_ENCRYPTION_KEY_VERSION": "v1",
-  },
   // Native logs and fetch traces can include full request URLs.
   "observability": {
     "enabled": false,

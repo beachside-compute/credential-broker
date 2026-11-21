@@ -120,14 +120,37 @@ function workerSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(deployment);
 }
 
-async function runCommand(root: string, env: NodeJS.ProcessEnv, args: string[]): Promise<number> {
+/** Cloudflare's reply when Wrangler reads back a Worker its first upload just created. */
+const firstDeployRace = /code: 10007\]/;
+
+async function runCommand(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  args: string[],
+  onError?: (text: string) => void,
+): Promise<number> {
   const child = Bun.spawn([process.execPath, "run", ...args], {
     cwd: resolve(root, servicePath),
     env,
     stdin: "inherit",
     stdout: "inherit",
-    stderr: "inherit",
+    stderr: onError ? "pipe" : "inherit",
   });
+
+  // Forward stderr as it arrives while letting the caller look for a known failure.
+  const stderr = child.stderr;
+
+  const forwarded =
+    onError && stderr
+      ? (async () => {
+          const decoder = new TextDecoder();
+
+          for await (const chunk of stderr) {
+            process.stderr.write(chunk);
+            onError(decoder.decode(chunk, { stream: true }));
+          }
+        })()
+      : undefined;
 
   const interrupt = () => {
     child.kill("SIGINT");
@@ -141,7 +164,10 @@ async function runCommand(root: string, env: NodeJS.ProcessEnv, args: string[]):
   process.once("SIGTERM", terminate);
 
   try {
-    return await child.exited;
+    const code = await child.exited;
+    await forwarded;
+
+    return code;
   } finally {
     process.off("SIGINT", interrupt);
     process.off("SIGTERM", terminate);
@@ -171,7 +197,23 @@ async function deployWrangler(
     const path = resolve(directory, "secrets.json");
     writeFileSync(path, JSON.stringify(secrets), { flag: "wx", mode: 0o600 });
 
-    return await runCommand(root, env, ["deploy:wrangler", ...args, "--secrets-file", path]);
+    const command = ["deploy:wrangler", ...args, "--secrets-file", path];
+    let raced = false;
+    let tail = "";
+
+    const code = await runCommand(root, env, command, (text) => {
+      tail = (tail + text).slice(-512);
+      raced ||= firstDeployRace.test(tail);
+    });
+
+    if (code === 0 || !raced) return code;
+
+    // A Worker's first deploy can upload, then fail to read itself back while the Workers API
+    // catches up. The upload landed, so one more deploy finishes it.
+    console.info("Cloudflare had not registered the new Worker yet. Deploying again.");
+    await Bun.sleep(5_000);
+
+    return await runCommand(root, env, command);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

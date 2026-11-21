@@ -75,6 +75,10 @@ function provisionStub(root: string) {
     };
     appendFileSync("calls.jsonl", JSON.stringify(record) + "\\n");
     if (command === "deploy") process.exitCode = Number(process.env.DEPLOY_STATUS ?? 0);
+    if (command === "deploy" && process.env.DEPLOY_RACE && readFileSync("calls.jsonl", "utf8").trim().split("\\n").length === 1) {
+      console.error("This Worker does not exist on your account. [code: 10007]");
+      process.exitCode = 1;
+    }
   `,
   );
 
@@ -232,3 +236,31 @@ test("help and dry run are configuration-free and existing Alchemy state require
     ]);
     expect(readFileSync(path, "utf8")).toBe(old);
   }));
+
+test(
+  "deploys once more when a first deploy loses Cloudflare's read-back race",
+  () =>
+    fixture(async (root) => {
+      const { service, command } = provisionStub(root);
+      generateDeploymentFile(join(root, ".env.deploy"));
+
+      const run = Bun.spawnSync(command, {
+        env: { PATH: process.env.PATH, DEPLOY_RACE: "1" },
+        stdin: "ignore",
+      });
+
+      expect(run.exitCode).toBe(0);
+      expect(run.stderr.toString()).toContain("code: 10007");
+      const calls = readFileSync(join(service, "calls.jsonl"), "utf8").trim().split("\n");
+      expect(calls).toHaveLength(2);
+
+      const failed = Bun.spawnSync(command, {
+        env: { PATH: process.env.PATH, DEPLOY_STATUS: "9" },
+        stdin: "ignore",
+      });
+
+      expect(failed.exitCode).toBe(9);
+      expect(readFileSync(join(service, "calls.jsonl"), "utf8").trim().split("\n")).toHaveLength(3);
+    }),
+  20_000,
+);

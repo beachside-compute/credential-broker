@@ -45,7 +45,7 @@ For manual setup, use the [deployment template](../../.env.deploy.example) and g
 
 Configure a static issuer key, GitHub Actions OIDC, or both. The admin, issuer, and encryption keys must be distinct. The API keys use 32–256 base64url characters and exclude the reserved sandbox grant token format.
 
-The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings so the deployment settings take precedence over the defaults in `wrangler.jsonc`.
+The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
 
 Wrangler preserves previously deployed secrets omitted from a later upload. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
 
@@ -61,7 +61,7 @@ Run `bun run deploy:alchemy` to retain an existing Alchemy-managed Worker and re
 
 ### Deploy directly with Wrangler
 
-Use `bun run deploy:wrangler` to manage Wrangler arguments and Worker secrets yourself. The [Wrangler configuration](./wrangler.jsonc) creates the `beachside-credential-broker` Worker and its SQLite-backed grant registry. Its regular variables default to version `v1` and an empty `BROKER_CONFIG`. Supply custom runtime settings in the configuration or as secret bindings. Use the same deployment path when updating the Worker and registry.
+Use `bun run deploy:wrangler` to manage Wrangler arguments and Worker secrets yourself. The [Wrangler configuration](./wrangler.jsonc) creates the `beachside-credential-broker` Worker and its SQLite-backed grant registry. Without bindings, the Worker uses encryption key version `v1` and an empty `BROKER_CONFIG`. Supply custom runtime settings as secret bindings. Preview URLs are off, so only the deployed version is reachable. Use the same deployment path when updating the Worker and registry.
 
 Put the Worker secret values in a protected JSON file outside the repository. For static issuance, furnish these fields. The keyring is a JSON-encoded string.
 

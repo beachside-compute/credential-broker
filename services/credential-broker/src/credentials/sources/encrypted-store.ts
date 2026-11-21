@@ -28,7 +28,8 @@ export function encryptionKeyring(bindings: EncryptionBindings): EncryptionKeyri
   const { BROKER_ENCRYPTION_KEYS, BROKER_ENCRYPTION_KEY_VERSION } = bindings;
 
   try {
-    const active = keyVersion.parse(BROKER_ENCRYPTION_KEY_VERSION);
+    // Without a version binding, the first key version `bun run deploy:setup` creates is active.
+    const active = keyVersion.parse(BROKER_ENCRYPTION_KEY_VERSION ?? "v1");
 
     const keys = new Map(
       Object.entries(keyringSchema.parse(JSON.parse(BROKER_ENCRYPTION_KEYS ?? ""))),
