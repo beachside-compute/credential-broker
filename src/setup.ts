@@ -64,7 +64,7 @@ export async function setupIntegration(): Promise<BrokerIntegrationInput> {
         return answer(await clack.password({ ...common, message }));
       },
       async confirm(message) {
-        return answer(await clack.confirm({ ...common, message, initialValue: false }));
+        return answer(await clack.confirm({ ...common, message, initialValue: true }));
       },
     });
   } finally {

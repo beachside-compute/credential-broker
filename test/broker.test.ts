@@ -241,7 +241,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           ["Choose a provider", "\r"],
           ["Enter for openrouter", "\r"],
           ["Provider API key", `${upstreamKey}\r`],
-          ["Create openrouter", "\x1b[D\r"],
+          ["Create openrouter", "\r"],
         ];
 
         const stdoutFile = join(root, "setup-stdout");
