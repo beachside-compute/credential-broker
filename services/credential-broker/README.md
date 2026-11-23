@@ -255,7 +255,18 @@ Supported events are `push`, `schedule`, `workflow_dispatch`, `workflow_run`, an
 
 Grants last between 1 second and 7 days (604,800 seconds). An issuer can renew its own active grant to a new lifetime of up to 7 days from the renewal, keeping its token and scope. There is no overall cap: each renewal can add up to another 7 days, so a grant renewed weekly lives until it is revoked. The 7-day limit bounds how long a forgotten grant stays live, not a grant's total lifetime. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
 
-By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Each grant allows 120 requests per UTC minute and eight concurrent gateway requests, including streams. A lost lease release can occupy a slot until expiry. A request over a bound receives HTTP `429`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
+By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Request limits apply to each grant and integration separately, counting streams. A GitHub integration allows 800 requests per UTC minute and 32 concurrent requests, since one clone or fetch makes many requests at once. Every other integration allows 600 per minute and 32 concurrent. A concurrency slot frees when its response finishes, or after 15 minutes if the release is lost. A request over a bound receives HTTP `429 grant_request_limit`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
+
+Override the limits for an integration ID in `BROKER_CONFIG`, up to 100,000 per minute and 1,000 concurrent. Omitted fields keep their defaults:
+
+```json
+{
+  "limits": {
+    "github-work": { "requestsPerMinute": 2000, "concurrentRequests": 64 },
+    "openrouter": { "requestsPerMinute": 300 }
+  }
+}
+```
 
 ## Use the gateways
 

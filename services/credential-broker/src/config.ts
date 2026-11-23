@@ -43,7 +43,18 @@ const workflowPolicy = z
     }
   });
 
+const requestLimit = z.strictObject({
+  requestsPerMinute: z.int().min(1).max(100_000).optional(),
+  concurrentRequests: z.int().min(1).max(1_000).optional(),
+});
+
+export type RequestLimits = Record<string, z.infer<typeof requestLimit>>;
+
 const configuration = z.strictObject({
+  limits: z
+    .record(integrationId, requestLimit)
+    .refine((limits) => Object.keys(limits).length <= 100)
+    .optional(),
   workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),
   githubActions: z
     .strictObject({

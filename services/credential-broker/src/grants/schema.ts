@@ -1,4 +1,4 @@
-import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const grants = sqliteTable(
   "grants",
@@ -9,8 +9,6 @@ export const grants = sqliteTable(
     permissions: text({ mode: "json" }).$type<string[]>().notNull(),
     expiresAt: integer("expires_at").notNull(),
     traceparent: text(),
-    rateWindow: integer("rate_window").notNull().default(0),
-    rateCount: integer("rate_count").notNull().default(0),
     createdAt: integer("created_at").notNull().default(0),
     label: text(),
     requests: integer().notNull().default(0),
@@ -29,6 +27,21 @@ export const leases = sqliteTable(
     grantId: text("grant_id")
       .notNull()
       .references(() => grants.id, { onDelete: "cascade" }),
+    identity: text().notNull().default(""),
+    expiresAt: integer("expires_at").notNull().default(0),
   },
-  (table) => [index("leases_grant").on(table.grantId)],
+  (table) => [index("leases_grant").on(table.grantId, table.identity)],
+);
+
+export const usage = sqliteTable(
+  "grant_usage",
+  {
+    grantId: text("grant_id")
+      .notNull()
+      .references(() => grants.id, { onDelete: "cascade" }),
+    identity: text().notNull(),
+    window: integer().notNull(),
+    count: integer().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.grantId, table.identity] })],
 );

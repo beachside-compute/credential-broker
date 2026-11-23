@@ -279,6 +279,7 @@ app.all("*", async (context) => {
     await tokenHash(token),
     selector,
     request.headers.has("x-api-key"),
+    parseConfig(context.env.BROKER_CONFIG ?? "{}").limits ?? {},
   );
 
   if (authorized.status === "invalid") return failure(401, "grant_invalid", isGit);
@@ -303,7 +304,7 @@ app.all("*", async (context) => {
     if (completed) return;
     completed = true;
     finishSpan(span, status, failed);
-    // A lost release can hold a slot until this grant expires. It never widens access.
+    // A lost release holds a slot until the lease expires. It never widens access.
     context.executionCtx.waitUntil(store.release(authorized.leaseId).catch(() => {}));
   };
 
