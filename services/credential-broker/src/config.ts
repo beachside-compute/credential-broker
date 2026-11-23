@@ -67,7 +67,10 @@ export function requestLimit(
   integration: { id: string; kind: IntegrationKind },
   limits: RequestLimits,
 ) {
-  return { ...defaultLimits[integration.kind], ...limits[integration.id] };
+  return {
+    ...defaultLimits[integration.kind],
+    ...(Object.hasOwn(limits, integration.id) && limits[integration.id]),
+  };
 }
 
 const configuration = z.strictObject({

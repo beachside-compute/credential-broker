@@ -99,7 +99,7 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
     limits: Object.fromEntries(
       known.map((integration) => [
         integration.id,
-        { ...requestLimit(integration, limits), configured: integration.id in limits },
+        { ...requestLimit(integration, limits), configured: Object.hasOwn(limits, integration.id) },
       ]),
     ),
     unknownLimitIds: Object.keys(limits).filter((id) => !known.some((row) => row.id === id)),

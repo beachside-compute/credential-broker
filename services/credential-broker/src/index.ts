@@ -300,9 +300,7 @@ app.all("*", async (context) => {
 
   let completed = false;
 
-  const renewal = setInterval(() => {
-    context.executionCtx.waitUntil(store.renewLease(authorized.leaseId).catch(() => {}));
-  }, leaseTtlMs / 3);
+  let renewal: ReturnType<typeof setInterval> | undefined;
 
   const complete = (status: number, failed?: boolean) => {
     if (completed) return;
@@ -316,10 +314,13 @@ app.all("*", async (context) => {
   const { integration } = authorized;
   const target = upstreamRoute(incoming, integration);
 
+  const path = decodedPath(requestUrl.pathname);
+
   const blockedEndpoint =
     target?.type === "http" &&
     (request.headers.has("upgrade") ||
-      decodeURIComponent(requestUrl.pathname).includes(token) ||
+      path === undefined ||
+      path.includes(token) ||
       [...requestUrl.searchParams].some(
         ([name, value]) => name.includes(token) || value.includes(token),
       ));
@@ -365,6 +366,10 @@ app.all("*", async (context) => {
     return failure(503, "credential_unavailable");
   }
 
+  renewal = setInterval(() => {
+    context.executionCtx.waitUntil(store.renewLease(authorized.leaseId).catch(() => {}));
+  }, leaseTtlMs / 3);
+
   try {
     const response = await upstream(request, target, credential, token);
 
@@ -375,5 +380,13 @@ app.all("*", async (context) => {
     return failure(502, "upstream_unavailable");
   }
 });
+
+function decodedPath(path: string): string | undefined {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return undefined;
+  }
+}
 
 export default app;

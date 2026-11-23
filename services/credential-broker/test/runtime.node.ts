@@ -1086,9 +1086,28 @@ test("streams data before completion and reclaims released or expired leases", a
     assert.equal((await access(path, issued.token, "POST", body)).status, 429);
 
     await storage.exec("UPDATE leases SET expires_at = 0 WHERE grant_id = ?", issued.id);
+
+    const [renewed] = await storage.exec(
+      "SELECT id FROM leases WHERE grant_id = ? LIMIT 1",
+      issued.id,
+    );
+
+    const namespace = await runtime.getDurableObjectNamespace("REGISTRY");
+
+    // SAFETY: REGISTRY is bound to GrantRegistry, whose RPC surface includes renewLease.
+    const registry: { renewLease(id: string): Promise<void> } = namespace.getByName(
+      "grant-registry",
+    ) as never;
+
+    await registry.renewLease(String(renewed.id));
+
     const afterExpiry = await access(path, issued.token, "POST", body);
     assert.equal(afterExpiry.status, 200);
     requests.push({ reader: afterExpiry.body!.getReader(), finish: sendStreamTail! });
+
+    const remaining = await storage.exec("SELECT id FROM leases WHERE grant_id = ?", issued.id);
+    assert.equal(remaining.length, 2);
+    assert.ok(remaining.some(({ id }) => id === renewed.id));
     assert.equal((await access(`/v1/grants/${issued.id}`, apiKey, "DELETE")).status, 204);
     assert.equal((await access(path, issued.token, "POST", body)).status, 401);
     assert.deepEqual(
@@ -1452,6 +1471,13 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { fixture: true });
     assert.equal(response.headers.get("x-page-count"), "2");
+
+    const malformed = await runtime.dispatchFetch(`${result.env.CUSTOM_URL}/widgets/%E0%A4%A`, {
+      headers: { "x-api-key": token },
+    });
+
+    assert.equal(malformed.status, 404);
+    await malformed.text();
 
     for (const name of ["set-cookie", "cf-aig-authorization", "x-reflected-credential"])
       assert.equal(response.headers.get(name), null);
