@@ -8,7 +8,7 @@ import type { ResolvedCredential } from "./credentials/source";
 import { workerSecretSource } from "./credentials/sources/worker-secret";
 import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
 import { failure, upstream, withCompletion } from "./proxy/forward";
-import { GrantRegistry } from "./grants/registry";
+import { GrantRegistry, leaseTtlMs } from "./grants/registry";
 import { grantView } from "./grants/view";
 import { route, sandboxToken, upstreamRoute } from "./proxy/routes";
 import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "./http";
@@ -300,9 +300,14 @@ app.all("*", async (context) => {
 
   let completed = false;
 
+  const renewal = setInterval(() => {
+    context.executionCtx.waitUntil(store.renewLease(authorized.leaseId).catch(() => {}));
+  }, leaseTtlMs / 3);
+
   const complete = (status: number, failed?: boolean) => {
     if (completed) return;
     completed = true;
+    clearInterval(renewal);
     finishSpan(span, status, failed);
     // A lost release holds a slot until the lease expires. It never widens access.
     context.executionCtx.waitUntil(store.release(authorized.leaseId).catch(() => {}));

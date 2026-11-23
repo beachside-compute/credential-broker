@@ -589,6 +589,16 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
               (workflow) =>
                 `  ${policyText(workflow.workflowRef)} (${policyText(workflow.event)}): ${policyText(workflow.integrations)}`,
             ),
+            ...(Object.keys(config.limits).length ? ["request limits per grant"] : []),
+            ...Object.entries(config.limits).map(
+              ([id, limit]) =>
+                `  ${id.padEnd(20)}${limit.requestsPerMinute}/min, ${limit.concurrentRequests} concurrent${limit.configured ? " (configured)" : ""}`,
+            ),
+            ...(config.unknownLimitIds.length
+              ? [
+                  `warning: BROKER_CONFIG.limits names no integration: ${config.unknownLimitIds.join(", ")}`,
+                ]
+              : []),
           ].join("\n"),
         );
 

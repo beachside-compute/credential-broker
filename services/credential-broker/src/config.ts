@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { IntegrationKind } from "./integrations/types";
 
 export const integrationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
@@ -43,16 +44,35 @@ const workflowPolicy = z
     }
   });
 
-const requestLimit = z.strictObject({
+const limitOverride = z.strictObject({
   requestsPerMinute: z.int().min(1).max(100_000).optional(),
   concurrentRequests: z.int().min(1).max(1_000).optional(),
 });
 
-export type RequestLimits = Record<string, z.infer<typeof requestLimit>>;
+export type RequestLimits = Record<string, z.infer<typeof limitOverride>>;
+
+/** Per grant and integration. Git clones and fetches burst far more than model calls. */
+const defaultLimits: Record<
+  IntegrationKind,
+  { requestsPerMinute: number; concurrentRequests: number }
+> = {
+  github: { requestsPerMinute: 800, concurrentRequests: 32 },
+  anthropic: { requestsPerMinute: 600, concurrentRequests: 32 },
+  openai: { requestsPerMinute: 600, concurrentRequests: 32 },
+  openrouter: { requestsPerMinute: 600, concurrentRequests: 32 },
+  http: { requestsPerMinute: 300, concurrentRequests: 8 },
+};
+
+export function requestLimit(
+  integration: { id: string; kind: IntegrationKind },
+  limits: RequestLimits,
+) {
+  return { ...defaultLimits[integration.kind], ...limits[integration.id] };
+}
 
 const configuration = z.strictObject({
   limits: z
-    .record(integrationId, requestLimit)
+    .record(integrationId, limitOverride)
     .refine((limits) => Object.keys(limits).length <= 100)
     .optional(),
   workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),

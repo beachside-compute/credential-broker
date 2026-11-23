@@ -12,4 +12,5 @@ ALTER TABLE `leases` ADD `identity` text DEFAULT '' NOT NULL;--> statement-break
 ALTER TABLE `leases` ADD `expires_at` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 CREATE INDEX `leases_grant` ON `leases` (`grant_id`,`identity`);--> statement-breakpoint
 ALTER TABLE `grants` DROP COLUMN `rate_window`;--> statement-breakpoint
-ALTER TABLE `grants` DROP COLUMN `rate_count`;
+ALTER TABLE `grants` DROP COLUMN `rate_count`;--> statement-breakpoint
+DELETE FROM `leases`;

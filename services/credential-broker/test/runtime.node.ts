@@ -87,7 +87,7 @@ const config = {
     "CREDENTIAL_MISSING",
   ],
   githubActions: { audience, workflows: [policy, reusablePolicy] },
-  limits: { openai: { concurrentRequests: 3 } },
+  limits: { openai: { concurrentRequests: 3 }, retired: { requestsPerMinute: 10 } },
 };
 
 const claims = {
@@ -2159,6 +2159,17 @@ test("explains refused issuance, lists and renews grants, and reports status by 
   assert.equal(config.issuerKey, true);
   assert.equal(config.githubActions?.audience, audience);
   assert.equal(config.workerSecretBindings, kinds.length + 1);
+  assert.deepEqual(config.limits.openai, {
+    requestsPerMinute: 600,
+    concurrentRequests: 3,
+    configured: true,
+  });
+  assert.deepEqual(config.limits.github, {
+    requestsPerMinute: 800,
+    concurrentRequests: 32,
+    configured: false,
+  });
+  assert.deepEqual(config.unknownLimitIds, ["retired"]);
 
   await adminClient.integrations.delete("parked");
 });

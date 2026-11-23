@@ -123,7 +123,7 @@ bun run broker issuer deny openrouter
 bun run broker issuer set openrouter github-work
 ```
 
-`integration list` shows each integration's state, whether it is allowed to issue, its upstream and credential version. `config show` prints the GitHub Actions trust policy from `BROKER_CONFIG`.
+`integration list` shows each integration's state, whether it is allowed to issue, its upstream and credential version. `config show` prints the GitHub Actions trust policy and the request limits from `BROKER_CONFIG`.
 
 ### Issue and manage grants
 
@@ -255,9 +255,9 @@ Supported events are `push`, `schedule`, `workflow_dispatch`, `workflow_run`, an
 
 Grants last between 1 second and 7 days (604,800 seconds). An issuer can renew its own active grant to a new lifetime of up to 7 days from the renewal, keeping its token and scope. There is no overall cap: each renewal can add up to another 7 days, so a grant renewed weekly lives until it is revoked. The 7-day limit bounds how long a forgotten grant stays live, not a grant's total lifetime. A grant can use its selected integrations immediately and cannot manage grants. The operation is authorized again for every gateway request. Revocation and expiry reject new requests. Requests that have already passed authorization, including active model streams and writes, may finish. A lost response to grant creation may leave a record until its expiry, and the broker cannot recover the raw grant token.
 
-By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Request limits apply to each grant and integration separately, counting streams. A GitHub integration allows 800 requests per UTC minute and 32 concurrent requests, since one clone or fetch makes many requests at once. The `anthropic`, `openai` and `openrouter` model gateways allow 600 per minute and 32 concurrent. Administrator-configured `http` endpoints allow 300 per minute and 8 concurrent. A concurrency slot frees when its response finishes, or after 15 minutes if the release is lost. A request over a bound receives HTTP `429 grant_request_limit`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
+By default the registry admits up to 1,000 active grants and up to 100 per issuing authority (one static issuer role or one workflow run). Request limits apply to each grant and integration separately, counting streams. A GitHub integration allows 800 requests per UTC minute and 32 concurrent requests, since one clone or fetch makes many requests at once. The `anthropic`, `openai` and `openrouter` model gateways allow 600 per minute and 32 concurrent. Administrator-configured `http` endpoints allow 300 per minute and 8 concurrent. A concurrency slot frees when its response finishes. A running request renews its slot every 5 minutes, so a slot whose release is lost frees within 15 minutes. A request over a bound receives HTTP `429 grant_request_limit`. Set provider-side token scopes, spend limits, and quotas to constrain delegated use.
 
-Override the limits for an integration ID in `BROKER_CONFIG`, up to 100,000 per minute and 1,000 concurrent. Omitted fields keep their defaults:
+Override the limits for up to 100 integration IDs in `BROKER_CONFIG`, up to 100,000 per minute and 1,000 concurrent each. Omitted fields keep their defaults. `config show` lists each integration's effective limits and warns about IDs that match no integration:
 
 ```json
 {
