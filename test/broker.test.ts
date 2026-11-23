@@ -228,6 +228,17 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and keys
       const explicit = await run(["--url", origin, ...list]);
       expect(explicit.status, explicit.stderr).toBe(0);
       expect(JSON.parse(explicit.stdout)).toEqual({ integrations: [] });
+
+      // The CLI would use a second --url, so the runner refuses rather than check only the first.
+      const twice = await run([
+        "--url",
+        origin,
+        "--url=https://elsewhere.example.invalid",
+        ...list,
+      ]);
+
+      expect(twice.status).toBe(2);
+      expect(twice.stderr).toContain("Pass --url once");
       writeFileSync(secretFile, `${settings}BEACHSIDE_BROKER_URL=${origin}\n`);
       const saved = await run(list, { BEACHSIDE_BROKER_URL: "https://unrelated.example.invalid" });
       expect(saved.status, saved.stderr).toBe(0);
@@ -242,6 +253,15 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and keys
       expect(human.stdout).toContain(
         "No integrations yet. Add one with `bun run broker integration setup`.",
       );
+      // An env: reference may name a variable the runner keeps away from the CLI.
+      writeFileSync(
+        secretFile,
+        `BEACHSIDE_BROKER_URL=${origin}\nBROKER_ADMIN_KEY=env:BROKER_ADMIN_KEY\n`,
+      );
+      const fromEnv = await run(list, { BROKER_ADMIN_KEY: adminKey });
+      expect(fromEnv.status, fromEnv.stderr).toBe(0);
+      expect(requests.at(-1)?.authorization).toBe(`Bearer ${adminKey}`);
+      writeFileSync(secretFile, `${settings}BEACHSIDE_BROKER_URL=${origin}\n`);
       requests.length = 0;
 
       for (const json of [false, true]) {

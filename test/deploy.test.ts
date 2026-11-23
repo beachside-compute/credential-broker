@@ -56,16 +56,19 @@ function provisionStub(root: string) {
       scripts: {
         wrangler: "bun provision.ts",
         "deploy:wrangler": "bun provision.ts deploy",
-        deploy: "bun provision.ts alchemy",
       },
     }),
   );
   writeFileSync(
     join(service, "provision.ts"),
     `
-    import { appendFileSync, readFileSync, statSync } from "node:fs";
+    import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
+      if (process.env.SECRET_LIST_ERROR) {
+        console.error(process.env.SECRET_LIST_ERROR);
+        process.exit(1);
+      }
       if (process.env.WORKER_SECRETS === undefined) {
         console.error('Worker "beachside-credential-broker" not found.');
         process.exit(1);
@@ -79,12 +82,13 @@ function provisionStub(root: string) {
       command, args, cwd: process.cwd(),
       receivedToken: process.env.CLOUDFLARE_API_TOKEN === ${JSON.stringify(token)},
       receivedAccount: process.env.CLOUDFLARE_ACCOUNT_ID === ${JSON.stringify(account)},
-      inheritedRuntimeSecret: Boolean(process.env.BROKER_ADMIN_KEY || process.env.CREDENTIAL_DECLARED),
+      inheritedRuntimeSecret: Boolean(process.env.BROKER_ADMIN_KEY || process.env.CREDENTIAL_DECLARED || process.env.BEACHSIDE_BROKER_ADMIN_KEY),
       ...(command === "deploy" && path && { path, mode: statSync(path).mode & 0o777, bindings: JSON.parse(readFileSync(path, "utf8")) }),
     };
     appendFileSync("calls.jsonl", JSON.stringify(record) + "\\n");
     if (command === "deploy") process.exitCode = Number(process.env.DEPLOY_STATUS ?? 0);
-    if (command === "deploy" && !args.includes("--dry-run")) console.log("Deployed triggers\\n  https://beachside-credential-broker.fixture.workers.dev");
+    if (command === "deploy" && process.env.BREAK_ENV_FILE) mkdirSync("../../.env.deploy");
+    if (command === "deploy" && !args.includes("--dry-run")) console.log("Deployed triggers\\n  " + (process.env.DEPLOY_URL ?? "https://beachside-credential-broker.fixture.workers.dev"));
     if (command === "deploy" && process.env.DEPLOY_RACE && readFileSync("calls.jsonl", "utf8").trim().split("\\n").length === 1) {
       console.error("This Worker does not exist on your account. [code: 10007]");
       process.exitCode = 1;
@@ -101,27 +105,44 @@ function provisionStub(root: string) {
 const deployed =
   "BROKER_ADMIN_KEY,BROKER_ISSUER_KEY,BROKER_ENCRYPTION_KEYS,BROKER_ENCRYPTION_KEY_VERSION,BROKER_CONFIG";
 
+const fixtureURL = "https://beachside-credential-broker.fixture.workers.dev";
+
 function calls(service: string) {
-  return readFileSync(join(service, "calls.jsonl"), "utf8")
+  const path = join(service, "calls.jsonl");
+
+  if (!existsSync(path)) return [];
+
+  return readFileSync(path, "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
+}
+
+function spawn(command: string[], env: Record<string, string> = {}) {
+  const run = Bun.spawnSync(command, { env: { PATH: process.env.PATH, ...env }, stdin: "ignore" });
+
+  return { code: run.exitCode, stdout: run.stdout.toString(), stderr: run.stderr.toString() };
 }
 
 test("setup deploys fresh keys once, prints the role keys and saves only the URL", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     const path = join(root, ".env.deploy");
-    const options = { env: { PATH: process.env.PATH }, stdin: "ignore" } as const;
-    const missing = Bun.spawnSync(command, options);
-    expect(missing.exitCode).toBe(1);
-    expect(missing.stderr.toString()).toContain("bun run deploy:setup");
-    expect(existsSync(join(service, "calls.jsonl"))).toBe(false);
+    const setup = [...command, "--setup-only"];
 
-    const setup = Bun.spawnSync([...command, "--setup-only"], options);
-    expect(setup.exitCode, setup.stderr.toString()).toBe(0);
+    const missing = spawn(command);
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toContain("bun run deploy:setup");
+
+    // Without a terminal the keys would land in a log, so printing them takes an explicit flag.
+    const unattended = spawn(setup);
+    expect(unattended.code).toBe(1);
+    expect(unattended.stderr).toContain("--print-keys");
+    expect(calls(service)).toEqual([]);
+
+    const run = spawn([...setup, "--print-keys"]);
+    expect(run.code, run.stderr).toBe(0);
     const [upload] = calls(service);
-    expect(upload.command).toBe("deploy");
     expect(upload.mode).toBe(0o600);
     expect(existsSync(dirname(upload.path))).toBe(false);
     const { bindings } = upload;
@@ -136,44 +157,58 @@ test("setup deploys fresh keys once, prints the role keys and saves only the URL
       expect(Buffer.from(key, "base64url").byteLength).toBe(32);
     }
 
-    const printed = setup.stdout.toString();
-    expect(printed).toContain(`BROKER_ADMIN_KEY=${bindings.BROKER_ADMIN_KEY}`);
-    expect(printed).toContain(`BROKER_ISSUER_KEY=${bindings.BROKER_ISSUER_KEY}`);
-    expect(printed + setup.stderr.toString()).not.toContain(encryption);
+    expect(run.stdout).toContain(`BROKER_ADMIN_KEY=${bindings.BROKER_ADMIN_KEY}`);
+    expect(run.stdout).toContain(`BROKER_ISSUER_KEY=${bindings.BROKER_ISSUER_KEY}`);
+    expect(run.stdout + run.stderr).not.toContain(encryption);
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(loadDeploymentFile(path)).toEqual({
-      BEACHSIDE_BROKER_URL: "https://beachside-credential-broker.fixture.workers.dev",
+    expect(loadDeploymentFile(path)).toEqual({ BEACHSIDE_BROKER_URL: fixtureURL });
+
+    // Setup never replaces a live broker's keys, even when only some of them are on the Worker.
+    for (const existing of [deployed, "BROKER_ADMIN_KEY"]) {
+      const again = spawn([...setup, "--print-keys"], { WORKER_SECRETS: existing });
+      expect(again.code).toBe(1);
+      expect(again.stderr).toContain("Setup never replaces keys");
+    }
+
+    // Only Wrangler's missing-Worker reply counts as a fresh broker.
+    const unreadable = spawn([...setup, "--print-keys"], {
+      SECRET_LIST_ERROR: "Authentication error: profile not found.",
     });
 
-    // Setup never replaces a live broker's keys, which would orphan its encrypted integrations.
-    const again = Bun.spawnSync([...command, "--setup-only"], {
-      ...options,
-      env: { ...options.env, WORKER_SECRETS: deployed },
-    });
-
-    expect(again.exitCode).toBe(1);
-    expect(again.stderr.toString()).toContain("already has its keys");
+    expect(unreadable.code).toBe(1);
+    expect(unreadable.stderr).toContain("Could not read the Worker's secrets");
     expect(calls(service)).toHaveLength(1);
   }));
 
-test("setup refuses keys left in .env.deploy by an older setup", () =>
+test("setup prints the keys even when it cannot save the URL", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
-    writeFileSync(join(root, ".env.deploy"), "BROKER_ADMIN_KEY=old-plaintext-admin\n", {
-      mode: 0o600,
-    });
-
-    const run = Bun.spawnSync([...command, "--setup-only"], {
-      env: { PATH: process.env.PATH },
-      stdin: "ignore",
-    });
-
-    expect(run.exitCode).toBe(1);
-    expect(run.stderr.toString()).toContain("bun run deploy");
-    expect(existsSync(join(service, "calls.jsonl"))).toBe(false);
+    const run = spawn([...command, "--setup-only", "--print-keys"], { BREAK_ENV_FILE: "1" });
+    expect(run.code, run.stderr).toBe(0);
+    const [{ bindings }] = calls(service);
+    expect(run.stdout).toContain(`BROKER_ADMIN_KEY=${bindings.BROKER_ADMIN_KEY}`);
+    expect(run.stderr).toContain(`Save BEACHSIDE_BROKER_URL=${fixtureURL} in .env.deploy yourself`);
   }));
 
-test("the URL is saved only to a private regular file", () =>
+test("setup accepts key references but refuses keys an older setup saved", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    const path = join(root, ".env.deploy");
+    const setup = [...command, "--setup-only", "--print-keys"];
+    writeFileSync(path, "BROKER_ADMIN_KEY=old-plaintext-admin\n", { mode: 0o600 });
+    const legacy = spawn(setup);
+    expect(legacy.code).toBe(1);
+    expect(legacy.stderr).toContain("older setup");
+    expect(calls(service)).toEqual([]);
+
+    const references = "BROKER_ADMIN_KEY=op://Private/broker/admin\nBROKER_ISSUER_KEY=env:ISSUER\n";
+    writeFileSync(path, references);
+    const run = spawn(setup);
+    expect(run.code, run.stderr).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(`${references}BEACHSIDE_BROKER_URL=${fixtureURL}\n`);
+  }));
+
+test("the URL is saved only to a private regular file and must be a broker origin", () =>
   fixture(async (root) => {
     const path = join(root, ".env.deploy");
     writeFileSync(path, "OTHER_OPERATOR=keep\n");
@@ -186,49 +221,53 @@ test("the URL is saved only to a private regular file", () =>
     symlinkSync(target, path);
     expect(() => saveBrokerURL(path, "https://broker.example.com")).toThrow("regular file");
     expect(readFileSync(target, "utf8")).toBe("CLOUDFLARE_API_TOKEN=fixture\n");
+    rmSync(path);
+    expect(() => saveBrokerURL(path, "https://broker.example.com/v1")).toThrow("origin");
+    expect(existsSync(path)).toBe(false);
+    saveBrokerURL(path, "https://broker.example.com/");
+    expect(readFileSync(path, "utf8")).toEndWith(
+      "\nBEACHSIDE_BROKER_URL=https://broker.example.com\n",
+    );
   }));
 
-test("updates never upload broker keys and forward only validated settings, even when Wrangler fails", () =>
+test("updates never upload broker keys, resolve setting references and follow the deployed URL", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     const file = join(root, ".env.deploy");
 
     const setting = {
-      BEACHSIDE_BROKER_URL: "https://broker.example.com",
+      BEACHSIDE_BROKER_URL: "https://old-broker.example.com",
       BROKER_ADMIN_KEY: "old-plaintext-admin",
       BROKER_ISSUER_KEY: "op://Private/beachside-broker/issuer",
       BROKER_ENCRYPTION_KEYS: '{"v1":"old-plaintext-encryption"}',
       CLOUDFLARE_API_TOKEN: token,
       CLOUDFLARE_ACCOUNT_ID: account,
       BROKER_CONFIG: '{"workerSecretBindings":["CREDENTIAL_DECLARED"]}',
-      CREDENTIAL_DECLARED: "fake-declared-secret",
+      CREDENTIAL_DECLARED: "env:DECLARED_SOURCE",
       CREDENTIAL_UNUSED: "fake-unused-secret",
       BROKER_OTLP_TRACES_ENDPOINT: "https://traces.example.com/v1/traces",
-      BROKER_OTLP_AUTHORIZATION: "Bearer fake-collector-auth",
+      BROKER_OTLP_AUTHORIZATION: "env:COLLECTOR_AUTH",
     };
 
-    const updated = Object.entries(setting)
-      .map(([name, value]) => `${name}='${value}'`)
-      .join("\n");
+    writeFileSync(
+      file,
+      Object.entries(setting)
+        .map(([name, value]) => `${name}='${value}'`)
+        .join("\n"),
+      { mode: 0o600 },
+    );
 
-    writeFileSync(file, updated, { mode: 0o600 });
-
-    const run = Bun.spawnSync([...command, "--name", "fixture"], {
-      env: {
-        PATH: process.env.PATH,
-        WORKER_SECRETS: deployed,
-        DEPLOY_STATUS: "19",
-        BROKER_ADMIN_KEY: "inherited-should-not-leak",
-        CREDENTIAL_DECLARED: "inherited-should-not-leak",
-        ALCHEMY_PASSWORD: "unrelated-alchemy-password",
-      },
-      stdin: "ignore",
+    const run = spawn([...command, "--name", "fixture"], {
+      WORKER_SECRETS: deployed,
+      DEPLOY_STATUS: "19",
+      DECLARED_SOURCE: "fake-declared-secret",
+      COLLECTOR_AUTH: "Bearer fake-collector-auth",
+      BROKER_ADMIN_KEY: "inherited-should-not-leak",
+      BEACHSIDE_BROKER_ADMIN_KEY: "inherited-should-not-leak",
     });
 
-    expect(run.exitCode).toBe(19);
-    expect(run.stderr.toString()).toContain(
-      "BROKER_ADMIN_KEY, BROKER_ENCRYPTION_KEYS in plaintext",
-    );
+    expect(run.code).toBe(19);
+    expect(run.stderr).toContain("BROKER_ADMIN_KEY, BROKER_ENCRYPTION_KEYS in plaintext");
     const [upload] = calls(service);
     expect(upload.cwd).toBe(service);
     expect(upload.args).toEqual(["--name", "fixture", "--secrets-file", upload.path]);
@@ -237,38 +276,37 @@ test("updates never upload broker keys and forward only validated settings, even
     expect(upload.bindings).toEqual({
       BROKER_CONFIG: setting.BROKER_CONFIG,
       BROKER_OTLP_TRACES_ENDPOINT: setting.BROKER_OTLP_TRACES_ENDPOINT,
-      BROKER_OTLP_AUTHORIZATION: setting.BROKER_OTLP_AUTHORIZATION,
-      CREDENTIAL_DECLARED: setting.CREDENTIAL_DECLARED,
+      BROKER_OTLP_AUTHORIZATION: "Bearer fake-collector-auth",
+      CREDENTIAL_DECLARED: "fake-declared-secret",
     });
-    expect(readFileSync(file, "utf8")).toBe(updated);
+    expect(loadDeploymentFile(file)?.BEACHSIDE_BROKER_URL).toBe(setting.BEACHSIDE_BROKER_URL);
+
+    // The broker commands send the file's keys to its URL, so a successful deploy replaces a stale one.
+    const deployedRun = spawn(command, {
+      WORKER_SECRETS: deployed,
+      DECLARED_SOURCE: "x",
+      COLLECTOR_AUTH: "Bearer y",
+    });
+
+    expect(deployedRun.code, deployedRun.stderr).toBe(0);
+    expect(deployedRun.stdout).toContain(
+      `Replaced BEACHSIDE_BROKER_URL ${setting.BEACHSIDE_BROKER_URL} with ${fixtureURL}`,
+    );
+    expect(loadDeploymentFile(file)?.BEACHSIDE_BROKER_URL).toBe(fixtureURL);
   }));
 
-test("help and dry run are configuration-free and existing Alchemy state requires the explicit command", () =>
+test("help and dry run need no settings or Worker", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
-    const path = join(root, ".env.deploy");
-    const options = { env: { PATH: process.env.PATH }, stdin: "ignore" } as const;
-    expect(Bun.spawnSync([...command, "--help"], options).exitCode).toBe(0);
-    expect(Bun.spawnSync([...command, "--dry-run"], options).exitCode).toBe(0);
-    expect(existsSync(path)).toBe(false);
-
-    const old =
-      'BROKER_ADMIN_KEY=fixture-admin\nBROKER_ENCRYPTION_KEYS=\'{"v1":"fixture"}\'\nBROKER_ENCRYPTION_KEY_VERSION=v1\nALCHEMY_STAGE=production\nALCHEMY_PASSWORD=fixture-existing-alchemy-secret\n';
-
-    writeFileSync(path, old, { mode: 0o600 });
-    const rejected = Bun.spawnSync(command, options);
-    expect(rejected.exitCode).toBe(1);
-    expect(rejected.stderr.toString()).toContain("Use bun run deploy:alchemy");
+    expect(spawn([...command, "--help"]).code).toBe(0);
+    expect(spawn([...command, "--dry-run"], { BEACHSIDE_BROKER_ADMIN_KEY: "leak" }).code).toBe(0);
     expect(
-      Bun.spawnSync([...command, "--alchemy", "--stage", "production"], options).exitCode,
-    ).toBe(0);
-
-    expect(calls(service).map((call) => [call.command, call.args])).toEqual([
-      ["deploy", ["--help"]],
-      ["deploy", ["--dry-run"]],
-      ["alchemy", ["--stage", "production"]],
+      calls(service).map((call) => [call.command, call.args, call.inheritedRuntimeSecret]),
+    ).toEqual([
+      ["deploy", ["--help"], false],
+      ["deploy", ["--dry-run"], false],
     ]);
-    expect(readFileSync(path, "utf8")).toBe(old);
+    expect(existsSync(join(root, ".env.deploy"))).toBe(false);
   }));
 
 test(
@@ -276,23 +314,14 @@ test(
   () =>
     fixture(async (root) => {
       const { service, command } = provisionStub(root);
-
-      const run = Bun.spawnSync([...command, "--setup-only"], {
-        env: { PATH: process.env.PATH, DEPLOY_RACE: "1" },
-        stdin: "ignore",
-      });
-
-      expect(run.exitCode).toBe(0);
-      expect(run.stderr.toString()).toContain("code: 10007");
+      const run = spawn([...command, "--setup-only", "--print-keys"], { DEPLOY_RACE: "1" });
+      expect(run.code).toBe(0);
+      expect(run.stderr).toContain("code: 10007");
       expect(calls(service)).toHaveLength(2);
       expect(calls(service)[1].bindings).toEqual(calls(service)[0].bindings);
 
-      const failed = Bun.spawnSync(command, {
-        env: { PATH: process.env.PATH, WORKER_SECRETS: deployed, DEPLOY_STATUS: "9" },
-        stdin: "ignore",
-      });
-
-      expect(failed.exitCode).toBe(9);
+      const failed = spawn(command, { WORKER_SECRETS: deployed, DEPLOY_STATUS: "9" });
+      expect(failed.code).toBe(9);
       expect(calls(service)).toHaveLength(3);
     }),
   20_000,

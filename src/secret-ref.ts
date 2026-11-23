@@ -5,53 +5,71 @@ type Env = Readonly<Record<string, string | undefined>>;
 
 interface Manager {
   name: string;
-  pattern: RegExp;
+  prefix: string;
+  valid: (path: string) => boolean;
   command: string;
-  args: (reference: string) => string[];
+  args: (path: string) => string[];
   value: (stdout: string) => string;
-  install: string;
+  check: string;
 }
+
+const passSegment = /^[\w@+-][\w@+.-]*$/;
 
 const managers: Manager[] = [
   {
     name: "1Password",
-    pattern: /^op:\/\/[^/\s]+\/[^/\s]+(\/[^/\s]+){1,2}(\?\S*)?$/,
+    prefix: "op://",
+    valid: (path) => /^[^/\s]+\/[^/\s]+(\/[^/\s]+){1,2}(\?\S*)?$/.test(path),
     command: "op",
-    args: (reference) => ["read", "--no-newline", reference],
+    args: (path) => ["read", "--no-newline", `op://${path}`],
     value: (stdout) => stdout,
-    install: "Install the 1Password CLI and sign in with `op signin`",
+    check:
+      "Install the 1Password CLI, sign in with `op signin`, and check the vault, item and field",
   },
   {
     name: "Bitwarden Secrets Manager",
-    pattern: /^bws:\/\/[0-9a-fA-F-]{36}$/,
+    prefix: "bws://",
+    valid: (path) => /^[0-9a-fA-F-]{36}$/.test(path),
     command: "bws",
-    args: (reference) => ["secret", "get", reference.slice("bws://".length), "--output", "json"],
+    args: (path) => ["secret", "get", path, "--output", "json"],
     value: (stdout) => {
       // SAFETY: `bws secret get --output json` prints the secret object; an empty value is rejected by the caller.
       const { value } = JSON.parse(stdout) as { value?: string };
 
       return String(value ?? "");
     },
-    install: "Install the Bitwarden Secrets Manager CLI and set BWS_ACCESS_TOKEN",
+    check:
+      "Install the Bitwarden Secrets Manager CLI, set BWS_ACCESS_TOKEN, and check the secret ID",
   },
   {
     name: "pass",
-    pattern: /^pass:\/\/(?!.*(^|\/)\.\.(\/|$))[\w@+.-]+(\/[\w@+.-]+)*$/,
+    prefix: "pass://",
+    valid: (path) => path.split("/").every((segment) => passSegment.test(segment)),
     command: "pass",
-    args: (reference) => ["show", reference.slice("pass://".length)],
+    args: (path) => ["show", path],
     value: (stdout) => stdout.split("\n")[0] ?? "",
-    install: "Install pass and initialise your store",
+    check: "Install pass, initialise your store, and check that `pass show <path>` works",
   },
 ];
 
 /** Whether a setting names a secret elsewhere instead of holding it. */
 export function isSecretReference(value: string): boolean {
-  return /^(?:env:|op:\/\/|bws:\/\/|pass:\/\/)/.test(value);
+  return value.startsWith("env:") || managers.some(({ prefix }) => value.startsWith(prefix));
+}
+
+/** The environment a password manager runs with: everything except other broker secrets. */
+function managerEnvironment(env: Env): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([name]) => !/^(?:BEACHSIDE_BROKER_|BROKER_|CREDENTIAL_)/.test(name),
+    ),
+  );
 }
 
 /**
  * Resolves `env:NAME`, `op://`, `bws://` and `pass://` references through the password manager's
- * own CLI. Any other value is returned as it is.
+ * own CLI. An `env:` reference yields the variable's value as it is. Any other value is returned
+ * unchanged.
  */
 export async function resolveSecret(value: string, name: string, env: Env): Promise<string> {
   if (value.startsWith("env:")) {
@@ -66,46 +84,52 @@ export async function resolveSecret(value: string, name: string, env: Env): Prom
     return resolved;
   }
 
-  if (!isSecretReference(value)) return value;
-  const manager = managers.find((candidate) => candidate.pattern.test(value));
+  const manager = managers.find(({ prefix }) => value.startsWith(prefix));
 
-  if (!manager)
+  if (!manager) return value;
+  const path = value.slice(manager.prefix.length);
+
+  if (!manager.valid(path))
     throw new CredentialBrokerError(
       "INVALID_ARGUMENT",
-      `${name} is not a valid reference: ${value}`,
+      `${name} is not a valid ${manager.name} reference: ${value}`,
     );
 
-  const result = await new Promise<{ code: string | number; stdout: string; stderr: string }>(
-    (done) =>
-      execFile(
-        manager.command,
-        manager.args(value),
-        { env: { ...env }, timeout: 60_000, maxBuffer: 1024 * 1024 },
-        (error, stdout, stderr) =>
-          done({ code: error ? (error.code ?? "FAILED") : 0, stdout, stderr }),
-      ),
+  const { code, secret } = await new Promise<{ code: string | number; secret?: string }>((done) =>
+    execFile(
+      manager.command,
+      manager.args(path),
+      { env: managerEnvironment(env), timeout: 60_000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) return done({ code: error.code ?? "FAILED" });
+
+        try {
+          done({ code: 0, secret: manager.value(stdout) });
+        } catch {
+          done({ code: 0 });
+        }
+      },
+    ),
   );
 
-  if (result.code === "ENOENT")
+  // Only the exit status is reported: a manager's own output may describe or contain the secret.
+  if (code === "ENOENT")
     throw new CredentialBrokerError(
       "INVALID_ARGUMENT",
-      `${name} is a ${manager.name} reference, but \`${manager.command}\` is not installed. ${manager.install}`,
+      `${name} is a ${manager.name} reference, but \`${manager.command}\` is not installed. ${manager.check}`,
     );
 
-  if (result.code !== 0)
+  if (code !== 0)
     throw new CredentialBrokerError(
       "UNAVAILABLE",
-      `Could not read ${name} from ${manager.name} (${value}): ${result.stderr.trim() || `${manager.command} exited with ${result.code}`}`,
+      `Could not read ${name} from ${manager.name} (${value}): ${manager.command} exited with ${code}. ${manager.check}`,
     );
 
-  try {
-    const secret = manager.value(result.stdout);
+  if (!secret)
+    throw new CredentialBrokerError(
+      "UNAVAILABLE",
+      `${manager.name} returned no value for ${name} (${value})`,
+    );
 
-    if (secret) return secret;
-  } catch {}
-
-  throw new CredentialBrokerError(
-    "UNAVAILABLE",
-    `${manager.name} returned no value for ${name} (${value})`,
-  );
+  return secret;
 }

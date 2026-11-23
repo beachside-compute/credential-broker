@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { CredentialBrokerError } from "../src/transport.js";
-import { loadDeploymentFile, plaintextKeys, setupError } from "./deployment-file";
+import { loadDeploymentFile, plaintextKeys, plaintextWarning, setupError } from "./deployment-file";
+import { resolveSecret } from "../src/secret-ref.js";
 
 const root = resolve(import.meta.dir, "..");
 
@@ -24,24 +25,29 @@ function commandWords(args: readonly string[]): string[] {
 
 /** Take `--url <origin>` or `--url=<origin>` out of the arguments; the runner resolves the URL. */
 function takeURL(args: string[]): string | undefined {
+  let url: string | undefined;
+
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
+    let value: string | undefined;
 
     if (argument === "--url") {
-      const value = args[index + 1];
+      value = args[index + 1];
 
       if (!value || value.startsWith("--")) return setupError("Pass the broker origin after --url");
       args.splice(index, 2);
-
-      return value;
-    }
-
-    if (argument.startsWith("--url=")) {
+    } else if (argument.startsWith("--url=")) {
+      value = argument.slice("--url=".length);
       args.splice(index, 1);
+    } else continue;
 
-      return argument.slice("--url=".length);
-    }
+    // A second --url would reach the CLI, which could send the key somewhere the runner never checked.
+    if (url !== undefined) return setupError("Pass --url once");
+    url = value;
+    index--;
   }
+
+  return url;
 }
 
 async function packageVersion(): Promise<string> {
@@ -83,10 +89,7 @@ async function broker() {
     const file = loadDeploymentFile(resolve(root, ".env.deploy"));
     const plaintext = plaintextKeys(file);
 
-    if (plaintext.length)
-      console.warn(
-        `.env.deploy holds ${plaintext.join(", ")} in plaintext. Save the keys in your password manager and replace each value with a reference such as op://Private/beachside-broker/admin.`,
-      );
+    if (plaintext.length) console.warn(plaintextWarning(plaintext));
     const admin = file?.BROKER_ADMIN_KEY ?? fromEnv.admin;
     const issuer = file?.BROKER_ISSUER_KEY ?? fromEnv.issuer;
 
@@ -118,9 +121,11 @@ async function broker() {
 
     env.BEACHSIDE_BROKER_URL = url;
 
-    // Without a key, the CLI asks for one at a terminal.
-    if (key)
-      env[role === "issuer" ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY"] = key;
+    const name = role === "issuer" ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY";
+
+    // References resolve against the caller's environment, which still holds names like
+    // BROKER_ADMIN_KEY that the CLI does not receive. Without a key, the CLI asks at a terminal.
+    if (key) env[name] = await resolveSecret(key, name, process.env);
   }
 
   const node = Bun.which("node");

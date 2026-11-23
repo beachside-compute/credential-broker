@@ -30,9 +30,9 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
    BROKER_ISSUER_KEY=op://Private/beachside-broker/issuer
    ```
 
-   `bws://<secret-id>`, `pass://<path>` and `env:NAME` references work too. The encryption key goes straight to the Worker and is never shown. Setup refuses to run against a Worker that already has keys.
+   `bws://<secret-id>`, `pass://<path>` and `env:NAME` references work too. The encryption key is never shown, and the Worker holds its only lasting copy. Setup refuses to run against a Worker that already has any broker key, and outside a terminal it needs `--print-keys` so keys don't land in a log by accident.
 
-Later deploys run `bun run deploy`. They update the code and settings such as `BROKER_CONFIG`, and never upload keys. Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
+Later deploys run `bun run deploy`. They update the code and settings such as `BROKER_CONFIG`, and never upload keys. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
 
 ## Add an OpenRouter key
 

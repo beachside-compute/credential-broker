@@ -1,6 +1,6 @@
 # Release the credential client
 
-The release workflow publishes the root `@beachside/credential-client` package and its `beachside-broker` executable. The Worker under `services/credential-broker` is private and deploys separately through Alchemy.
+The release workflow publishes the root `@beachside/credential-client` package and its `beachside-broker` executable. The Worker under `services/credential-broker` is private and deploys separately with `bun run deploy`.
 
 ## One-time setup
 

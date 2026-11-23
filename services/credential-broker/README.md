@@ -14,7 +14,7 @@ bun run deploy:setup
 
 For a remote terminal, use `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code. [Wrangler login options](https://developers.cloudflare.com/workers/wrangler/commands/general/#wrangler-login).
 
-`bun run deploy:setup` is the first deploy. It generates independent admin, issuer and encryption keys in memory, uploads them with the Worker as secrets, and saves only the broker's URL to `.env.deploy` (mode `0600`). It prints the admin and issuer keys once; store them in your password manager and reference them from `.env.deploy` as `BROKER_ADMIN_KEY=op://...` and `BROKER_ISSUER_KEY=op://...` (`bws://`, `pass://` and `env:NAME` work too). The encryption key never leaves the Worker. Setup refuses to run when the Worker already has an encryption keyring, so it cannot replace a live broker's keys. If the deploy fails, setup discards the keys; when a retry reports that the new Worker already has keys, delete that Worker with `bun run --cwd services/credential-broker wrangler delete` and run setup again. For unattended deployment, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
+`bun run deploy:setup` is the first deploy. It generates independent admin, issuer and encryption keys in memory, uploads them with the Worker as secrets, and saves only the broker's URL to `.env.deploy` (mode `0600`). It prints the admin and issuer keys once; store them in your password manager and reference them from `.env.deploy` as `BROKER_ADMIN_KEY=op://...` and `BROKER_ISSUER_KEY=op://...` (`bws://`, `pass://` and `env:NAME` work too). The encryption key is never shown, and the Worker holds its only lasting copy. Setup refuses to run when the Worker already has any broker key, so it cannot replace a live broker's keys, and it prints the keys before saving the URL so a local write failure cannot lose them. Outside a terminal, setup requires `--print-keys` (`bun run deploy:setup --print-keys`), because the keys would otherwise land in a log unnoticed. If the deploy fails, setup discards the keys; when a retry reports that the new Worker already has keys, delete that Worker with `bun run --cwd services/credential-broker wrangler delete` and run setup again. For unattended deployment, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
 
 `bun run deploy` updates the Worker's code and its non-key settings (`BROKER_CONFIG`, OTLP tracing and `CREDENTIAL_…` bindings). It never uploads the admin, issuer or encryption keys, even when they are set, and refuses to deploy a Worker that setup has not created. Run `bun run deploy --dry-run` to check the Worker bundle offline.
 
@@ -29,7 +29,7 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 
 ### Configure deployment bindings
 
-`.env.deploy` holds settings, not keys. See the [deployment template](../../.env.deploy.example). You can also supply the settings through exported environment variables. The file takes precedence for values it sets. `bun run broker` sends a key referenced from the file only to the file's `BEACHSIDE_BROKER_URL` or an explicit `--url`, never to a URL that only the environment sets. An `.env.deploy` from an older setup that holds keys as values keeps working, but every command warns until you move them into your password manager and delete `BROKER_ENCRYPTION_KEYS` from the file. The runtime `.dev.vars` file is for local development.
+`.env.deploy` holds settings, not keys. See the [deployment template](../../.env.deploy.example). You can also supply the settings through exported environment variables. The file takes precedence for values it sets. `bun run broker` sends a key referenced from the file only to the file's `BEACHSIDE_BROKER_URL` or an explicit `--url`, never to a URL that only the environment sets. `CREDENTIAL_…` bindings and `BROKER_OTLP_AUTHORIZATION` accept the same references as the role keys; deploys resolve them before uploading. An `.env.deploy` from an older setup that holds keys as values keeps working, but `bun run broker` and `bun run deploy` warn until you move the admin and issuer keys into your password manager and delete `BROKER_ENCRYPTION_KEYS` from the file. A deploy also replaces a saved `BEACHSIDE_BROKER_URL` that differs from the origin Wrangler printed, because `bun run broker` sends the file's keys to that URL. The runtime `.dev.vars` file is for local development.
 
 | Variable                                                      | Value                                                                                                             |
 | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
@@ -41,7 +41,7 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 | `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                              |
 | `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                  |
 
-The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` as a Worker secret binding. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
+The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes; on the first deploy that file briefly holds the generated keys. Wrangler runs without the broker settings or `BEACHSIDE_BROKER_*` keys from your environment. It uploads `BROKER_CONFIG` as a Worker secret binding. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
 
 Wrangler preserves previously deployed secrets omitted from a later upload, which is how the keys outlive every update. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
 
@@ -50,10 +50,6 @@ bun run --cwd services/credential-broker wrangler secret delete BROKER_ISSUER_KE
 ```
 
 Use the HTTPS origin Wrangler prints in the client. The Durable Object applies pending migrations on startup. After schema changes, run `bun run --cwd services/credential-broker db:generate --name your_change` and commit its SQL, journal, snapshot, and bundled migration index. A new deployment begins with an empty integration catalog and issuer allowlist.
-
-### Update an Alchemy deployment
-
-Run `bun run deploy:alchemy` to retain an existing Alchemy-managed Worker and registry. Alchemy sets every secret on each deploy, so supply the original broker keys and `ALCHEMY_PASSWORD` through exported environment variables, for example with `op run`. Keep the same Alchemy stage and state directory and use its existing Cloudflare profile or provisioning credentials. The passphrase protects Alchemy state. The default command directs detected Alchemy deployments to the explicit Alchemy command.
 
 ### Deploy directly with Wrangler
 
@@ -216,7 +212,7 @@ bun run --cwd services/credential-broker wrangler secret put BROKER_ISSUER_KEY
 
 The admin, issuer and encryption keys must be distinct, 32–256 base64url characters each.
 
-The Worker holds the only copy of the encryption key. To replace it, upload a keyring with only a new key under a new version label, then rotate every encrypted integration with its upstream credential. Integrations fail until they are rotated, because the old key is gone. Every successful rotation writes with the active version and a fresh nonce.
+The Worker holds the only lasting copy of the encryption key, and Worker secrets cannot be read back, so there is no recovery path: if the secret is lost or replaced, integrations encrypted with it must be re-entered. To replace it, upload a keyring with only a new key under a new version label, then rotate every encrypted integration with its upstream credential. Integrations fail until they are rotated, because the old key is gone. Every successful rotation writes with the active version and a fresh nonce.
 
 ```sh
 printf '{"BROKER_ENCRYPTION_KEYS":"{\\"v2\\":\\"%s\\"}","BROKER_ENCRYPTION_KEY_VERSION":"v2"}' \
