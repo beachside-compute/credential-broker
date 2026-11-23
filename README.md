@@ -4,7 +4,7 @@ A self-hosted credential broker for AI sandboxes. The Worker stores encrypted up
 
 ## Install the agent skills
 
-Run this from the trusted operator or launcher project where you use your coding agent:
+Install the broker's skills for your coding agent:
 
 ```sh
 npx skills add beachside-compute/credential-broker --skill broker-setup --skill broker-grants
