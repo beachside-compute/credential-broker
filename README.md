@@ -1,6 +1,6 @@
 # Beachside credential broker
 
-A self-hosted credential broker for AI sandboxes. The Worker stores encrypted upstream credentials and issues short-lived grants scoped to named integrations, so your real keys never reach the sandbox or the sandbox provider. The credential client and management CLI work with Beachside and standalone orchestrators.
+A self-hosted credential broker for AI sandboxes. The Worker stores encrypted upstream credentials and issues short-lived grants scoped to named integrations, so your real keys never reach the sandbox or the sandbox provider. The credential client and management CLI work with [beachside](https://beachside.run) OR as a standalone cli.
 
 ## Install the agent skills
 
