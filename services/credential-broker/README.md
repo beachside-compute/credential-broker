@@ -10,14 +10,13 @@ Use Bun 1.4.4, Node.js 22 or later, and a Cloudflare account with permission to 
 bun install --frozen-lockfile
 bun run --cwd services/credential-broker wrangler login
 bun run deploy:setup
-bun run deploy
 ```
 
 For a remote terminal, use `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code. [Wrangler login options](https://developers.cloudflare.com/workers/wrangler/commands/general/#wrangler-login).
 
-`bun run deploy:setup` generates independent admin, issuer, and encryption keys in `.env.deploy` with mode `0600`. It runs without a terminal and leaves an existing private file unchanged. Keep secure backups of the keys for as long as the registry or its backups may need them. For unattended deployment, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
+`bun run deploy:setup` is the first deploy. It generates independent admin, issuer and encryption keys in memory, uploads them with the Worker as secrets, and saves only the broker's URL to `.env.deploy` (mode `0600`). It prints the admin and issuer keys once; store them in your password manager and reference them from `.env.deploy` as `BROKER_ADMIN_KEY=op://...` and `BROKER_ISSUER_KEY=op://...` (`bws://`, `pass://` and `env:NAME` work too). The encryption key never leaves the Worker. Setup refuses to run when the Worker already has an encryption keyring, so it cannot replace a live broker's keys. If the deploy fails, setup discards the keys; when a retry reports that the new Worker already has keys, delete that Worker with `bun run --cwd services/credential-broker wrangler delete` and run setup again. For unattended deployment, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` alongside your broker settings. [Wrangler permissions and API token authentication](https://developers.cloudflare.com/workers/authorization/).
 
-`bun run deploy` reuses your deployment settings and passes them to Wrangler. Run `bun run deploy --dry-run` to check the Worker bundle offline.
+`bun run deploy` updates the Worker's code and its non-key settings (`BROKER_CONFIG`, OTLP tracing and `CREDENTIAL_…` bindings). It never uploads the admin, issuer or encryption keys, even when they are set, and refuses to deploy a Worker that setup has not created. Run `bun run deploy --dry-run` to check the Worker bundle offline.
 
 ### Use a custom hostname
 
@@ -30,24 +29,21 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 
 ### Configure deployment bindings
 
-For manual setup, use the [deployment template](../../.env.deploy.example) and give the resulting `.env.deploy` file mode `0600`. You can also supply the settings through exported environment variables. The file takes precedence for values it sets. `bun run broker` sends a key from the file only to the file's `BEACHSIDE_BROKER_URL` or an explicit `--url`, never to a URL that only the environment sets. The runtime `.dev.vars` file is for local development.
+`.env.deploy` holds settings, not keys. See the [deployment template](../../.env.deploy.example). You can also supply the settings through exported environment variables. The file takes precedence for values it sets. `bun run broker` sends a key referenced from the file only to the file's `BEACHSIDE_BROKER_URL` or an explicit `--url`, never to a URL that only the environment sets. An `.env.deploy` from an older setup that holds keys as values keeps working, but every command warns until you move them into your password manager and delete `BROKER_ENCRYPTION_KEYS` from the file. The runtime `.dev.vars` file is for local development.
 
-| Variable                                                      | Value                                                                                                                                      |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `BROKER_ADMIN_KEY`                                            | Required management bearer key. Generate it from at least 32 random bytes and encode it as base64url.                                      |
-| `BROKER_ISSUER_KEY`                                           | Optional static grant-issuance bearer key. Generate it independently of the admin key.                                                     |
-| `BROKER_ENCRYPTION_KEYS`                                      | Required JSON object mapping encryption key versions to unpadded base64url encodings of 32 independently generated random bytes each.      |
-| `BROKER_ENCRYPTION_KEY_VERSION`                               | Required active key version. Use a 1–32 character label made of letters, digits, hyphens, or underscores, starting with a letter or digit. |
-| `BROKER_CONFIG`                                               | Optional JSON for GitHub Actions trust policies and declared Worker secret bindings. Defaults to an empty object.                          |
-| `CREDENTIAL_…`                                                | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.                                       |
-| `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                                                       |
-| `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                                           |
+| Variable                                                      | Value                                                                                                             |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `BROKER_ADMIN_KEY`                                            | Management bearer key, set by setup. In `.env.deploy`, a reference for `bun run broker`.                          |
+| `BROKER_ISSUER_KEY`                                           | Static grant-issuance bearer key, set by setup. In `.env.deploy`, a reference for `bun run broker`.               |
+| `BEACHSIDE_BROKER_URL`                                        | The broker's origin, saved by setup, for `bun run broker`.                                                        |
+| `BROKER_CONFIG`                                               | Optional JSON for GitHub Actions trust policies and declared Worker secret bindings. Defaults to an empty object. |
+| `CREDENTIAL_…`                                                | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.              |
+| `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                              |
+| `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                  |
 
-Configure a static issuer key, GitHub Actions OIDC, or both. The admin, issuer, and encryption keys must be distinct. The API keys use 32–256 base64url characters and exclude the reserved sandbox grant token format.
+The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` as a Worker secret binding. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
 
-The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes. It uploads `BROKER_CONFIG` and `BROKER_ENCRYPTION_KEY_VERSION` as Worker secret bindings. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
-
-Wrangler preserves previously deployed secrets omitted from a later upload. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
+Wrangler preserves previously deployed secrets omitted from a later upload, which is how the keys outlive every update. To remove an optional binding such as the static issuer key or OTLP authorization, remove it from your deployment settings and explicitly delete it from the same Worker. For example, configure GitHub Actions OIDC before removing the static issuer key. [Wrangler secret removal](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
 
 ```sh
 bun run --cwd services/credential-broker wrangler secret delete BROKER_ISSUER_KEY
@@ -57,7 +53,7 @@ Use the HTTPS origin Wrangler prints in the client. The Durable Object applies p
 
 ### Update an Alchemy deployment
 
-Run `bun run deploy:alchemy` to retain an existing Alchemy-managed Worker and registry. Restore the original broker keys and `ALCHEMY_PASSWORD` through `.env.deploy` or your secret manager. Keep the same Alchemy stage and state directory and use its existing Cloudflare profile or provisioning credentials. The passphrase protects Alchemy state. The default command directs detected Alchemy deployments to the explicit Alchemy command.
+Run `bun run deploy:alchemy` to retain an existing Alchemy-managed Worker and registry. Alchemy sets every secret on each deploy, so supply the original broker keys and `ALCHEMY_PASSWORD` through exported environment variables, for example with `op run`. Keep the same Alchemy stage and state directory and use its existing Cloudflare profile or provisioning credentials. The passphrase protects Alchemy state. The default command directs detected Alchemy deployments to the explicit Alchemy command.
 
 ### Deploy directly with Wrangler
 
@@ -101,18 +97,18 @@ BEACHSIDE_BROKER_ADMIN_KEY="$(sed -n 's/^BROKER_ADMIN_KEY=//p' services/credenti
   bun run broker status
 ```
 
-Keys in `.env.deploy` take precedence, so run this from a checkout without deployment keys, or use the installed `beachside-broker` command, which reads only the environment.
+Keys referenced from `.env.deploy` take precedence, so run this from a checkout without one, or use the installed `beachside-broker` command, which reads only the environment.
 
 ## Manage integrations
 
-From the deployment checkout, save the HTTPS origin printed by Wrangler as `BEACHSIDE_BROKER_URL` in `.env.deploy`, then open the integration setup wizard. Choose OpenRouter, keep the ID `openrouter`, and enter its upstream API key when prompted. The command runs the management CLI with the admin key from `.env.deploy`, and lets the issuer mint grants for the new integration unless you pass `--no-allow-issue`.
+From the deployment checkout, open the integration setup wizard. Choose OpenRouter, keep the ID `openrouter`, and enter its upstream API key when prompted. The command runs the management CLI with the URL and the admin key referenced from `.env.deploy`, and lets the issuer mint grants for the new integration unless you pass `--no-allow-issue`.
 
 ```sh
 bun run broker status
 bun run broker integration setup
 ```
 
-The integration ID is the name a sandbox uses to request access. Enter a unique ID for a second key of the same provider. Add `--json` to write the integration metadata to stdout. You can also pass `--url` for one command, or set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` in the environment. The separately installed `beachside-broker` CLI and `beachside broker` in the Beachside CLI run the same commands.
+The integration ID is the name a sandbox uses to request access. Enter a unique ID for a second key of the same provider. Add `--json` to write the integration metadata to stdout. You can also pass `--url` for one command, or set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ADMIN_KEY` in the environment. With no key configured, the command asks for it at the terminal and keeps it for that run only; without a terminal it stops with an error. The separately installed `beachside-broker` CLI and `beachside broker` in the Beachside CLI run the same commands.
 
 The issuance allowlist decides which integrations the issuer can mint grants for. `integration create --allow-issue` and the setup wizard add the new integration. Change it one ID at a time, or replace the whole list.
 
@@ -136,7 +132,7 @@ bun run broker grant revoke GRANT_ID
 
 Use the base URL for each integration as the client's API base and the token as its API key. The broker reports each integration's kind, so the URL already maps to the upstream base for built-in and configurable integrations. Grants default to 15 minutes. `--ttl` takes seconds or a number with `s`, `m`, `h` or `d`, up to `7d`. `--token` prints only the token and `--json` the full record. Keep the output private.
 
-`grant list` shows the issuer's active grants with their integrations, label, expiry, request count and last use. `grant list --all` uses the admin key to show every grant and its issuing authority. Grant commands use `BROKER_ISSUER_KEY` from `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`.
+`grant list` shows the issuer's active grants with their integrations, label, expiry, request count and last use. `grant list --all` uses the admin key to show every grant and its issuing authority. Grant commands use the `BROKER_ISSUER_KEY` reference in `.env.deploy`. For the installed CLI, set `BEACHSIDE_BROKER_URL` and `BEACHSIDE_BROKER_ISSUER_KEY`, as the key or a reference.
 
 Create integrations with kind `github`, `anthropic`, `openai`, `openrouter`, or `http`. Kind and upstream destination are fixed for an integration's lifetime. The broker supports up to 100 names per deployment and multiple GitHub integrations. One grant can use at most one GitHub integration. A GitHub grant delegates the upstream token's Git and GraphQL access. Use upstream tokens with the repository scope and operations the sandbox needs.
 
@@ -200,7 +196,7 @@ The admin create API takes the same JSON plus `"id": "gateway-work"` and `"kind"
 
 Update the admin client and CLI before creating HTTP integrations. An older admin client rejects metadata for this new kind.
 
-To rotate one or more headers, pipe in a JSON map that contains only the replacement values. The admin rotate API receives `{ "source": "encrypted-store", "values": {...} }`. Use `--secret-stdin` or `--worker-secret` for the built-in kinds. Omitted HTTP secret headers keep their current values and existing grants remain valid. For root key rotation, provide every secret value from its original source or rotate it to a fresh upstream value. An endpoint with no secret headers can be re-encrypted with an empty map.
+To rotate one or more headers, pipe in a JSON map that contains only the replacement values. The admin rotate API receives `{ "source": "encrypted-store", "values": {...} }`. Use `--secret-stdin` or `--worker-secret` for the built-in kinds. Omitted HTTP secret headers keep their current values and existing grants remain valid. After an encryption key rotation, provide every secret value from its original source or rotate it to a fresh upstream value. An endpoint with no secret headers can be re-encrypted with an empty map.
 
 ```sh
 node dist/cli.js integration rotate gateway-work --credentials-stdin < /secure/path/replacement-headers.json
@@ -210,9 +206,24 @@ A grant can call HTTP paths beneath the configured base. For example, a request 
 
 The broker blocks redirects, WebSocket upgrades, and CONNECT, TRACE, and TRACK. Paths reject encoded separators, double slashes, matrix parameters, and segments ending in a dot or whitespace. The HTTP gateway supports server-sent events and streaming bodies. Response filtering removes cookies, redirect targets, and configured secret header names. It also removes headers that match a raw secret, contain a prefixed secret, or contain a raw secret of at least eight characters. This filtering is best effort. Use trusted upstreams that keep credentials out of responses.
 
-### Rotate an encryption key
+### Rotate keys
 
-Deploy `BROKER_ENCRYPTION_KEYS` with both the previous and new keys while keeping the old version active. After that deployment has rolled out, switch `BROKER_ENCRYPTION_KEY_VERSION` to the new version and deploy again. Rotate each encrypted integration using its upstream credential from the original source or a new upstream credential. Every successful rotation writes with the active version and a fresh nonce. Remove a previous key from the Worker only after rotating the integrations encrypted with it. Keep secure recovery copies for as long as database backups may contain those ciphertexts. Losing an old key makes records written with it unrecoverable. Always use a new label for new key material.
+Deploys never change the broker's keys. To replace the admin or issuer key, generate a new value with `node -p 'require("node:crypto").randomBytes(32).toString("base64url")'`, paste it into Wrangler's prompt, then update it in your password manager and on every machine that uses it.
+
+```sh
+bun run --cwd services/credential-broker wrangler secret put BROKER_ISSUER_KEY
+```
+
+The admin, issuer and encryption keys must be distinct, 32–256 base64url characters each.
+
+The Worker holds the only copy of the encryption key. To replace it, upload a keyring with only a new key under a new version label, then rotate every encrypted integration with its upstream credential. Integrations fail until they are rotated, because the old key is gone. Every successful rotation writes with the active version and a fresh nonce.
+
+```sh
+printf '{"BROKER_ENCRYPTION_KEYS":"{\\"v2\\":\\"%s\\"}","BROKER_ENCRYPTION_KEY_VERSION":"v2"}' \
+  "$(node -p 'require("node:crypto").randomBytes(32).toString("base64url")')" |
+  bun run --cwd services/credential-broker wrangler secret bulk
+bun run broker integration rotate openrouter --credentials-stdin < /secure/path/replacement-headers.json
+```
 
 ## Authenticate grant issuance
 

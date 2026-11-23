@@ -1,13 +1,17 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { generateDeploymentFile, loadDeploymentFile, setupError } from "./deployment-file";
+import {
+  generateKeys,
+  keySecrets,
+  loadDeploymentFile,
+  plaintextKeys,
+  saveBrokerURL,
+  setupError,
+} from "./deployment-file";
 import { CredentialBrokerError } from "../src/transport.js";
-import { assertSeparateRoleKeys } from "../services/credential-broker/src/auth";
-import { isBrokerApiKey } from "../services/credential-broker/src/auth/api-key";
 import { parseConfig } from "../services/credential-broker/src/config";
 import { credentialValue } from "../services/credential-broker/src/credentials/source";
-import { encryptionKeyring } from "../services/credential-broker/src/credentials/sources/encrypted-store";
 import {
   traceAuthorization,
   traceEndpoint,
@@ -16,13 +20,6 @@ import {
 const repository = resolve(import.meta.dir, "..");
 
 const servicePath = "services/credential-broker";
-
-const brokerSecrets = [
-  "BROKER_ADMIN_KEY",
-  "BROKER_ISSUER_KEY",
-  "BROKER_ENCRYPTION_KEYS",
-  "BROKER_ENCRYPTION_KEY_VERSION",
-];
 
 const environmentFile = ".env.deploy";
 
@@ -47,49 +44,17 @@ function alchemyEnvironment(
   return env;
 }
 
-function workerSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
+/** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
+function settingSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
   const {
-    BROKER_ADMIN_KEY: admin,
-    BROKER_ISSUER_KEY: issuer,
-    BROKER_ENCRYPTION_KEYS: encoded,
-    BROKER_ENCRYPTION_KEY_VERSION: active,
     BROKER_OTLP_TRACES_ENDPOINT: traceUrl,
     BROKER_OTLP_AUTHORIZATION: collectorAuthorization,
   } = env;
 
-  if (
-    !isBrokerApiKey(admin) ||
-    (issuer !== undefined && !isBrokerApiKey(issuer)) ||
-    !encoded ||
-    !active
-  )
-    return setupError(
-      "Configure valid broker role keys and an encryption keyring in .env.deploy or the environment",
-    );
-
-  const deployment = new Map([
-    ["BROKER_ADMIN_KEY", admin],
-    ["BROKER_ENCRYPTION_KEYS", encoded],
-    ["BROKER_ENCRYPTION_KEY_VERSION", active],
-  ]);
-
-  if (issuer) deployment.set("BROKER_ISSUER_KEY", issuer);
+  const deployment = new Map<string, string>();
 
   try {
     const config = parseConfig(env.BROKER_CONFIG ?? "{}");
-
-    const keyring = encryptionKeyring({
-      BROKER_ENCRYPTION_KEYS: encoded,
-      BROKER_ENCRYPTION_KEY_VERSION: active,
-    });
-
-    assertSeparateRoleKeys(
-      { BROKER_ADMIN_KEY: admin, BROKER_ISSUER_KEY: issuer },
-      keyring.keys.values(),
-    );
-
-    if (!issuer && !config.githubActions)
-      return setupError("Configure a broker issuer key, GitHub Actions OIDC, or both");
     deployment.set("BROKER_CONFIG", JSON.stringify(config));
 
     for (const name of config.workerSecretBindings) {
@@ -112,9 +77,7 @@ function workerSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
   } catch (error) {
     if (error instanceof CredentialBrokerError) throw error;
 
-    return setupError(
-      "Invalid broker policy, encryption keyring, role key separation, or trace configuration",
-    );
+    return setupError("Invalid broker policy or trace configuration");
   }
 
   return Object.fromEntries(deployment);
@@ -123,34 +86,48 @@ function workerSecrets(env: NodeJS.ProcessEnv): Record<string, string> {
 /** Cloudflare's reply when Wrangler reads back a Worker its first upload just created. */
 const firstDeployRace = /code: 10007\]/;
 
+interface Run {
+  /** Sees stdout and stderr as they are forwarded. */
+  watch?: (text: string) => void;
+  /** Captures stdout instead of forwarding it. */
+  capture?: boolean;
+}
+
 async function runCommand(
   root: string,
   env: NodeJS.ProcessEnv,
   args: string[],
-  onError?: (text: string) => void,
-): Promise<number> {
+  { watch, capture }: Run = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const piped = Boolean(watch || capture);
+
   const child = Bun.spawn([process.execPath, "run", ...args], {
     cwd: resolve(root, servicePath),
     env,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: onError ? "pipe" : "inherit",
+    stdin: capture ? "ignore" : "inherit",
+    stdout: piped ? "pipe" : "inherit",
+    stderr: piped ? "pipe" : "inherit",
   });
 
-  // Forward stderr as it arrives while letting the caller look for a known failure.
-  const stderr = child.stderr;
+  const output = { stdout: "", stderr: "" };
 
-  const forwarded =
-    onError && stderr
-      ? (async () => {
-          const decoder = new TextDecoder();
+  const forward = async (
+    stream: ReadableStream<Uint8Array> | number | undefined,
+    name: "stdout" | "stderr",
+  ) => {
+    if (!(stream instanceof ReadableStream)) return;
+    const decoder = new TextDecoder();
 
-          for await (const chunk of stderr) {
-            process.stderr.write(chunk);
-            onError(decoder.decode(chunk, { stream: true }));
-          }
-        })()
-      : undefined;
+    for await (const chunk of stream) {
+      const text = decoder.decode(chunk, { stream: true });
+
+      if (capture) output[name] += text;
+      else process[name].write(chunk);
+      watch?.(text);
+    }
+  };
+
+  const forwarded = Promise.all([forward(child.stdout, "stdout"), forward(child.stderr, "stderr")]);
 
   const interrupt = () => {
     child.kill("SIGINT");
@@ -167,20 +144,18 @@ async function runCommand(
     const code = await child.exited;
     await forwarded;
 
-    return code;
+    return { code, ...output };
   } finally {
     process.off("SIGINT", interrupt);
     process.off("SIGTERM", terminate);
   }
 }
 
-async function deployWrangler(
-  root: string,
+/** The environment Wrangler runs with: Cloudflare account settings, but no broker settings. */
+function wranglerEnvironment(
   inherited: NodeJS.ProcessEnv,
   settings: NodeJS.ProcessEnv,
-  args: string[],
-): Promise<number> {
-  const secrets = workerSecrets(settings);
+): NodeJS.ProcessEnv {
   const env = { ...inherited };
 
   for (const name of Object.keys(env)) {
@@ -191,6 +166,50 @@ async function deployWrangler(
 
   if (settings.CLOUDFLARE_ACCOUNT_ID) env.CLOUDFLARE_ACCOUNT_ID = settings.CLOUDFLARE_ACCOUNT_ID;
 
+  return env;
+}
+
+/** Names of the secrets the deployed Worker has, or none when it does not exist yet. */
+async function workerSecretNames(root: string, env: NodeJS.ProcessEnv): Promise<Set<string>> {
+  const { code, stdout, stderr } = await runCommand(
+    root,
+    env,
+    ["wrangler", "secret", "list", "--format", "json"],
+    { capture: true },
+  );
+
+  if (code !== 0) {
+    if (/not found/i.test(stderr + stdout)) return new Set();
+    process.stderr.write(stderr);
+
+    return setupError("Could not read the Worker's secrets. Check `wrangler login` and try again");
+  }
+
+  try {
+    const listed: { name: string }[] = JSON.parse(stdout.slice(stdout.indexOf("[")));
+
+    return new Set(listed.map((secret) => secret.name));
+  } catch {
+    return setupError("Could not read the Worker's secrets from Wrangler's output");
+  }
+}
+
+/** The origin Wrangler printed for the deployed Worker. */
+function deployedOrigin(output: string): string | undefined {
+  const workersDev = /https:\/\/[\w.-]+\.workers\.dev\b/.exec(output)?.[0];
+
+  if (workersDev) return workersDev;
+  const custom = /^\s*([\w.-]+\.[a-z]{2,}) \(custom domain\)\s*$/im.exec(output)?.[1];
+
+  return custom && `https://${custom}`;
+}
+
+async function deployWrangler(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  secrets: Record<string, string>,
+  args: string[],
+): Promise<{ code: number; url?: string }> {
   const directory = mkdtempSync(resolve(tmpdir(), "broker-wrangler-"));
 
   try {
@@ -200,23 +219,90 @@ async function deployWrangler(
     const command = ["deploy:wrangler", ...args, "--secrets-file", path];
     let raced = false;
     let tail = "";
+    let printed = "";
 
-    const code = await runCommand(root, env, command, (text) => {
+    const watch = (text: string) => {
       tail = (tail + text).slice(-512);
+      printed = (printed + text).slice(-16_384);
       raced ||= firstDeployRace.test(tail);
-    });
+    };
 
-    if (code === 0 || !raced) return code;
+    let { code } = await runCommand(root, env, command, { watch });
 
-    // A Worker's first deploy can upload, then fail to read itself back while the Workers API
-    // catches up. The upload landed, so one more deploy finishes it.
-    console.info("Cloudflare had not registered the new Worker yet. Deploying again.");
-    await Bun.sleep(5_000);
+    if (code !== 0 && raced) {
+      // A Worker's first deploy can upload, then fail to read itself back while the Workers API
+      // catches up. The upload landed, so one more deploy finishes it.
+      console.info("Cloudflare had not registered the new Worker yet. Deploying again.");
+      await Bun.sleep(5_000);
+      ({ code } = await runCommand(root, env, command, { watch }));
+    }
 
-    return await runCommand(root, env, command);
+    return { code, url: deployedOrigin(printed) };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+function printKeys(keys: ReturnType<typeof generateKeys>) {
+  console.info(
+    [
+      "",
+      "Save these two keys in your password manager now. They are not stored anywhere else.",
+      "",
+      `  BROKER_ADMIN_KEY=${keys.BROKER_ADMIN_KEY}`,
+      `  BROKER_ISSUER_KEY=${keys.BROKER_ISSUER_KEY}`,
+      "",
+      "Then point .env.deploy at them, for example:",
+      "",
+      "  BROKER_ADMIN_KEY=op://Private/beachside-broker/admin",
+      "  BROKER_ISSUER_KEY=op://Private/beachside-broker/issuer",
+      "",
+      "bws://<secret-id>, pass://<path> and env:NAME references work too.",
+      "The encryption key went straight to the Worker and is not shown.",
+    ].join("\n"),
+  );
+}
+
+async function setup(
+  envPath: string,
+  inherited: NodeJS.ProcessEnv,
+  file: NodeJS.ProcessEnv | undefined,
+  settings: NodeJS.ProcessEnv,
+): Promise<number> {
+  if (keySecrets.some((name) => file?.[name] || inherited[name]))
+    return setupError(
+      "Broker keys are already configured, so this broker has been set up. Update it with bun run deploy",
+    );
+  const secrets = settingSecrets(settings);
+  const env = wranglerEnvironment(inherited, settings);
+
+  if ((await workerSecretNames(repository, env)).has("BROKER_ENCRYPTION_KEYS"))
+    return setupError(
+      "The broker Worker already has its keys. Update it with bun run deploy; setup never replaces them",
+    );
+  const keys = generateKeys();
+  const { code, url } = await deployWrangler(repository, env, { ...secrets, ...keys }, []);
+
+  if (code !== 0) {
+    console.error(
+      "Deploy failed, so the new keys were discarded. Fix the error above and run bun run deploy:setup again. If setup then says the Worker already has keys, delete the new Worker with `bun run --cwd services/credential-broker wrangler delete` first.",
+    );
+
+    return code;
+  }
+
+  const origin = settings.BEACHSIDE_BROKER_URL ?? url;
+
+  console.info(
+    origin && saveBrokerURL(envPath, origin)
+      ? `Deployed ${origin} and saved it to .env.deploy.`
+      : origin
+        ? `Deployed ${origin}.`
+        : "Deployed. Save the HTTPS origin Wrangler printed as BEACHSIDE_BROKER_URL in .env.deploy.",
+  );
+  printKeys(keys);
+
+  return 0;
 }
 
 async function deploy() {
@@ -235,21 +321,16 @@ async function deploy() {
       firstArgument === "-h" ||
       (!alchemy && firstArgument === "--dry-run"))
   )
-    return runCommand(repository, inherited, [alchemy ? "deploy" : "deploy:wrangler", ...args]);
+    return (
+      await runCommand(repository, inherited, [alchemy ? "deploy" : "deploy:wrangler", ...args])
+    ).code;
   const file = loadDeploymentFile(envPath);
 
   if (alchemy)
-    return runCommand(repository, alchemyEnvironment(inherited, file), ["deploy", ...args]);
+    return (await runCommand(repository, alchemyEnvironment(inherited, file), ["deploy", ...args]))
+      .code;
 
-  if (setupOnly) {
-    if (args.length !== 1) return setupError("bun run deploy:setup takes no options");
-
-    if (file) {
-      console.info("Keeping the existing .env.deploy.");
-
-      return 0;
-    }
-  }
+  if (setupOnly && args.length !== 1) return setupError("bun run deploy:setup takes no options");
 
   if (
     args.some((argument) => argument === "--secrets-file" || argument.startsWith("--secrets-file="))
@@ -268,36 +349,38 @@ async function deploy() {
       "Existing Alchemy deployment detected. Use bun run deploy:alchemy to retain its Worker and state",
     );
 
-  if (setupOnly) {
-    if (brokerSecrets.some((name) => inherited[name]))
-      return setupError(
-        "Broker settings already exist in the environment. Retain and reuse those keys",
-      );
-    const created = generateDeploymentFile(envPath);
-    console.info(
-      created
-        ? "Saved .env.deploy. Keep it private and back up its keys securely."
-        : "Keeping the existing .env.deploy.",
+  if (setupOnly) return setup(envPath, inherited, file, settings);
+
+  const plaintext = plaintextKeys(file);
+
+  if (plaintext.length)
+    console.warn(
+      `.env.deploy holds ${plaintext.join(", ")} in plaintext. Deploys never upload keys, so save them in your password manager, replace each value with a reference such as op://Private/beachside-broker/admin, and delete BROKER_ENCRYPTION_KEYS.`,
     );
 
-    return 0;
+  const secrets = settingSecrets(settings);
+  const env = wranglerEnvironment(inherited, settings);
+
+  if (!args.includes("--dry-run")) {
+    const existing = await workerSecretNames(repository, env);
+
+    if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
+      return setupError("This broker has not been set up yet. Run bun run deploy:setup first");
   }
 
-  if (!file && !hasBrokerCredentials(inherited))
-    return setupError(
-      "Run bun run deploy:setup or supply the existing broker settings before deploying",
-    );
+  const { code, url } = await deployWrangler(repository, env, secrets, args);
 
-  const status = await deployWrangler(repository, inherited, settings, args);
+  if (code === 0 && !args.includes("--dry-run")) {
+    const saved = !settings.BEACHSIDE_BROKER_URL && url && saveBrokerURL(envPath, url);
 
-  if (status === 0 && !args.includes("--dry-run"))
     console.info(
-      settings.BEACHSIDE_BROKER_URL
-        ? "Deployed. Check it with `bun run broker status`, then add an integration with `bun run broker integration setup`."
-        : "Deployed. Save the HTTPS origin Wrangler printed as BEACHSIDE_BROKER_URL in .env.deploy, then run `bun run broker status` and `bun run broker integration setup`.",
+      settings.BEACHSIDE_BROKER_URL || saved
+        ? `Deployed${saved ? ` ${url} and saved it to .env.deploy` : ""}. Check it with \`bun run broker status\`.`
+        : "Deployed. Save the HTTPS origin Wrangler printed as BEACHSIDE_BROKER_URL in .env.deploy, then run `bun run broker status`.",
     );
+  }
 
-  return status;
+  return code;
 }
 
 if (import.meta.main) {

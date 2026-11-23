@@ -24,7 +24,7 @@ const grant = {
   integrations: ["openrouter"],
 };
 
-test("checkout command runs the Node CLI with the selected HTTPS origin and its protected admin key", async () => {
+test("checkout command runs the Node CLI with the selected HTTPS origin and keys referenced from .env.deploy", async () => {
   const project = resolve(import.meta.dir, "..");
   const root = mkdtempSync(join(tmpdir(), "broker-checkout-cli-"));
 
@@ -41,8 +41,16 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       join(root, "package.json"),
       JSON.stringify({ version: "9.9.9-test", scripts: { broker: "bun scripts/broker.ts" } }),
     );
+    // A stand-in 1Password CLI, so keys in .env.deploy can be references.
+    mkdirSync(join(root, "bin"));
+    writeFileSync(
+      join(root, "bin/op"),
+      `#!/bin/sh\ncase "$3" in\n  op://Private/broker/admin) printf %s ${adminKey} ;;\n  op://Private/broker/issuer) printf %s ${issuerKey} ;;\n  *) echo "no item $3" >&2; exit 1 ;;\nesac\n`,
+      { mode: 0o755 },
+    );
+    const PATH = `${join(root, "bin")}:${process.env.PATH}`;
     const secretFile = join(root, ".env.deploy");
-    const settings = `BROKER_ADMIN_KEY=${adminKey}\n`;
+    const settings = "BROKER_ADMIN_KEY=op://Private/broker/admin\n";
     writeFileSync(secretFile, settings, { mode: 0o600 });
     const key = join(root, "key.pem");
     const cert = join(root, "cert.pem");
@@ -184,7 +192,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       const run = async (args: string[], env: NodeJS.ProcessEnv = {}) => {
         const child = Bun.spawn([process.execPath, "run", "broker", ...args], {
           cwd: root,
-          env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: cert, ...env },
+          env: { PATH, NODE_EXTRA_CA_CERTS: cert, ...env },
           stdin: "ignore",
           stdout: "pipe",
           stderr: "pipe",
@@ -263,7 +271,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
           ],
           {
             cwd: root,
-            env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: cert, FIXTURE_STDOUT: stdoutFile },
+            env: { PATH, NODE_EXTRA_CA_CERTS: cert, FIXTURE_STDOUT: stdoutFile },
             terminal: {
               cols: 110,
               data(terminal, bytes) {
@@ -311,7 +319,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       expect(requests).toHaveLength(beforeGrants);
       writeFileSync(
         secretFile,
-        `${settings}BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=${issuerKey}\n`,
+        `${settings}BEACHSIDE_BROKER_URL=${origin}\nBROKER_ISSUER_KEY=op://Private/broker/issuer\n`,
       );
 
       const issued = await run(["--url", origin, ...issue, "--json"], {
@@ -383,6 +391,7 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and its 
       const missingAdmin = await run(list, { BEACHSIDE_BROKER_ISSUER_KEY: issuerKey });
       expect(missingAdmin.status).toBe(2);
       expect(missingAdmin.stderr).toContain("admin key");
+      expect(missingAdmin.stderr).toContain("BROKER_ISSUER_KEY in plaintext");
       expect(requests).toHaveLength(beforeInvalid);
       // With only an issuer key, status reports the issuer role instead of asking for the admin key.
       const issuerStatus = await run(["status", "--json"]);

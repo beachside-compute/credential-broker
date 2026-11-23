@@ -15,28 +15,30 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
 
    On a remote machine, run `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code.
 
-2. Generate separate admin, issuer, and encryption keys in `.env.deploy`. Keep this file private and back up its keys securely. Rerunning setup keeps an existing file.
+2. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname) in `wrangler.jsonc`.
+
+3. Deploy the broker for the first time.
 
    ```sh
    bun run deploy:setup
    ```
 
-3. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname) in `wrangler.jsonc`.
+   Setup generates the admin, issuer and encryption keys in memory, uploads them as Worker secrets, and saves the broker's URL to `.env.deploy`. It prints the admin and issuer keys once. Save them in your password manager, then reference them from `.env.deploy`:
 
-4. Deploy and copy the HTTPS URL Wrangler prints.
-
-   ```sh
-   bun run deploy
+   ```dotenv
+   BROKER_ADMIN_KEY=op://Private/beachside-broker/admin
+   BROKER_ISSUER_KEY=op://Private/beachside-broker/issuer
    ```
 
-Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
+   `bws://<secret-id>`, `pass://<path>` and `env:NAME` references work too. The encryption key goes straight to the Worker and is never shown. Setup refuses to run against a Worker that already has keys.
+
+Later deploys run `bun run deploy`. They update the code and settings such as `BROKER_CONFIG`, and never upload keys. Use `bun run deploy:alchemy` for an existing Alchemy deployment. For automated deployment, raw Wrangler commands, or local Worker development, see the [deployment runbook](./services/credential-broker/README.md#deploy).
 
 ## Add an OpenRouter key
 
-Save the deployed origin in `.env.deploy` so later commands can find it, then check the broker and your key.
+Check the broker and your admin key.
 
 ```sh
-echo 'BEACHSIDE_BROKER_URL=https://your-broker.example.com' >> .env.deploy
 bun run broker status
 ```
 
@@ -48,7 +50,7 @@ bun run broker integration setup
 
 The integration ID is the name a sandbox uses to request access. Use a unique ID such as `openrouter-team` when you add a second key for the same provider. The same command offers other model gateways and custom HTTPS endpoints. See the [endpoint runbook](./services/credential-broker/README.md#configurable-https-endpoints) for unattended setup.
 
-The checkout command reads the admin and issuer keys from `.env.deploy`. On another machine, install the CLI with `npm install -g @beachside/credential-client` and set `BEACHSIDE_BROKER_URL` with `BEACHSIDE_BROKER_ADMIN_KEY` or `BEACHSIDE_BROKER_ISSUER_KEY`. The Beachside CLI also runs these commands as `beachside broker ...` with keys from its config.
+The checkout command reads the URL and key references from `.env.deploy`. On another machine, install the CLI with `npm install -g @beachside/credential-client` and set `BEACHSIDE_BROKER_URL` with `BEACHSIDE_BROKER_ADMIN_KEY` or `BEACHSIDE_BROKER_ISSUER_KEY`. Each key can be the value or a reference such as `op://Private/beachside-broker/issuer`. When no key is configured, both commands ask for it at the terminal and use it for that run only. The Beachside CLI also runs these commands as `beachside broker ...` with keys from its config.
 
 ### Issue a grant
 

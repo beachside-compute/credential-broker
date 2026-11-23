@@ -38,3 +38,44 @@ test("reports usage errors with the embedding prefix and the shared exit codes",
   expect(await runBrokerCli(["--version", "--json"], io)).toBe(0);
   expect(JSON.parse(out.at(-1)!)).toHaveProperty("version");
 });
+
+test("asks for the key a command needs when no setting supplies it", async () => {
+  const seen: (string | null)[] = [];
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      seen.push(request.headers.get("authorization"));
+
+      return new URL(request.url).pathname === "/v1/grants"
+        ? Response.json({ grants: [] })
+        : Response.json({ apiVersion: 2, role: "admin", limits: { maxGrantTtlSeconds: 604_800 } });
+    },
+  });
+
+  try {
+    const asked: string[] = [];
+
+    const io = {
+      env: { BEACHSIDE_BROKER_URL: `http://127.0.0.1:${server.port}` },
+      stdout: () => {},
+      stderr: () => {},
+      promptKey: async (role: "admin" | "issuer") => {
+        asked.push(role);
+
+        return `typed-${role}-key-${"k".repeat(32)}`;
+      },
+    };
+
+    expect(await runBrokerCli(["status"], io)).toBe(0);
+    expect(await runBrokerCli(["grant", "list"], io)).toBe(0);
+    expect(asked).toEqual(["admin", "issuer"]);
+    expect(seen).toEqual([
+      `Bearer typed-admin-key-${"k".repeat(32)}`,
+      `Bearer typed-issuer-key-${"k".repeat(32)}`,
+    ]);
+  } finally {
+    await server.stop(true);
+  }
+});

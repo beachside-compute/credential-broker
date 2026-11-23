@@ -1,6 +1,15 @@
 import { randomBytes } from "node:crypto";
-import { constants, closeSync, fstatSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  constants,
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { parseEnv } from "node:util";
+import { isSecretReference } from "../src/secret-ref.js";
 import { CredentialBrokerError } from "../src/transport.js";
 
 export function setupError(message: string): never {
@@ -38,32 +47,60 @@ function randomKey(): string {
   return Buffer.from(randomBytes(32)).toString("base64url");
 }
 
-export function generateDeploymentFile(path: string): boolean {
-  if (loadDeploymentFile(path)) return false;
+/** Fresh, independent broker keys, held only in memory until the first deploy uploads them. */
+export function generateKeys(): Record<(typeof keySecrets)[number], string> {
+  const version = "v1";
 
-  const active = "v1";
+  return {
+    BROKER_ADMIN_KEY: randomKey(),
+    BROKER_ISSUER_KEY: randomKey(),
+    BROKER_ENCRYPTION_KEYS: JSON.stringify({ [version]: randomKey() }),
+    BROKER_ENCRYPTION_KEY_VERSION: version,
+  };
+}
 
-  const contents = [
-    "# Private deployment configuration. Back up the broker keys securely.",
-    `BROKER_ADMIN_KEY=${randomKey()}`,
-    `BROKER_ISSUER_KEY=${randomKey()}`,
-    `BROKER_ENCRYPTION_KEYS='${JSON.stringify({ [active]: randomKey() })}'`,
-    `BROKER_ENCRYPTION_KEY_VERSION=${active}`,
-    "",
-  ].join("\n");
+/** The Worker secrets that only the first deploy sets. */
+export const keySecrets = [
+  "BROKER_ADMIN_KEY",
+  "BROKER_ISSUER_KEY",
+  "BROKER_ENCRYPTION_KEYS",
+  "BROKER_ENCRYPTION_KEY_VERSION",
+] as const;
+
+/** Keys an older setup saved in the file as values rather than references. */
+export function plaintextKeys(file: NodeJS.ProcessEnv | undefined): string[] {
+  return keySecrets.filter((name) => {
+    const value = file?.[name];
+
+    return (
+      value !== undefined && name !== "BROKER_ENCRYPTION_KEY_VERSION" && !isSecretReference(value)
+    );
+  });
+}
+
+/** Records the broker's origin in the file, creating it if needed. An existing URL is kept. */
+export function saveBrokerURL(path: string, url: string): boolean {
+  const file = loadDeploymentFile(path);
+
+  if (file?.BEACHSIDE_BROKER_URL) return false;
 
   try {
-    writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      "code" in error &&
-      error.code === "EEXIST" &&
-      loadDeploymentFile(path)
-    )
-      return false;
-
-    return setupError("Could not create .env.deploy. Check the path and permissions");
+    if (file) {
+      const text = readFileSync(path, "utf8");
+      appendFileSync(
+        path,
+        `${text && !text.endsWith("\n") ? "\n" : ""}BEACHSIDE_BROKER_URL=${url}\n`,
+      );
+    } else
+      writeFileSync(
+        path,
+        `# Broker settings. Keys belong in your password manager; reference them with op://, bws://, pass:// or env:NAME.\nBEACHSIDE_BROKER_URL=${url}\n`,
+        { flag: "wx", mode: 0o600 },
+      );
+  } catch {
+    return setupError(
+      "Could not save BEACHSIDE_BROKER_URL to .env.deploy. Check the path and permissions",
+    );
   }
 
   return true;

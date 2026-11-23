@@ -11,6 +11,7 @@ import {
   type BrokerWorkflowPolicy,
 } from "./admin.js";
 import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
+import { resolveSecret } from "./secret-ref.js";
 import type { BrokerGrantSummary } from "./grants.js";
 import { createCredentialBroker, integrationBaseURL } from "./index.js";
 import { setupIntegration } from "./setup.js";
@@ -30,6 +31,8 @@ export interface CliIo {
   readonly stderr: (text: string) => void;
   /** The command prefix in help and hints, such as `beachside broker`. */
   readonly prefix?: string;
+  /** Asks for a key no setting supplies, when a person is at the terminal. */
+  readonly promptKey?: (role: "admin" | "issuer") => Promise<string | undefined>;
 }
 
 /** Exit codes shared with the `beachside` CLI. */
@@ -81,7 +84,8 @@ Options
   --json           Print JSON instead of text
   --version        Print the client version
 
-Keys come from BEACHSIDE_BROKER_ADMIN_KEY and BEACHSIDE_BROKER_ISSUER_KEY.
+Keys come from BEACHSIDE_BROKER_ADMIN_KEY and BEACHSIDE_BROKER_ISSUER_KEY, as values or
+env:NAME, op://, bws:// or pass:// references.
 Durations are seconds or a number with s, m, h or d, from 1s to 7d. Grants default to 15m.
 Pipe one credential to --secret-stdin. --config-stdin takes {"endpoint", "credential"} JSON,
 --credentials-stdin a JSON map of header names to replacement secrets.
@@ -527,32 +531,36 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
     const print = <Data extends object>(data: Data, text: string) =>
       io.stdout(json ? JSON.stringify(data) : text);
 
-    const adminKey = () => {
-      const value = io.env.BEACHSIDE_BROKER_ADMIN_KEY;
+    const roleKey = async (role: "admin" | "issuer") => {
+      const name = role === "admin" ? "BEACHSIDE_BROKER_ADMIN_KEY" : "BEACHSIDE_BROKER_ISSUER_KEY";
+      const value = io.env[name];
 
-      if (!value)
-        return usageError(
-          `${key} needs the admin key. Set BEACHSIDE_BROKER_ADMIN_KEY to BROKER_ADMIN_KEY from the deployment`,
-        );
+      if (value) return resolveSecret(value, name, io.env);
+      const entered = await io.promptKey?.(role);
 
-      return createCredentialBrokerAdmin({ url: base.origin, apiKey: value });
+      return (
+        entered ||
+        usageError(
+          `${key} needs the ${role} key. Set ${name} to the key or a reference such as op://Private/beachside-broker/${role}`,
+        )
+      );
     };
 
-    const issuer = () => {
-      const value = io.env.BEACHSIDE_BROKER_ISSUER_KEY;
+    const adminKey = async () =>
+      createCredentialBrokerAdmin({ url: base.origin, apiKey: await roleKey("admin") });
 
-      if (!value)
-        return usageError(
-          `${key} needs the issuer key. Set BEACHSIDE_BROKER_ISSUER_KEY to BROKER_ISSUER_KEY from the deployment`,
-        );
-
-      return createCredentialBroker({ url: base.origin, auth: { apiKey: value } });
-    };
+    const issuer = async () =>
+      createCredentialBroker({ url: base.origin, auth: { apiKey: await roleKey("issuer") } });
 
     switch (key) {
       case "status": {
         noPositionals(operands);
-        const client = io.env.BEACHSIDE_BROKER_ADMIN_KEY ? adminKey() : issuer();
+
+        const client =
+          io.env.BEACHSIDE_BROKER_ISSUER_KEY && !io.env.BEACHSIDE_BROKER_ADMIN_KEY
+            ? await issuer()
+            : await adminKey();
+
         const status = await client.status();
 
         print(
@@ -576,7 +584,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "config show": {
         noPositionals(operands);
-        const config = await adminKey().config();
+        const admin = await adminKey();
+        const config = await admin.config();
         const workflows = config.githubActions?.workflows ?? [];
 
         print(
@@ -597,7 +606,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration setup": {
         noPositionals(operands);
-        const admin = adminKey();
+        const admin = await adminKey();
         const config = await setupIntegration();
         const created = await admin.integrations.create(config);
 
@@ -623,7 +632,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration list": {
         noPositionals(operands);
-        const integrations = await adminKey().integrations.list();
+        const admin = await adminKey();
+        const integrations = await admin.integrations.list();
         print({ integrations }, integrationLines(integrations));
 
         return 0;
@@ -631,7 +641,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration show": {
         const [id] = integrationIds(operands, false);
-        const item = await adminKey().integrations.get(id!);
+        const admin = await adminKey();
+        const item = await admin.integrations.get(id!);
         print(item, integrationDetail(item));
 
         return 0;
@@ -639,7 +650,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration create": {
         const [id] = integrationIds(operands, false);
-        const admin = adminKey();
+        const admin = await adminKey();
         let input: BrokerIntegrationInput;
 
         if (values.provider === "http") {
@@ -677,7 +688,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration rotate": {
         const [id] = integrationIds(operands, false);
-        const admin = adminKey();
+        const admin = await adminKey();
         let rotated: BrokerIntegration;
 
         if (!values["credentials-stdin"]) {
@@ -704,7 +715,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
       case "integration disable": {
         const [id] = integrationIds(operands, false);
         const enabled = command === "enable";
-        const item = await adminKey().integrations.setEnabled(id!, enabled);
+        const admin = await adminKey();
+        const item = await admin.integrations.setEnabled(id!, enabled);
 
         print(
           item,
@@ -718,7 +730,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "integration delete": {
         const [id] = integrationIds(operands, false);
-        await adminKey().integrations.delete(id!);
+        const admin = await adminKey();
+        await admin.integrations.delete(id!);
         print({ deleted: true, id }, `Deleted ${id} and revoked its grants.`);
 
         return 0;
@@ -726,7 +739,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "issuer show": {
         noPositionals(operands);
-        const { integrations } = await adminKey().issuerPermissions.get();
+        const admin = await adminKey();
+        const { integrations } = await admin.issuerPermissions.get();
         print(
           { integrations },
           integrations.length
@@ -740,7 +754,7 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
       case "issuer allow":
       case "issuer deny": {
         const ids = integrationIds(operands, true);
-        const admin = adminKey();
+        const admin = await adminKey();
         let integrations: string[] = [];
 
         for (const id of ids) {
@@ -762,7 +776,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "issuer set": {
         const ids = operands.length ? integrationIds(operands, true) : [];
-        const { integrations } = await adminKey().issuerPermissions.set(ids);
+        const admin = await adminKey();
+        const { integrations } = await admin.issuerPermissions.set(ids);
         print(
           { integrations },
           integrations.length
@@ -776,7 +791,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
       case "grant issue": {
         const integrations = integrationIds(operands, true);
         const ttlSeconds = values.ttl === undefined ? 900 : parseDuration(values.ttl);
-        const grant = await issuer().issue({ integrations, ttlSeconds, label: values.label });
+        const broker = await issuer();
+        const grant = await broker.issue({ integrations, ttlSeconds, label: values.label });
 
         if (values.token) {
           io.stdout(grant.token);
@@ -809,7 +825,11 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "grant list": {
         noPositionals(operands);
-        const grants = values.all ? await adminKey().grants.list() : await issuer().list();
+
+        const grants = values.all
+          ? await (await adminKey()).grants.list()
+          : await (await issuer()).list();
+
         print({ grants }, grantLines(grants, Boolean(values.all)));
 
         return 0;
@@ -818,7 +838,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
       case "grant renew": {
         if (operands.length !== 1) return usageError("Pass exactly one grant ID");
         const ttlSeconds = values.ttl === undefined ? 900 : parseDuration(values.ttl);
-        const renewed = await issuer().renew(operands[0]!, ttlSeconds);
+        const broker = await issuer();
+        const renewed = await broker.renew(operands[0]!, ttlSeconds);
         print(
           renewed,
           `Renewed ${renewed.id}. It now expires ${renewed.expiresAt} (${until(renewed.expiresAt)}).`,
@@ -829,7 +850,8 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
 
       case "grant revoke": {
         if (operands.length !== 1) return usageError("Pass exactly one grant ID");
-        await issuer().revoke(operands[0]!);
+        const broker = await issuer();
+        await broker.revoke(operands[0]!);
         print({ revoked: true, id: operands[0] }, `Revoked ${operands[0]}.`);
 
         return 0;

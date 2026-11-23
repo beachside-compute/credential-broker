@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { CredentialBrokerError } from "../src/transport.js";
-import { loadDeploymentFile, setupError } from "./deployment-file";
+import { loadDeploymentFile, plaintextKeys, setupError } from "./deployment-file";
 
 const root = resolve(import.meta.dir, "..");
 
@@ -81,6 +81,12 @@ async function broker() {
 
   if (!help && !version) {
     const file = loadDeploymentFile(resolve(root, ".env.deploy"));
+    const plaintext = plaintextKeys(file);
+
+    if (plaintext.length)
+      console.warn(
+        `.env.deploy holds ${plaintext.join(", ")} in plaintext. Save the keys in your password manager and replace each value with a reference such as op://Private/beachside-broker/admin.`,
+      );
     const admin = file?.BROKER_ADMIN_KEY ?? fromEnv.admin;
     const issuer = file?.BROKER_ISSUER_KEY ?? fromEnv.issuer;
 
@@ -103,15 +109,18 @@ async function broker() {
     const url =
       selectedURL ?? file?.BEACHSIDE_BROKER_URL ?? (keyFromFile ? undefined : fromEnv.url);
 
-    if (!url || !key)
+    if (!url)
       return setupError(
-        keyFromFile && fromEnv.url && !url
+        keyFromFile && fromEnv.url
           ? "The key in .env.deploy is only sent to the BEACHSIDE_BROKER_URL in that file. Add it there, or pass --url"
-          : `Run bun run broker --url https://your-broker.example.com <command> with your ${role} key in .env.deploy or the environment`,
+          : "Run bun run deploy:setup to save the broker's URL in .env.deploy, or pass --url https://your-broker.example.com",
       );
 
     env.BEACHSIDE_BROKER_URL = url;
-    env[role === "issuer" ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY"] = key;
+
+    // Without a key, the CLI asks for one at a terminal.
+    if (key)
+      env[role === "issuer" ? "BEACHSIDE_BROKER_ISSUER_KEY" : "BEACHSIDE_BROKER_ADMIN_KEY"] = key;
   }
 
   const node = Bun.which("node");
