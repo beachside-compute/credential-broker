@@ -2,6 +2,19 @@
 
 A self-hosted credential broker for AI sandboxes. The Worker stores encrypted upstream credentials and issues short-lived grants scoped to named integrations, so your real keys never reach the sandbox or the sandbox provider. The credential client and management CLI work with Beachside and standalone orchestrators.
 
+## Install the agent skills
+
+Run this from the trusted operator or launcher project where you use your coding agent:
+
+```sh
+npx skills add beachside-compute/credential-broker --skill broker-setup --skill broker-grants
+```
+
+- [`broker-setup`](./skills/broker-setup/SKILL.md) guides a trusted operator through installing, deploying, and configuring the broker.
+- [`broker-grants`](./skills/broker-grants/SKILL.md) guides a trusted launcher through issuing a short-lived grant, configuring the sandbox's tools, and revoking the grant when the job ends.
+
+Inside the checkout the skills use `bun run deploy` and `bun run broker`; on other machines, the `beachside-broker` CLI from `@beachside/credential-client`. Sandboxes don't need the skills; they use their configured CLI or SDK as usual.
+
 ## Deploy
 
 Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
