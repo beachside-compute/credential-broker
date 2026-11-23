@@ -4,14 +4,14 @@ A self-hosted credential broker for AI sandboxes. The Worker stores encrypted up
 
 ## Install the agent skills
 
-Run this from the trusted operator or launcher project where you use your coding agent:
+Install the broker's skills for your coding agent:
 
 ```sh
 npx skills add beachside-compute/credential-broker --skill broker-setup --skill broker-grants
 ```
 
-- [`broker-setup`](./skills/broker-setup/SKILL.md) guides a trusted operator through installing, deploying, and configuring the broker.
-- [`broker-grants`](./skills/broker-grants/SKILL.md) guides a trusted launcher through issuing a short-lived grant, configuring the sandbox's tools, and revoking the grant when the job ends.
+- [`broker-setup`](./skills/broker-setup/SKILL.md) walks your agent through deploying the broker and adding integrations.
+- [`broker-grants`](./skills/broker-grants/SKILL.md) walks it through issuing a short-lived grant for a sandbox, passing it to the sandbox's tools, and revoking it when the job ends.
 
 Inside the checkout the skills use `bun run deploy` and `bun run broker`; on other machines, the `beachside-broker` CLI from `@beachside/credential-client`. Sandboxes don't need the skills; they use their configured CLI or SDK as usual.
 
