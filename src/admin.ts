@@ -25,6 +25,15 @@ import {
   type Fetch,
 } from "./transport.js";
 import {
+  canaryId,
+  destinationInput,
+  parseCanary,
+  parseCanaryEvents,
+  parseCanaryToken,
+  parseDestination,
+  type BrokerAlertDestinationInput,
+} from "./canaries.js";
+import {
   brokerStatus,
   grantListing,
   type BrokerGrantSummary,
@@ -132,6 +141,10 @@ function validIdentifiers(ids: readonly unknown[]): ids is string[] {
 }
 
 type JsonReply = Awaited<ReturnType<typeof jsonRecord>>;
+
+function invalidCanaryResponse(): never {
+  throw invalidResponse();
+}
 
 function invalidResponse() {
   return new CredentialBrokerError(
@@ -434,6 +447,115 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
         return json("/v1/admin/grants", "GET", 200, call, (reply) => grantListing(reply, true));
       },
     },
+    alerts: {
+      async list(call: BrokerRequestOptions = {}) {
+        return json("/v1/admin/alerts", "GET", 200, call, (reply) =>
+          "destinations" in reply && Array.isArray(reply.destinations)
+            ? reply.destinations.map(parseDestination)
+            : invalidCanaryResponse(),
+        );
+      },
+      /** Add a destination. A webhook's reply carries its signing secret, shown only this once. */
+      async create(input: BrokerAlertDestinationInput, call: BrokerRequestOptions = {}) {
+        const body = destinationInput(input);
+
+        return json(
+          "/v1/admin/alerts",
+          "POST",
+          201,
+          call,
+          (reply) => ({
+            ...parseDestination(reply),
+            ...("signingSecret" in reply &&
+              typeof reply.signingSecret === "string" && { signingSecret: reply.signingSecret }),
+          }),
+          JSON.stringify(body),
+          body.id,
+        );
+      },
+      /** Send a test event now, outside the hourly limit. */
+      async test(id: string, call: BrokerRequestOptions = {}) {
+        return json(
+          `/v1/admin/alerts/${requireId(id)}/test`,
+          "POST",
+          200,
+          call,
+          (reply) =>
+            "status" in reply && typeof reply.status === "number"
+              ? { id, status: reply.status, delivered: reply.status >= 200 && reply.status < 300 }
+              : invalidCanaryResponse(),
+          undefined,
+          id,
+        );
+      },
+      async delete(id: string, call: BrokerRequestOptions = {}) {
+        await request(
+          `/v1/admin/alerts/${requireId(id)}`,
+          "DELETE",
+          204,
+          call,
+          undefined,
+          async () => {},
+        );
+      },
+    },
+    canaries: {
+      /** Issue a decoy grant. Any use of it is refused like an unknown grant and raises an alert. */
+      async issue(
+        input: { integrations: readonly string[]; label?: string; note?: string },
+        call: BrokerRequestOptions = {},
+      ) {
+        if (
+          !Array.isArray(input?.integrations) ||
+          !input.integrations.length ||
+          !validIdentifiers(input.integrations)
+        )
+          throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid canary integrations");
+
+        return json(
+          "/v1/admin/canaries",
+          "POST",
+          201,
+          call,
+          parseCanaryToken,
+          JSON.stringify(input),
+          input.integrations.join(", "),
+        );
+      },
+      async list(call: BrokerRequestOptions = {}) {
+        return json("/v1/admin/canaries", "GET", 200, call, (reply) =>
+          "canaries" in reply && Array.isArray(reply.canaries)
+            ? reply.canaries.map(parseCanary)
+            : invalidCanaryResponse(),
+        );
+      },
+      /** A canary with its most recent trips, newest first. */
+      async get(id: string, call: BrokerRequestOptions = {}) {
+        return json(
+          `/v1/admin/canaries/${canaryId(id)}`,
+          "GET",
+          200,
+          call,
+          (reply) => ({
+            ...parseCanary(reply),
+            events: parseCanaryEvents("events" in reply ? reply.events : undefined),
+          }),
+          undefined,
+          id,
+        );
+      },
+      async revoke(id: string, call: BrokerRequestOptions = {}) {
+        await request(
+          `/v1/admin/canaries/${canaryId(id)}`,
+          "DELETE",
+          204,
+          call,
+          undefined,
+          async () => {},
+          id,
+        );
+      },
+    },
     /** The deployment's GitHub Actions trust policy. Worker secret binding names stay private. */
     async config(call: BrokerRequestOptions = {}): Promise<BrokerDeploymentConfig> {
       return json("/v1/admin/config", "GET", 200, call, deploymentConfig);
@@ -559,6 +681,15 @@ function requestLimits(
 }
 
 const adminMessages = {
+  invalid_alert_destination: () =>
+    "The broker rejected the alert destination. Use an HTTPS URL; Slack takes an incoming webhook URL and no headers",
+  alert_destination_exists: (id) => `Alert destination ${id} already exists. Pick another ID`,
+  alert_destination_not_found: (id) =>
+    `Alert destination ${id} was not found. List them with \`${hint("alert list")}\``,
+  alert_destination_limit: () => "The broker already holds its limit of 20 alert destinations",
+  canary_not_found: (id) => `Canary ${id} was not found. List them with \`${hint("canary list")}\``,
+  canary_limit: () => "The broker already holds its limit of 100 canaries",
+  invalid_canary_request: () => "The broker rejected the canary request",
   integration_not_found: (id) =>
     `Integration ${id} was not found. List integrations with \`${hint("integration list")}\``,
   integration_exists: (id) =>

@@ -16,6 +16,8 @@ import type { Worker } from "./http";
 import { adminRoutes } from "./integrations/admin";
 import type { IntegrationSelector } from "./integrations/types";
 import { finishSpan, grantOrigin, parseTraceparent, startSpan } from "./observability/tracing";
+import { alertOnTrip, tripRoleKey } from "./canaries/admin";
+import { tripRequest } from "./canaries/alerts";
 
 export { GrantRegistry };
 
@@ -68,7 +70,11 @@ app.post("/v1/grants", async (context) => {
   const request = context.req.raw;
   const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
 
-  if (!principal) return failure(401, "orchestrator_authentication_required");
+  if (!principal) {
+    await tripRoleKey(context, "issuer-auth");
+
+    return failure(401, "orchestrator_authentication_required");
+  }
 
   managementKeyring(context.env);
 
@@ -172,7 +178,11 @@ app.get("/v1/status", async (context) => {
 
   const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
 
-  if (!principal) return failure(401, "authentication_required");
+  if (!principal) {
+    await tripRoleKey(context, "issuer-auth");
+
+    return failure(401, "authentication_required");
+  }
 
   return traced(context, "status", async () =>
     privateJson({
@@ -187,7 +197,11 @@ app.get("/v1/grants", async (context) => {
   const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
   const principal = await orchestrator(context.req.raw, config, context.env.BROKER_ISSUER_KEY);
 
-  if (!principal) return failure(401, "orchestrator_authentication_required");
+  if (!principal) {
+    await tripRoleKey(context, "issuer-auth");
+
+    return failure(401, "orchestrator_authentication_required");
+  }
 
   return traced(context, "grant.list", async () => {
     const grants = await registry(context.env).listGrants(principal.owner);
@@ -201,7 +215,11 @@ app.post("/v1/grants/:id/renew", async (context) => {
   const request = context.req.raw;
   const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
 
-  if (!principal) return failure(401, "orchestrator_authentication_required");
+  if (!principal) {
+    await tripRoleKey(context, "issuer-auth");
+
+    return failure(401, "orchestrator_authentication_required");
+  }
 
   return traced(context, "grant.renew", async () => {
     const id = context.req.param("id");
@@ -213,9 +231,14 @@ app.post("/v1/grants/:id/renew", async (context) => {
       id,
       principal.owner,
       Date.now() + input.data.ttlSeconds * 1_000,
+      tripRequest(request, "renew"),
     );
 
-    if (result.status === "not_found") return failure(404, "grant_not_found");
+    if (result.status === "not_found") {
+      alertOnTrip(context, result.trip);
+
+      return failure(404, "grant_not_found");
+    }
 
     return privateJson(grantView(result.grant, false));
   });
@@ -225,7 +248,11 @@ app.delete("/v1/grants/:id", async (context) => {
   const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
   const principal = await orchestrator(context.req.raw, config, context.env.BROKER_ISSUER_KEY);
 
-  if (!principal) return failure(401, "orchestrator_authentication_required");
+  if (!principal) {
+    await tripRoleKey(context, "issuer-auth");
+
+    return failure(401, "orchestrator_authentication_required");
+  }
 
   managementKeyring(context.env);
 
@@ -249,7 +276,14 @@ app.delete("/v1/grants/:id", async (context) => {
       return failure(status, "invalid_grant_id");
     }
 
-    await registry(context.env).revoke(id, principal.owner);
+    alertOnTrip(
+      context,
+      await registry(context.env).revoke(
+        id,
+        principal.owner,
+        tripRequest(context.req.raw, "revoke"),
+      ),
+    );
     status = 204;
 
     return privateNoContent();
@@ -280,9 +314,19 @@ app.all("*", async (context) => {
     selector,
     request.headers.has("x-api-key"),
     parseConfig(context.env.BROKER_CONFIG ?? "{}").limits ?? {},
+    tripRequest(
+      request,
+      incoming.type === "gateway" ? "gateway" : incoming.type === "git" ? "git" : "github-api",
+      incoming.type === "gateway" ? incoming.id : "",
+      token,
+    ),
   );
 
-  if (authorized.status === "invalid") return failure(401, "grant_invalid", isGit);
+  if (authorized.status === "invalid") {
+    alertOnTrip(context, authorized.trip);
+
+    return failure(401, "grant_invalid", isGit);
+  }
 
   if (authorized.status === "forbidden") return failure(403, "integration_forbidden");
 

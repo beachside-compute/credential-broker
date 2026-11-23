@@ -54,7 +54,7 @@ export async function sealCredential(
   integration: IntegrationRevision,
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
-  return seal(value, integration, keyring);
+  return seal(value, aad(integration, keyring.active), keyring);
 }
 
 export function sealEndpointValues(
@@ -62,19 +62,41 @@ export function sealEndpointValues(
   integration: HttpIntegrationRevision,
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
-  return seal(JSON.stringify(values), integration, keyring);
+  return seal(JSON.stringify(values), aad(integration, keyring.active), keyring);
+}
+
+/** Seal a value bound to `context`, which `openValue` must be given unchanged. */
+export function sealValue(
+  value: string,
+  context: readonly (string | number)[],
+  keyring: EncryptionKeyring,
+): Promise<EncryptedCredential> {
+  return seal(value, contextData(context, keyring.active), keyring);
+}
+
+export function openValue(
+  reference: EncryptedCredential,
+  context: readonly (string | number)[],
+  keyring: EncryptionKeyring,
+  maxBytes: number,
+): Promise<string | undefined> {
+  return open(reference, contextData(context, reference.keyVersion), keyring, maxBytes);
+}
+
+function contextData(context: readonly (string | number)[], keyVersion: string) {
+  return encoder.encode(JSON.stringify([...context, keyVersion]));
 }
 
 async function seal(
   value: string,
-  integration: IntegrationRevision,
+  additionalData: BufferSource,
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
   const keyVersion = keyring.active;
   const nonce = crypto.getRandomValues(new Uint8Array(12));
 
   const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce, additionalData: aad(integration, keyVersion), tagLength: 128 },
+    { name: "AES-GCM", iv: nonce, additionalData, tagLength: 128 },
     await importKey(keyring, keyVersion, "encrypt"),
     encoder.encode(value),
   );
@@ -93,7 +115,13 @@ export function encryptedStoreSource(
 ): CredentialSource<EncryptedCredential> {
   return {
     async resolve(reference) {
-      const plaintext = await open(reference, integration, keyring, 4096);
+      const plaintext = await open(
+        reference,
+        aad(integration, reference.keyVersion),
+        keyring,
+        4096,
+      );
+
       const result = credentialValue.safeParse(plaintext);
 
       return result.success ? { value: result.data } : undefined;
@@ -110,7 +138,7 @@ export async function openEndpointValues(
 
   if (!endpoint) return;
 
-  const json = await open(reference, integration, keyring, 67_000);
+  const json = await open(reference, aad(integration, reference.keyVersion), keyring, 67_000);
 
   if (json === undefined) return;
 
@@ -125,7 +153,7 @@ export async function openEndpointValues(
 
 async function open(
   reference: EncryptedCredential,
-  integration: IntegrationRevision,
+  additionalData: BufferSource,
   keyring: EncryptionKeyring,
   maxBytes: number,
 ): Promise<string | undefined> {
@@ -141,7 +169,7 @@ async function open(
       {
         name: "AES-GCM",
         iv: nonce,
-        additionalData: aad(integration, reference.keyVersion),
+        additionalData,
         tagLength: 128,
       },
       await importKey(keyring, reference.keyVersion, "decrypt"),

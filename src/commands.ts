@@ -13,7 +13,14 @@ import {
 import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
 import { resolveSecret } from "./secret-ref.js";
 import type { BrokerGrantSummary } from "./grants.js";
-import { createCredentialBroker, integrationBaseURL } from "./index.js";
+import {
+  createCredentialBroker,
+  githubGrantEnv,
+  grantEnvPrefix,
+  integrationBaseURL,
+} from "./index.js";
+import type { BrokerAlertDestination, BrokerCanary, BrokerCanaryToken } from "./canaries.js";
+import { isSecretReference } from "./secret-ref.js";
 import { setupIntegration } from "./setup.js";
 import {
   brokerOrigin,
@@ -73,6 +80,20 @@ Issuance allowlist (admin key)
   issuer deny <id...>                      Stop new grants for them (existing grants keep working)
   issuer set [id...]                       Replace the whole list
 
+Canaries (admin key)
+  canary issue <id...> [--label <text>] [--note <text>] [--env]
+                                           Issue a decoy grant; --env prints the sandbox variables to plant
+  canary list
+  canary show <canary-id>                  Recent uses: route, IP, network, user agent
+  canary revoke <canary-id>
+
+Canary alerts (admin key; each destination gets at most one alert an hour)
+  alert add slack <id> (--to <webhook-url> | --to-stdin)
+  alert add webhook <id> (--to <url> | --to-stdin) [--header Name=value]...
+  alert list
+  alert test <id>                          Send a test event now
+  alert delete <id>
+
 Grants (issuer key; --all uses the admin key)
   grant issue <id...> [--ttl <duration>] [--label <text>] [--token]
   grant list [--all]
@@ -87,6 +108,7 @@ Options
 Keys come from BEACHSIDE_BROKER_ADMIN_KEY and BEACHSIDE_BROKER_ISSUER_KEY, as values or
 env:NAME, op://, bws:// or pass:// references.
 Durations are seconds or a number with s, m, h or d, from 1s to 7d. Grants default to 15m.
+Alert --to URLs and --header values may be op://, bws:// or pass:// references.
 Pipe one credential to --secret-stdin. --config-stdin takes {"endpoint", "credential"} JSON,
 --credentials-stdin a JSON map of header names to replacement secrets.
 Exit codes: 0 ok, 1 other, 2 usage, 3 not found, 5 authentication or permission, 6 outcome unknown, 7 retryable.`;
@@ -262,6 +284,11 @@ function parseCommandOptions(args: string[]) {
         "worker-secret": { type: "string" },
         "config-stdin": { type: "boolean" },
         "credentials-stdin": { type: "boolean" },
+        note: { type: "string" },
+        env: { type: "boolean" },
+        to: { type: "string" },
+        "to-stdin": { type: "boolean" },
+        header: { type: "string", multiple: true },
       },
     });
   } catch {
@@ -327,6 +354,14 @@ const allowedFlags = {
   "issuer allow": [],
   "issuer deny": [],
   "issuer set": [],
+  "canary issue": ["label", "note", "env"],
+  "canary list": [],
+  "canary show": [],
+  "canary revoke": [],
+  "alert add": ["to", "to-stdin", "header"],
+  "alert list": [],
+  "alert test": [],
+  "alert delete": [],
   "grant issue": ["ttl", "label", "token"],
   "grant list": ["all"],
   "grant renew": ["ttl"],
@@ -457,6 +492,102 @@ function grantKind(
     );
 
   return kind;
+}
+
+async function secretFlag(value: string, name: string, env: CliIo["env"]): Promise<string> {
+  return isSecretReference(value) ? resolveSecret(value, name, env) : value;
+}
+
+async function alertTarget(
+  values: { to?: string; "to-stdin"?: boolean },
+  env: CliIo["env"],
+): Promise<string> {
+  if (values.to !== undefined && !values["to-stdin"]) return secretFlag(values.to, "--to", env);
+
+  if (values["to-stdin"] && values.to === undefined) return readSecret();
+
+  return usageError("Give the destination URL with exactly one of --to or --to-stdin");
+}
+
+async function alertHeaders(
+  pairs: readonly string[] | undefined,
+  env: CliIo["env"],
+): Promise<Record<string, string> | undefined> {
+  if (!pairs?.length) return;
+  const headers: Record<string, string> = {};
+
+  for (const pair of pairs) {
+    const split = pair.indexOf("=");
+
+    if (split < 1) usageError("--header takes Name=value");
+    const name = pair.slice(0, split);
+    headers[name] = await secretFlag(pair.slice(split + 1), `--header ${name}`, env);
+  }
+
+  return headers;
+}
+
+function canaryEnv(
+  base: URL,
+  token: string,
+  integrations: readonly string[],
+  kinds: BrokerCanaryToken["kinds"],
+) {
+  const env: Record<string, string> = {};
+
+  for (const id of integrations) {
+    const kind = grantKind(kinds, id);
+
+    if (kind === "github") {
+      if (env.GH_HOST) usageError("Only one GitHub integration can configure git in a sandbox");
+      Object.assign(env, githubGrantEnv(base, token));
+    } else {
+      const prefix = grantEnvPrefix(id, kind);
+
+      if (env[`${prefix}_API_KEY`]) usageError(`Two integrations would set ${prefix}_API_KEY`);
+      env[`${prefix}_BASE_URL`] = integrationBaseURL(base, id, kind);
+      env[`${prefix}_API_KEY`] = token;
+    }
+  }
+
+  return env;
+}
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./:@-]*$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function canaryLines(items: readonly BrokerCanary[]): string {
+  if (!items.length) return `No canaries yet. Issue one with \`${hint("canary issue <id>")}\`.`;
+
+  return table([
+    ["ID", "LABEL", "INTEGRATIONS", "TRIPS", "LAST TRIP"],
+    ...items.map((item) => [
+      item.id,
+      item.label ?? "-",
+      item.integrations.join(","),
+      String(item.trips),
+      item.lastTrippedAt ? since(item.lastTrippedAt) : "never",
+    ]),
+  ]);
+}
+
+function destinationLines(items: readonly BrokerAlertDestination[]): string {
+  if (!items.length)
+    return `No alert destinations yet. Add one with \`${hint("alert add slack <id> --to-stdin")}\`.`;
+
+  return table([
+    ["ID", "KIND", "HOST", "HEADERS", "LAST DELIVERY"],
+    ...items.map((item) => [
+      item.id,
+      item.kind,
+      item.host,
+      item.headerNames.join(",") || "-",
+      item.lastDeliveryAt
+        ? `${since(item.lastDeliveryAt)} (${item.lastStatus ? `HTTP ${item.lastStatus}` : "no answer"})`
+        : "never",
+    ]),
+  ]);
 }
 
 /** Allow a just-created integration, saying how to finish if that second step fails. */
@@ -794,6 +925,160 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
             ? `The issuer can mint grants for: ${integrations.join(", ")}`
             : "Cleared the allowlist. The issuer cannot mint new grants.",
         );
+
+        return 0;
+      }
+
+      case "canary issue": {
+        const integrations = integrationIds(operands, true);
+        const admin = await adminKey();
+
+        const canary = await admin.canaries.issue({
+          integrations,
+          ...(values.label !== undefined && { label: values.label }),
+          ...(values.note !== undefined && { note: values.note }),
+        });
+
+        if (values.env) {
+          const env = canaryEnv(base, canary.token, canary.integrations, canary.kinds);
+          io.stdout(
+            json
+              ? JSON.stringify(env)
+              : Object.entries(env)
+                  .map(([name, value]) => `${name}=${shellQuote(value)}`)
+                  .join("\n"),
+          );
+
+          return 0;
+        }
+
+        print(
+          canary,
+          [
+            `canary    ${canary.id}`,
+            ...canary.integrations.map(
+              (id) =>
+                `base url  ${id}: ${integrationBaseURL(base, id, grantKind(canary.kinds, id))}`,
+            ),
+            `token     ${canary.token}`,
+            "",
+            "Plant it where only an intruder would find it. Any use is refused like an unknown grant and alerts your destinations.",
+            `Print the sandbox variables with --env. Revoke it with \`${prefix} canary revoke ${canary.id}\`.`,
+          ].join("\n"),
+        );
+
+        return 0;
+      }
+
+      case "canary list": {
+        noPositionals(operands);
+        const canaries = await (await adminKey()).canaries.list();
+        print({ canaries }, canaryLines(canaries));
+
+        return 0;
+      }
+
+      case "canary show": {
+        if (operands.length !== 1) return usageError("Pass exactly one canary ID");
+        const canary = await (await adminKey()).canaries.get(operands[0]!);
+
+        print(
+          canary,
+          [
+            `${canary.id}${canary.label ? ` (${canary.label})` : ""}`,
+            ...(canary.note ? [`  note          ${canary.note}`] : []),
+            `  integrations  ${canary.integrations.join(", ")}`,
+            `  trips         ${canary.trips}${canary.firstTrippedAt ? `, first ${canary.firstTrippedAt}` : ""}`,
+            ...(canary.events.length
+              ? [
+                  "",
+                  table([
+                    ["AT", "ROUTE", "REQUEST", "IP", "NETWORK", "USER AGENT"],
+                    ...canary.events.map((event) => [
+                      event.at ?? "-",
+                      [event.route, event.integration].filter(Boolean).join(" ") || "-",
+                      `${event.method ?? ""} ${event.path ?? ""}`.trim() || "-",
+                      event.ip || "-",
+                      [event.as_org, event.country].filter(Boolean).join(", ") || "-",
+                      event.user_agent || "-",
+                    ]),
+                  ]),
+                ]
+              : []),
+          ].join("\n"),
+        );
+
+        return 0;
+      }
+
+      case "canary revoke": {
+        if (operands.length !== 1) return usageError("Pass exactly one canary ID");
+        await (await adminKey()).canaries.revoke(operands[0]!);
+        print({ revoked: true, id: operands[0] }, `Revoked canary ${operands[0]}.`);
+
+        return 0;
+      }
+
+      case "alert add": {
+        const [kind, id, ...extra] = operands;
+
+        if ((kind !== "slack" && kind !== "webhook") || !id || extra.length)
+          return usageError("Use alert add <slack|webhook> <id>");
+
+        if (kind === "slack" && values.header?.length)
+          return usageError("Slack destinations take no headers");
+
+        const admin = await adminKey();
+
+        const created = await admin.alerts.create({
+          id,
+          kind,
+          url: await alertTarget(values, io.env),
+          ...(kind === "webhook" && { headers: await alertHeaders(values.header, io.env) }),
+        });
+
+        print(
+          created,
+          [
+            `Added ${created.kind} destination ${created.id} (${created.host}).`,
+            ...("signingSecret" in created
+              ? [
+                  `signing secret  ${created.signingSecret}`,
+                  "Requests are signed per Standard Webhooks. This secret is shown only once.",
+                ]
+              : []),
+            `Check it with \`${prefix} alert test ${created.id}\`.`,
+          ].join("\n"),
+        );
+
+        return 0;
+      }
+
+      case "alert list": {
+        noPositionals(operands);
+        const destinations = await (await adminKey()).alerts.list();
+        print({ destinations }, destinationLines(destinations));
+
+        return 0;
+      }
+
+      case "alert test": {
+        const [id] = integrationIds(operands, false);
+        const result = await (await adminKey()).alerts.test(id!);
+        print(
+          result,
+          result.delivered
+            ? `Delivered a test alert to ${id} (HTTP ${result.status}).`
+            : `The test alert to ${id} failed (${result.status ? `HTTP ${result.status}` : "no answer"}).`,
+        );
+
+        return result.delivered ? 0 : 7;
+      }
+
+      case "alert delete": {
+        const [id] = integrationIds(operands, false);
+        await (await adminKey()).alerts.delete(id!);
+        print({ deleted: true, id }, `Deleted alert destination ${id}.`);
 
         return 0;
       }

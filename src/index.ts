@@ -51,6 +51,15 @@ export {
   type BrokerWorkflowPolicy,
 } from "./admin.js";
 
+export type {
+  BrokerAlertDestination,
+  BrokerAlertDestinationInput,
+  BrokerAlertKind,
+  BrokerCanary,
+  BrokerCanaryEvent,
+  BrokerCanaryToken,
+} from "./canaries.js";
+
 export type { BrokerEndpoint, BrokerEndpointHeader } from "./endpoint.js";
 
 export type CredentialBrokerAuth =
@@ -156,6 +165,30 @@ function validateRequest({ integrations, ttlSeconds = 900, label }: BrokerGrantR
     throw new CredentialBrokerError("INVALID_ARGUMENT", "Invalid broker grant request");
 
   return { integrations: [...integrations], ttlSeconds, ...(label !== undefined && { label }) };
+}
+
+/** The variables that point git and gh at the broker with a grant token. */
+export function githubGrantEnv(base: URL, token: string) {
+  const helper = `credential.${base.origin}/.helper`;
+
+  return {
+    GH_HOST: base.host,
+    GH_ENTERPRISE_TOKEN: token,
+    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_KEY_0: helper,
+    GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: helper,
+    GIT_CONFIG_VALUE_1:
+      '!f() { if test "$1" = get; then printf "%s\\n" username=x-access-token "password=$GH_ENTERPRISE_TOKEN"; fi; }; f',
+    GIT_CONFIG_KEY_2: `url.${base.origin}/.insteadOf`,
+    GIT_CONFIG_VALUE_2: "https://github.com/",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+/** The `<PREFIX>_BASE_URL` / `<PREFIX>_API_KEY` prefix a sandbox gets for a non-GitHub integration. */
+export function grantEnvPrefix(id: string, kind: BrokerIntegrationKindName): string {
+  return (kind === "http" ? id.replaceAll("-", "_") : kind).toUpperCase();
 }
 
 /** The base URL a client should use for one integration, given its kind. */
@@ -597,11 +630,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
             gitHost = id;
           } else if (kind)
             // A generic HTTP integration has no provider of its own, so its ID names the variables.
-            prefixes.push([
-              id,
-              (kind === "http" ? id.replaceAll("-", "_") : kind).toUpperCase(),
-              kind,
-            ]);
+            prefixes.push([id, grantEnvPrefix(id, kind), kind]);
         }
 
         for (const [id, prefix] of prefixes) {
@@ -625,17 +654,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
           const taken = gitVariables.find((name) => github === undefined && variables.has(name));
 
           if (taken) await refuse(`An endpoint also sets ${taken}. Give it another variable name`);
-          env.GH_HOST = base.host;
-          env.GH_ENTERPRISE_TOKEN = grant.token;
-          env.GIT_CONFIG_COUNT = "3";
-          env.GIT_CONFIG_KEY_0 = `credential.${base.origin}/.helper`;
-          env.GIT_CONFIG_VALUE_0 = "";
-          env.GIT_CONFIG_KEY_1 = env.GIT_CONFIG_KEY_0;
-          env.GIT_CONFIG_VALUE_1 =
-            '!f() { if test "$1" = get; then printf "%s\\n" username=x-access-token "password=$GH_ENTERPRISE_TOKEN"; fi; }; f';
-          env.GIT_CONFIG_KEY_2 = `url.${base.origin}/.insteadOf`;
-          env.GIT_CONFIG_VALUE_2 = "https://github.com/";
-          env.GIT_TERMINAL_PROMPT = "0";
+          Object.assign(env, githubGrantEnv(base, grant.token));
         }
 
         if (anthropic !== undefined) {

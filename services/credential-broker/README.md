@@ -307,11 +307,83 @@ In OpenCode v2, point a selected API-key provider's `settings.baseURL` and `sett
 
 Use the corresponding environment variables for Anthropic or OpenRouter. In OpenCode v1, provider settings live under `provider.<id>.options`. These recipes use API keys and HTTP model endpoints. [OpenCode provider configuration](https://opencode.ai/docs/providers/)
 
+## Canary tokens
+
+A canary is a decoy grant the administrator issues to detect a leak. Plant one where only an intruder would find it: a decoy `.env`, a CI secret on an unused workflow, a sandbox image. Nothing legitimate ever uses it. It only detects use against this broker. A provider key used directly at its provider never reaches it.
+
+- **Looks like a grant.** It has the same `bsg_` token, the same issue response, and `canary issue --env` prints the variables a sandbox grant would get. Only the admin key can issue, list or see canaries. The issuer key and workflow tokens never see them, and they count toward no grant limits. A canary never expires; it stays live until revoked.
+- **Refused like an unknown grant.** A gateway, git or GitHub API request with a canary gets the same `401 grant_invalid` as an expired grant. The token is never proxied, and no credential is resolved.
+- **Also trips on management use.** Presenting a canary token as the admin or issuer key, or renewing or revoking a canary's ID with an issuer key, records a trip too. The responses stay unchanged.
+- **Recorded.** Each canary keeps its trip count and its last 100 uses. A use records the route, method and path (never the query string), IP address, country, ASN, network name, Cloudflare colo and user agent.
+
+```sh
+bun run broker alert add slack ops-chat --to-stdin < /secure/path/slack-webhook-url
+bun run broker alert add webhook pager --to-stdin --header "Authorization=op://Ops/incident-io/canary-source" < /secure/path/alert-url
+bun run broker alert test pager
+bun run broker canary issue openrouter github --label "decoy .env on build-box" --env > decoy.env
+bun run broker canary list
+bun run broker canary show <canary-id>
+bun run broker canary revoke <canary-id>
+```
+
+Every destination receives every canary's alerts. There are two kinds of destination:
+
+- **`slack`** takes a Slack incoming webhook URL on `hooks.slack.com` and posts a readable message.
+- **`webhook`** takes any HTTPS URL and up to 10 custom headers. It posts one flat JSON object of strings, signed per [Standard Webhooks](https://www.standardwebhooks.com/): `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<HMAC-SHA256>`. The signing secret is printed once, when you add the destination.
+
+The URL, header values and signing secret are sealed with the broker's encryption key. Listings show only the host and header names. Rotating the encryption key means re-adding destinations.
+
+```json
+{
+  "type": "canary.triggered",
+  "event_id": "evt_…",
+  "dedup_key": "beachside-canary-<canary-id>",
+  "status": "firing",
+  "severity": "critical",
+  "title": "Canary \"decoy .env on build-box\" used from 203.0.113.7 (DigitalOcean, NL) via gateway",
+  "broker_host": "broker.example.com",
+  "canary_id": "…",
+  "canary_label": "decoy .env on build-box",
+  "canary_note": "",
+  "occurred_at": "2026-11-23T22:40:00.000Z",
+  "trips_total": "3",
+  "trips_since_last_alert": "2",
+  "canaries_tripped": "decoy .env on build-box",
+  "request_route": "gateway",
+  "request_integration": "openrouter",
+  "request_method": "POST",
+  "request_path": "/gateway/openrouter/v1/chat/completions",
+  "request_ip": "203.0.113.7",
+  "request_country": "NL",
+  "request_asn": "14061",
+  "request_as_org": "DigitalOcean",
+  "request_colo": "AMS",
+  "request_user_agent": "OpenAI/Python 1.x"
+}
+```
+
+`request_route` is one of:
+
+- `gateway`, `git` or `github-api` for a sandbox-style request.
+- `issuer-auth` or `admin-auth` for a canary presented as a role key.
+- `renew` or `revoke` for management of a canary's ID.
+
+**Delivery limits.**
+
+- Each destination gets at most one alert an hour. Later trips inside that hour are recorded, then counted in the next alert as `trips_since_last_alert` and `canaries_tripped`.
+- Delivery is a single attempt with a 10-second timeout and no retries. `alert list` shows each destination's last delivery and its HTTP status.
+- `alert test` sends a `canary.test` event straight away, outside the hourly limit.
+
+**Receivers.**
+
+- **incident.io:** create an HTTP alert source with a custom payload. Set the deduplication key path to `$.dedup_key`, and map `title` and `status` in the transform. Add its events URL with an `Authorization: Bearer <source token>` header.
+- **PagerDuty:** use a Custom Event Transformer integration that maps `title`, `severity` and `dedup_key`.
+
 ## Observability and trust
 
 Set `BROKER_OTLP_TRACES_ENDPOINT` to a trusted HTTPS OTLP/HTTP traces endpoint, such as `https://collector.example.com/v1/traces`, to export safe broker spans. If the collector needs authentication, supply the complete Authorization value in `BROKER_OTLP_AUTHORIZATION` as a Worker secret. Admin and issuer requests can propagate trusted W3C trace context. Issuance, renewal, listing, revocation and status each have a span. Admin spans use static operation names and status codes. Authorized gateway requests link to the issuing trace when available. The broker discards guest trace context and does not propagate broker trace headers to upstreams. Telemetry delivery is best effort. The deployment disables automatic invocation logging and native HTTP tracing to keep caller-supplied paths, query strings, and payloads out of telemetry.
 
-Any sandbox workload or provider infrastructure able to read a grant can use it until expiry or revocation. Grants are bearer credentials scoped to integrations and are not bound to an IP address, sandbox identity, or private network. Keep them out of logs, artifacts, environment dumps, and persistent sandbox files. The registry stores token digests, expiry, grant scope, optional trace correlation, credential envelopes, and Worker-secret references. Root encryption keys and role keys are Worker secret bindings. The Worker uses resolved upstream credentials only at the fixed provider endpoints. This deployment trusts its operators, Cloudflare, and the upstream providers.
+Any sandbox workload or provider infrastructure able to read a grant can use it until expiry or revocation. Grants are bearer credentials scoped to integrations and are not bound to an IP address, sandbox identity, or private network. Keep them out of logs, artifacts, environment dumps, and persistent sandbox files. The registry stores token digests, expiry, grant scope, optional trace correlation, credential envelopes, Worker-secret references, sealed alert destinations, and canary trip records. Root encryption keys and role keys are Worker secret bindings. The Worker uses resolved upstream credentials only at the fixed provider endpoints. This deployment trusts its operators, Cloudflare, and the upstream providers.
 
 ## Validate locally
 
