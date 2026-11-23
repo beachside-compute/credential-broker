@@ -452,6 +452,17 @@ export interface BrokerDeploymentConfig {
   } | null;
   readonly workerSecretBindings: number;
   readonly issuerKey: boolean;
+  /** Effective per-grant limits for each integration. Empty from brokers that predate them. */
+  readonly limits: Readonly<Record<string, BrokerRequestLimit>>;
+  /** IDs in `BROKER_CONFIG.limits` that match no integration. */
+  readonly unknownLimitIds: readonly string[];
+}
+
+export interface BrokerRequestLimit {
+  readonly requestsPerMinute: number;
+  readonly concurrentRequests: number;
+  /** Set in `BROKER_CONFIG.limits` rather than the kind's default. */
+  readonly configured: boolean;
 }
 
 type PolicyValue = string | readonly string[];
@@ -484,7 +495,9 @@ function deploymentConfig(reply: JsonReply): BrokerDeploymentConfig {
   if (typeof workerSecretBindings !== "number" || typeof issuerKey !== "boolean")
     throw invalidResponse();
 
-  if (githubActions === null) return { githubActions: null, workerSecretBindings, issuerKey };
+  const shared = { workerSecretBindings, issuerKey, ...requestLimits(reply) };
+
+  if (githubActions === null) return { githubActions: null, ...shared };
 
   if (
     !githubActions ||
@@ -501,8 +514,47 @@ function deploymentConfig(reply: JsonReply): BrokerDeploymentConfig {
       audience: githubActions.audience,
       workflows: githubActions.workflows.map(workflowPolicy),
     },
-    workerSecretBindings,
-    issuerKey,
+    ...shared,
+  };
+}
+
+function requestLimits(
+  reply: JsonReply,
+): Pick<BrokerDeploymentConfig, "limits" | "unknownLimitIds"> {
+  const limits = "limits" in reply ? reply.limits : {};
+  const unknown = "unknownLimitIds" in reply ? reply.unknownLimitIds : [];
+
+  if (
+    !limits ||
+    typeof limits !== "object" ||
+    !Array.isArray(unknown) ||
+    !unknown.every((id) => typeof id === "string")
+  )
+    throw invalidResponse();
+
+  return {
+    limits: Object.fromEntries(
+      Object.entries(limits).map(([id, limit]): [string, BrokerRequestLimit] => {
+        if (
+          !limit ||
+          typeof limit !== "object" ||
+          !(
+            "requestsPerMinute" in limit &&
+            "concurrentRequests" in limit &&
+            "configured" in limit
+          ) ||
+          typeof limit.requestsPerMinute !== "number" ||
+          typeof limit.concurrentRequests !== "number" ||
+          typeof limit.configured !== "boolean"
+        )
+          throw invalidResponse();
+
+        const { requestsPerMinute, concurrentRequests, configured } = limit;
+
+        return [id, { requestsPerMinute, concurrentRequests, configured }];
+      }),
+    ),
+    unknownLimitIds: unknown.map(String),
   };
 }
 

@@ -4,6 +4,8 @@ import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
 import type { Principal } from "../auth";
+import { requestLimit } from "../config";
+import type { RequestLimits } from "../config";
 import type { CredentialReference } from "../credentials/source";
 import { integrations, issuerIntegrations } from "../integrations/schema";
 import { maxIntegrations } from "../integrations/types";
@@ -14,7 +16,7 @@ import type {
   IntegrationSelector,
   StoredIntegration,
 } from "../integrations/types";
-import { grants, leases } from "./schema";
+import { grants, leases, usage } from "./schema";
 
 const minuteMs = 60_000;
 
@@ -22,9 +24,8 @@ const maxActiveGrants = 1000;
 
 const maxActiveGrantsPerOwner = 100;
 
-const maxRequestsPerMinute = 120;
-
-const maxConcurrentRequests = 8;
+/** A request renews its lease while it runs, so an expired lease means its release was lost. */
+export const leaseTtlMs = 15 * minuteMs;
 
 export interface GrantRecord {
   id: string;
@@ -411,7 +412,12 @@ export class GrantRegistry extends DurableObject {
       .run();
   }
 
-  authorize(hash: string, selector: IntegrationSelector, usesApiKeyHeader: boolean): Authorization {
+  authorize(
+    hash: string,
+    selector: IntegrationSelector,
+    usesApiKeyHeader: boolean,
+    limits: RequestLimits,
+  ): Authorization {
     const now = Date.now();
 
     return this.ctx.storage.transactionSync(() => {
@@ -449,34 +455,60 @@ export class GrantRegistry extends DurableObject {
       if (usesApiKeyHeader && integration.kind !== "anthropic" && integration.kind !== "http")
         return { status: "invalid" };
 
+      const { requestsPerMinute, concurrentRequests } = requestLimit(integration, limits);
+
+      const scope = { grantId: grant.id, identity: integration.identity };
       const window = Math.floor(now / minuteMs);
-      const used = grant.rateWindow === window ? grant.rateCount : 0;
 
-      const { active } = this.db
-        .select({ active: count() })
-        .from(leases)
-        .where(eq(leases.grantId, grant.id))
-        .get()!;
+      const counter = this.db
+        .select()
+        .from(usage)
+        .where(and(eq(usage.grantId, scope.grantId), eq(usage.identity, scope.identity)))
+        .get();
 
-      if (used >= maxRequestsPerMinute || active >= maxConcurrentRequests) {
+      const used = counter?.window === window ? counter.count : 0;
+
+      const held = and(eq(leases.grantId, scope.grantId), eq(leases.identity, scope.identity));
+
+      this.db
+        .delete(leases)
+        .where(and(held, lte(leases.expiresAt, now)))
+        .run();
+      const { active } = this.db.select({ active: count() }).from(leases).where(held).get()!;
+
+      if (used >= requestsPerMinute || active >= concurrentRequests) {
         return { status: "busy" };
       }
 
       const leaseId = crypto.randomUUID();
       this.db
         .update(grants)
-        .set({
-          rateWindow: window,
-          rateCount: used + 1,
-          requests: grant.requests + 1,
-          lastUsedAt: now,
-        })
+        .set({ requests: grant.requests + 1, lastUsedAt: now })
         .where(eq(grants.id, grant.id))
         .run();
-      this.db.insert(leases).values({ id: leaseId, grantId: grant.id }).run();
+      this.db
+        .insert(usage)
+        .values({ ...scope, window, count: used + 1 })
+        .onConflictDoUpdate({
+          target: [usage.grantId, usage.identity],
+          set: { window, count: used + 1 },
+        })
+        .run();
+      this.db
+        .insert(leases)
+        .values({ id: leaseId, ...scope, expiresAt: now + leaseTtlMs })
+        .run();
 
       return { status: "allowed", leaseId, traceparent: grant.traceparent, integration };
     });
+  }
+
+  renewLease(leaseId: string): void {
+    this.db
+      .update(leases)
+      .set({ expiresAt: Date.now() + leaseTtlMs })
+      .where(eq(leases.id, leaseId))
+      .run();
   }
 
   release(leaseId: string): void {
@@ -484,14 +516,16 @@ export class GrantRegistry extends DurableObject {
   }
 
   override async alarm(): Promise<void> {
-    this.db.delete(grants).where(lte(grants.expiresAt, Date.now())).run();
+    const now = Date.now();
+    this.db.delete(grants).where(lte(grants.expiresAt, now)).run();
+    this.db.delete(leases).where(lte(leases.expiresAt, now)).run();
 
     const next = this.db
       .select({ expire: min(grants.expiresAt) })
       .from(grants)
       .get();
 
-    if (next?.expire != null) await this.scheduleCleanup(next.expire);
+    if (next?.expire != null) await this.scheduleCleanup(Math.min(next.expire, now + leaseTtlMs));
   }
 
   private findIntegration(id: string) {

@@ -87,6 +87,7 @@ const config = {
     "CREDENTIAL_MISSING",
   ],
   githubActions: { audience, workflows: [policy, reusablePolicy] },
+  limits: { openai: { concurrentRequests: 3 }, retired: { requestsPerMinute: 10 } },
 };
 
 const claims = {
@@ -1034,14 +1035,14 @@ function sseFixture() {
   );
 }
 
-test("streams data before completion and reclaims concurrency leases", async () => {
+test("streams data before completion and reclaims released or expired leases", async () => {
   const issued = await grant(["openai"]);
   const path = "/gateway/openai/v1/chat/completions";
   const body = JSON.stringify({ model: "fixture", stream: true });
   const requests = [];
 
   try {
-    for (let index = 0; index < 8; index++) {
+    for (let index = 0; index < 3; index++) {
       const pending = await access(path, issued.token, "POST", body);
       assert.equal(pending.status, 200);
       assert.equal(pending.headers.get("content-type"), "text/event-stream");
@@ -1070,14 +1071,43 @@ test("streams data before completion and reclaims concurrency leases", async () 
         issued.id,
       );
 
-      if (row.count === 7) break;
+      if (row.count === 2) break;
       await delay(20);
     }
 
     assert.deepEqual(
       await storage.exec("SELECT COUNT(*) AS count FROM leases WHERE grant_id = ?", issued.id),
-      [{ count: 7 }],
+      [{ count: 2 }],
     );
+
+    const held = await access(path, issued.token, "POST", body);
+    assert.equal(held.status, 200);
+    requests.push({ reader: held.body!.getReader(), finish: sendStreamTail! });
+    assert.equal((await access(path, issued.token, "POST", body)).status, 429);
+
+    await storage.exec("UPDATE leases SET expires_at = 0 WHERE grant_id = ?", issued.id);
+
+    const [renewed] = await storage.exec(
+      "SELECT id FROM leases WHERE grant_id = ? LIMIT 1",
+      issued.id,
+    );
+
+    const namespace = await runtime.getDurableObjectNamespace("REGISTRY");
+
+    // SAFETY: REGISTRY is bound to GrantRegistry, whose RPC surface includes renewLease.
+    const registry: { renewLease(id: string): Promise<void> } = namespace.getByName(
+      "grant-registry",
+    ) as never;
+
+    await registry.renewLease(String(renewed.id));
+
+    const afterExpiry = await access(path, issued.token, "POST", body);
+    assert.equal(afterExpiry.status, 200);
+    requests.push({ reader: afterExpiry.body!.getReader(), finish: sendStreamTail! });
+
+    const remaining = await storage.exec("SELECT id FROM leases WHERE grant_id = ?", issued.id);
+    assert.equal(remaining.length, 2);
+    assert.ok(remaining.some(({ id }) => id === renewed.id));
     assert.equal((await access(`/v1/grants/${issued.id}`, apiKey, "DELETE")).status, 204);
     assert.equal((await access(path, issued.token, "POST", body)).status, 401);
     assert.deepEqual(
@@ -1106,7 +1136,7 @@ test(
 
     try {
       await seedIntegrations();
-      const record = await grant(["openai"]);
+      const record = await grant(["openai", "openrouter"]);
 
       const previousStorage = await runtime.unsafeGetDurableObjectStorage(
         "broker",
@@ -1122,9 +1152,9 @@ test(
 
       const window = Math.floor(Date.now() / 60_000);
       await previousStorage.exec(
-        "UPDATE grants SET rate_count = 119, rate_window = ? WHERE id = ?",
-        window,
+        "INSERT INTO grant_usage SELECT ?, identity, ?, 599 FROM integrations WHERE id = 'openai'",
         record.id,
+        window,
       );
 
       await runtime.dispose();
@@ -1135,7 +1165,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 4 },
+        { count: 5 },
       ]);
 
       const path = "/gateway/openai/v1/models";
@@ -1143,22 +1173,33 @@ test(
       assert.equal(response.status, 200);
       await response.text();
       assert.deepEqual(
-        await storage.exec("SELECT rate_count FROM grants WHERE id = ?", record.id),
-        [{ rate_count: 120 }],
+        await storage.exec("SELECT count FROM grant_usage WHERE grant_id = ?", record.id),
+        [{ count: 600 }],
       );
 
       const forwarded = seen.length;
       assert.equal((await access(path, record.token)).status, 429);
       assert.equal(seen.length, forwarded);
 
+      const otherIntegration = await access("/gateway/openrouter/v1/models", record.token);
+      assert.equal(otherIntegration.status, 200);
+      await otherIntegration.text();
+
       // Simulate a counter from the previous minute without waiting for wall-clock rollover.
-      await storage.exec("UPDATE grants SET rate_window = ? WHERE id = ?", window - 1, record.id);
+      await storage.exec(
+        "UPDATE grant_usage SET window = ? WHERE grant_id = ?",
+        window - 1,
+        record.id,
+      );
       const allowed = await access(path, record.token);
       assert.equal(allowed.status, 200);
       await allowed.text();
       assert.deepEqual(
-        await storage.exec("SELECT rate_count FROM grants WHERE id = ?", record.id),
-        [{ rate_count: 1 }],
+        await storage.exec(
+          "SELECT count FROM grant_usage JOIN integrations USING (identity) WHERE grant_id = ? AND id = 'openai'",
+          record.id,
+        ),
+        [{ count: 1 }],
       );
     } finally {
       await runtime.dispose();
@@ -1430,6 +1471,13 @@ test("proxies an administrator-configured endpoint and rotates one sealed header
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { fixture: true });
     assert.equal(response.headers.get("x-page-count"), "2");
+
+    const malformed = await runtime.dispatchFetch(`${result.env.CUSTOM_URL}/widgets/%E0%A4%A`, {
+      headers: { "x-api-key": token },
+    });
+
+    assert.equal(malformed.status, 404);
+    await malformed.text();
 
     for (const name of ["set-cookie", "cf-aig-authorization", "x-reflected-credential"])
       assert.equal(response.headers.get(name), null);
@@ -2137,6 +2185,17 @@ test("explains refused issuance, lists and renews grants, and reports status by 
   assert.equal(config.issuerKey, true);
   assert.equal(config.githubActions?.audience, audience);
   assert.equal(config.workerSecretBindings, kinds.length + 1);
+  assert.deepEqual(config.limits.openai, {
+    requestsPerMinute: 600,
+    concurrentRequests: 3,
+    configured: true,
+  });
+  assert.deepEqual(config.limits.github, {
+    requestsPerMinute: 800,
+    concurrentRequests: 32,
+    configured: false,
+  });
+  assert.deepEqual(config.unknownLimitIds, ["retired"]);
 
   await adminClient.integrations.delete("parked");
 });

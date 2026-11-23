@@ -47,6 +47,7 @@ export {
   type BrokerEndpointCredential,
   type BrokerIntegrationInput,
   type BrokerDeploymentConfig,
+  type BrokerRequestLimit,
   type BrokerWorkflowPolicy,
 } from "./admin.js";
 

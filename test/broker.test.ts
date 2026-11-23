@@ -169,6 +169,10 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and keys
             },
             workerSecretBindings: 0,
             issuerKey: true,
+            limits: {
+              openrouter: { requestsPerMinute: 900, concurrentRequests: 8, configured: true },
+            },
+            unknownLimitIds: ["typo"],
           });
 
         if (request.method === "POST") {
@@ -395,6 +399,8 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and keys
       expect(config.status, config.stderr).toBe(0);
       expect(config.stdout).toContain("audience beachside-broker");
       expect(config.stdout).toContain("- (-): -");
+      expect(config.stdout).toContain("900/min, 8 concurrent (configured)");
+      expect(config.stdout).toContain("names no integration: typo");
       const allowed = await run(["issuer", "allow", "openrouter", "--json"]);
       expect(JSON.parse(allowed.stdout)).toEqual({ integrations: ["openrouter"] });
       const denied = await run(["issuer", "deny", "openrouter", "--json"]);

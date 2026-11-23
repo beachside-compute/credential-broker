@@ -8,7 +8,7 @@ import type { ResolvedCredential } from "./credentials/source";
 import { workerSecretSource } from "./credentials/sources/worker-secret";
 import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
 import { failure, upstream, withCompletion } from "./proxy/forward";
-import { GrantRegistry } from "./grants/registry";
+import { GrantRegistry, leaseTtlMs } from "./grants/registry";
 import { grantView } from "./grants/view";
 import { route, sandboxToken, upstreamRoute } from "./proxy/routes";
 import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "./http";
@@ -279,6 +279,7 @@ app.all("*", async (context) => {
     await tokenHash(token),
     selector,
     request.headers.has("x-api-key"),
+    parseConfig(context.env.BROKER_CONFIG ?? "{}").limits ?? {},
   );
 
   if (authorized.status === "invalid") return failure(401, "grant_invalid", isGit);
@@ -299,21 +300,27 @@ app.all("*", async (context) => {
 
   let completed = false;
 
+  let renewal: ReturnType<typeof setInterval> | undefined;
+
   const complete = (status: number, failed?: boolean) => {
     if (completed) return;
     completed = true;
+    clearInterval(renewal);
     finishSpan(span, status, failed);
-    // A lost release can hold a slot until this grant expires. It never widens access.
+    // A lost release holds a slot until the lease expires. It never widens access.
     context.executionCtx.waitUntil(store.release(authorized.leaseId).catch(() => {}));
   };
 
   const { integration } = authorized;
   const target = upstreamRoute(incoming, integration);
 
+  const path = decodedPath(requestUrl.pathname);
+
   const blockedEndpoint =
     target?.type === "http" &&
     (request.headers.has("upgrade") ||
-      decodeURIComponent(requestUrl.pathname).includes(token) ||
+      path === undefined ||
+      path.includes(token) ||
       [...requestUrl.searchParams].some(
         ([name, value]) => name.includes(token) || value.includes(token),
       ));
@@ -359,6 +366,10 @@ app.all("*", async (context) => {
     return failure(503, "credential_unavailable");
   }
 
+  renewal = setInterval(() => {
+    context.executionCtx.waitUntil(store.renewLease(authorized.leaseId).catch(() => {}));
+  }, leaseTtlMs / 3);
+
   try {
     const response = await upstream(request, target, credential, token);
 
@@ -369,5 +380,13 @@ app.all("*", async (context) => {
     return failure(502, "upstream_unavailable");
   }
 });
+
+function decodedPath(path: string): string | undefined {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return undefined;
+  }
+}
 
 export default app;

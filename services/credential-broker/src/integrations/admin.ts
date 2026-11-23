@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { administrator } from "../auth";
-import { integrationId, parseConfig } from "../config";
+import { integrationId, parseConfig, requestLimit } from "../config";
 import { credentialInput } from "../credentials/source";
 import type { CredentialInput, CredentialReference } from "../credentials/source";
 import {
@@ -91,8 +91,18 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
   const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
 
   // Binding names stay private. The workflow trust policy is configuration, not a secret.
+  const limits = config.limits ?? {};
+  const known = await registry(context.env).listIntegrations();
+
   return privateJson({
     githubActions: config.githubActions ?? null,
+    limits: Object.fromEntries(
+      known.map((integration) => [
+        integration.id,
+        { ...requestLimit(integration, limits), configured: Object.hasOwn(limits, integration.id) },
+      ]),
+    ),
+    unknownLimitIds: Object.keys(limits).filter((id) => !known.some((row) => row.id === id)),
     workerSecretBindings: config.workerSecretBindings.length,
     issuerKey: Boolean(context.env.BROKER_ISSUER_KEY),
   });
