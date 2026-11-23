@@ -32,7 +32,6 @@
     "package:smoke": "bun run build && node scripts/package-smoke.mjs",
     "broker": "bun scripts/broker.ts",
     "deploy": "bun scripts/deploy.ts",
-    "deploy:alchemy": "bun scripts/deploy.ts --alchemy",
     "deploy:setup": "bun scripts/deploy.ts --setup-only",
     "deploy:wrangler": "bun run --cwd services/credential-broker deploy:wrangler",
     "dev": "bun run --cwd services/credential-broker dev"

@@ -1,6 +1,6 @@
 # Working on the credential broker
 
-The repository root contains the public TypeScript credential client and management CLI. The private Worker, SQLite schema and migrations, and Alchemy deployment live in `services/credential-broker`. The user guide lives in [Beachside's documentation](https://beachside.run/docs/guides/credential-broker/).
+The repository root contains the public TypeScript credential client and management CLI. The private Worker, its SQLite schema and migrations, and its Wrangler configuration live in `services/credential-broker`. The user guide lives in [Beachside's documentation](https://beachside.run/docs/guides/credential-broker/).
 
 Keep admin, issuer, and sandbox authentication separate. Resolve upstream credentials only after per-request grant authorization and send them only to fixed, administrator-configured upstreams. Keep plaintext credentials and role keys out of SQLite, logs, spans, errors, and committed files. Review the local fixture and operator docs when changing the wire contract or storage.
 
