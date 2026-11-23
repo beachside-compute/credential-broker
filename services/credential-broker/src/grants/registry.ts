@@ -24,9 +24,15 @@ const maxActiveGrants = 1000;
 const maxActiveGrantsPerOwner = 100;
 
 /** Per grant and integration. Git clones and fetches burst far more than model calls. */
-const defaultLimits = {
+const defaultLimits: Record<
+  IntegrationKind,
+  { requestsPerMinute: number; concurrentRequests: number }
+> = {
   github: { requestsPerMinute: 800, concurrentRequests: 32 },
-  other: { requestsPerMinute: 600, concurrentRequests: 32 },
+  anthropic: { requestsPerMinute: 600, concurrentRequests: 32 },
+  openai: { requestsPerMinute: 600, concurrentRequests: 32 },
+  openrouter: { requestsPerMinute: 600, concurrentRequests: 32 },
+  http: { requestsPerMinute: 300, concurrentRequests: 8 },
 };
 
 /** A lease whose release was lost stops counting after this long. */
@@ -461,7 +467,7 @@ export class GrantRegistry extends DurableObject {
         return { status: "invalid" };
 
       const { requestsPerMinute, concurrentRequests } = {
-        ...defaultLimits[integration.kind === "github" ? "github" : "other"],
+        ...defaultLimits[integration.kind],
         ...limits[integration.id],
       };
 
