@@ -13,7 +13,7 @@ npx skills add beachside-compute/credential-broker --skill broker-setup --skill 
 - [`broker-setup`](./skills/broker-setup/SKILL.md) guides a trusted operator through installing, deploying, and configuring the broker.
 - [`broker-grants`](./skills/broker-grants/SKILL.md) guides a trusted launcher through issuing a short-lived grant, configuring the sandbox's tools, and revoking the grant when the job ends.
 
-The skills use the checkout's Bun scripts to deploy the Worker and the `beachside-broker` CLI from `npm install -g @beachside/credential-client` for day-to-day management. The installer adds the skills to your agent's workspace. Install them on the trusted side. The sandbox agent uses its configured CLI or SDK as usual.
+Inside the checkout the skills use `bun run deploy` and `bun run broker`; on other machines, the `beachside-broker` CLI from `@beachside/credential-client`. Sandboxes don't need the skills; they use their configured CLI or SDK as usual.
 
 ## Deploy
 

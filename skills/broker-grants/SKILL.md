@@ -7,15 +7,18 @@ description: Issue and revoke short-lived Beachside credential broker grants fro
 
 Use this skill in the host or CI job that launches the sandbox. The sandbox gets the temporary tool environment and can use its configured CLI or SDK normally. Keep admin and issuer credentials, GitHub Actions OIDC request variables, and the rest of the host environment on the trusted side.
 
+If the launcher creates sandboxes with Beachside, use `beachside create --grant INTEGRATION_ID` or the SDK's `grant` option instead. They issue the grant, inject it, and revoke it when the sandbox is removed. See the [Beachside credential broker guide](https://beachside.run/docs/credential-broker/).
+
 1. Identify the broker origin, exact integration IDs, and expected job duration. Request only the integrations the workload needs. Use a short TTL that covers the job, such as 900 seconds for a 15-minute task.
-2. For static issuance, use the installed `beachside-broker` CLI on the trusted host. Install it with `npm install -g @beachside/credential-client` if needed. Set `BEACHSIDE_BROKER_URL` and provide `BEACHSIDE_BROKER_ISSUER_KEY` from the trusted host's secret store.
+2. For static issuance, use the installed `beachside-broker` CLI on the trusted host. Install it with `npm install -g @beachside/credential-client` if needed. Set `BEACHSIDE_BROKER_URL` and provide `BEACHSIDE_BROKER_ISSUER_KEY` from the trusted host's secret store, as a value or an `op://`, `bws://`, `pass://` or `env:NAME` reference. Issuance prints the grant token, so capture it in a variable and never print it, and keep it out of your own tool output.
 
    ```sh
-   beachside-broker grant issue INTEGRATION_ID --ttl 15m --label "sandbox job"
-   beachside-broker grant revoke GRANT_ID
+   grant=$(beachside-broker grant issue INTEGRATION_ID --ttl 15m --label "sandbox job" --json)
+   grant_id=$(jq -r .id <<<"$grant")
+   trap 'beachside-broker grant revoke "$grant_id"' EXIT
    ```
 
-   Capture issuance output privately and revoke after the workload exits. For scripts, add `--json` and capture stdout directly in the launcher. Use the grant ID for cleanup and map the token and gateway URL to the sandbox's tool configuration. For GitHub tool configuration, see the client examples below.
+   The JSON holds `id`, `token`, `expiresAt` and `gatewayUrls` keyed by integration ID. Run issuance, the workload and cleanup in one launcher script, since the trap revokes the grant when that shell exits. Map the token and gateway URL to the sandbox's tool configuration. For GitHub tool configuration, see the client examples below.
 
 3. For a GitHub Actions workflow authorized via OIDC, use the [TypeScript client](https://www.npmjs.com/package/@beachside/credential-client). The CLI uses a static issuer key. Install the client in the launcher project with `npm install @beachside/credential-client`. Give the trusted job `id-token: write` and use the exact audience from its [broker policy](https://github.com/beachside-compute/credential-broker/blob/main/services/credential-broker/README.md#authenticate-grant-issuance). Keep PR-controlled code, actions, and artifacts out of that job.
 
