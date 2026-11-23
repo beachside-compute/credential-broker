@@ -1,7 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { CredentialBrokerError } from "../src/transport.js";
-import { loadDeploymentFile, plaintextKeys, plaintextWarning, setupError } from "./deployment-file";
+import {
+  keySecrets,
+  loadDeploymentFile,
+  plaintextKeys,
+  plaintextWarning,
+  setupError,
+} from "./deployment-file";
 import { resolveSecret } from "../src/secret-ref.js";
 
 const root = resolve(import.meta.dir, "..");
@@ -116,7 +122,9 @@ async function broker() {
       return setupError(
         keyFromFile && fromEnv.url
           ? "The key in .env.deploy is only sent to the BEACHSIDE_BROKER_URL in that file. Add it there, or pass --url"
-          : "Run bun run deploy:setup to save the broker's URL in .env.deploy, or pass --url https://your-broker.example.com",
+          : file && keySecrets.some((name) => file[name] !== undefined)
+            ? "Add BEACHSIDE_BROKER_URL=https://your-broker.example.com to .env.deploy, or pass --url. bun run deploy also saves it"
+            : "Run bun run deploy:setup to create a broker and save its URL in .env.deploy. For an existing broker, add BEACHSIDE_BROKER_URL=https://your-broker.example.com to .env.deploy or pass --url",
       );
 
     env.BEACHSIDE_BROKER_URL = url;
