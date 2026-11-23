@@ -220,6 +220,10 @@ test("checkout command runs the Node CLI with the selected HTTPS origin and keys
       }
 
       const list = ["integration", "list", "--json"];
+      // A file with keys but no URL belongs to an existing broker, which setup would refuse.
+      const noURL = await run(list);
+      expect(noURL.stderr).toContain("Add BEACHSIDE_BROKER_URL=");
+      expect(noURL.stderr).not.toContain("deploy:setup");
       // A key from .env.deploy is never sent to a URL that only the environment names.
       const unpaired = await run(list, { BEACHSIDE_BROKER_URL: origin });
       expect(unpaired.status).toBe(2);
