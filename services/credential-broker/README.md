@@ -41,6 +41,7 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 | `BROKER_CONFIG`                                               | Optional JSON for GitHub Actions trust policies and declared Worker secret bindings. Defaults to an empty object. |
 | `CREDENTIAL_…`                                                | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.              |
 | `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                              |
+| `BROKER_EMAIL_FROM`                                           | Optional sender for `email` canary alerts. Deploys add the `send_email` binding only when it is set.              |
 | `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                  |
 
 The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes; on the first deploy that file briefly holds the generated keys. Wrangler runs without the broker settings or `BEACHSIDE_BROKER_*` keys from your environment. It uploads `BROKER_CONFIG` as a Worker secret binding. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
@@ -321,6 +322,7 @@ A canary is a decoy grant the administrator issues to detect a leak. Plant one w
 ```sh
 bun run broker alert add slack ops-chat --to-stdin < /secure/path/slack-webhook-url
 bun run broker alert add webhook pager --to-stdin --header "Authorization=op://Ops/incident-io/canary-source" < /secure/path/alert-url
+bun run broker alert add email inbox --to oncall@example.com
 bun run broker alert test pager
 bun run broker canary issue openrouter github --label "decoy .env on build-box" --env > decoy.env
 bun run broker canary list
@@ -328,12 +330,13 @@ bun run broker canary show <canary-id>
 bun run broker canary revoke <canary-id>
 ```
 
-Every destination receives every canary's alerts, and a broker holds up to 5, because alerts go to all of them at once and a Worker opens at most six connections at a time. There are two kinds of destination:
+Every destination receives every canary's alerts, and a broker holds up to 5, because alerts go to all of them at once and a Worker opens at most six connections at a time. There are three kinds of destination:
 
 - **`slack`** takes a Slack incoming webhook URL on `hooks.slack.com` and posts a readable message.
 - **`webhook`** takes any HTTPS URL and up to 10 custom headers, with at most 16 KB of URL and headers combined. It posts one flat JSON object of strings, signed per [Standard Webhooks](https://www.standardwebhooks.com/): `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<HMAC-SHA256>`. The signing secret is printed once, when you add the destination.
+- **`email`** takes one address and sends a plain-text email through [Cloudflare Email Service](https://developers.cloudflare.com/email-service/). It needs a sending domain on Cloudflare DNS and Workers Paid; see [Email alerts](#email-alerts).
 
-The URL, header values and signing secret are sealed with the broker's encryption key. Listings show only the host and header names. Rotating the encryption key means re-adding destinations.
+The URL, header values and signing secret are sealed with the broker's encryption key. Listings show only the host and header names, or an email destination's address. Rotating the encryption key means re-adding destinations.
 
 ```json
 {
@@ -380,6 +383,16 @@ The URL, header values and signing secret are sealed with the broker's encryptio
 
 - **incident.io:** create an HTTP alert source with a custom payload. Set the deduplication key path to `$.dedup_key`, and map `title` and `status` in the transform. Add its events URL with an `Authorization: Bearer <source token>` header.
 - **PagerDuty:** use a Custom Event Transformer integration that maps `title`, `severity` and `dedup_key`.
+
+### Email alerts
+
+Email alerts use [Cloudflare Email Sending](https://developers.cloudflare.com/email-service/get-started/send-emails/), which needs the Workers Paid plan and a domain on Cloudflare DNS.
+
+1. In the Cloudflare dashboard, go to **Compute** > **Email Service** > **Email Sending**, select **Onboard Domain** and pick a subdomain such as `alerts.example.com`. Cloudflare adds its SPF, DKIM, DMARC and bounce records, which usually takes a few minutes. A subdomain keeps alert mail separate from your main domain's reputation.
+2. Set `BROKER_EMAIL_FROM=canary@alerts.example.com` in `.env.deploy` and run `bun run deploy`. The deploy adds a `send_email` binding that may send only from that address.
+3. Add a destination and check it: `bun run broker alert add email inbox --to oncall@example.com`, then `bun run broker alert test inbox`.
+
+The subject is the alert title and the body lists the event's fields. A send the binding accepts shows as status 202 in `alert list`; a refused send shows as no answer. Without `BROKER_EMAIL_FROM`, the broker has no binding and refuses `email` destinations.
 
 ## Observability and trust
 

@@ -8,6 +8,9 @@ import type { TraceExportBindings } from "./observability/otlp";
 
 interface Env extends TraceExportBindings, WorkerSecretBindings, RoleBindings, EncryptionBindings {
   BROKER_CONFIG?: string;
+  /** Present only when the deployment sets BROKER_EMAIL_FROM. */
+  EMAIL?: SendEmail;
+  BROKER_EMAIL_FROM?: string;
   REGISTRY: DurableObjectNamespace<GrantRegistry>;
 }
 

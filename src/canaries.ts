@@ -1,9 +1,9 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unsafe-dictionary-type -- Parse canary and alert replies at the HTTP trust boundary. */
 import { CredentialBrokerError, integrationName } from "./transport.js";
 
-export type BrokerAlertKind = "slack" | "webhook";
+export type BrokerAlertKind = "slack" | "webhook" | "email";
 
-/** Where the broker sends canary alerts. The URL and header values stay sealed on the broker. */
+/** Where the broker sends canary alerts. URLs and header values stay sealed; `host` is an email destination's address. */
 export interface BrokerAlertDestination {
   readonly id: string;
   readonly kind: BrokerAlertKind;
@@ -16,12 +16,14 @@ export interface BrokerAlertDestination {
   readonly lastStatus: number | null;
 }
 
-export interface BrokerAlertDestinationInput {
-  id: string;
-  kind: BrokerAlertKind;
-  url: string;
-  headers?: Readonly<Record<string, string>>;
-}
+export type BrokerAlertDestinationInput =
+  | {
+      id: string;
+      kind: "slack" | "webhook";
+      url: string;
+      headers?: Readonly<Record<string, string>>;
+    }
+  | { id: string; kind: "email"; to: string };
 
 export interface BrokerCanary {
   readonly id: string;
@@ -165,7 +167,7 @@ export function parseDestination(value: unknown): BrokerAlertDestination {
   if (
     typeof id !== "string" ||
     !integrationName.test(id) ||
-    (kind !== "slack" && kind !== "webhook") ||
+    (kind !== "slack" && kind !== "webhook" && kind !== "email") ||
     typeof host !== "string" ||
     !Array.isArray(reply.headerNames) ||
     !reply.headerNames.every((name) => typeof name === "string") ||
@@ -186,19 +188,21 @@ export function parseDestination(value: unknown): BrokerAlertDestination {
 }
 
 export function destinationInput(input: BrokerAlertDestinationInput): BrokerAlertDestinationInput {
+  if (typeof input?.id !== "string" || !integrationName.test(input.id)) return invalidDestination();
+
+  if (input.kind === "email")
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.to ?? "")
+      ? { id: input.id, kind: "email", to: input.to }
+      : invalidDestination();
+
   const url = URL.parse(input?.url ?? "");
 
   if (
-    typeof input?.id !== "string" ||
-    !integrationName.test(input.id) ||
     (input.kind !== "slack" && input.kind !== "webhook") ||
     url?.protocol !== "https:" ||
     (input.kind === "slack" && (url.hostname !== "hooks.slack.com" || input.headers))
   )
-    throw new CredentialBrokerError(
-      "INVALID_ARGUMENT",
-      "Alert destinations need an HTTPS URL; Slack takes an incoming webhook URL on hooks.slack.com and no headers",
-    );
+    return invalidDestination();
 
   return {
     id: input.id,
@@ -206,4 +210,11 @@ export function destinationInput(input: BrokerAlertDestinationInput): BrokerAler
     url: url.href,
     ...(input.headers && { headers: { ...input.headers } }),
   };
+}
+
+function invalidDestination(): never {
+  throw new CredentialBrokerError(
+    "INVALID_ARGUMENT",
+    "Alert destinations need an HTTPS URL or, for email, one address; Slack takes an incoming webhook URL on hooks.slack.com and no headers",
+  );
 }

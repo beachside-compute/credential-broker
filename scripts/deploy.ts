@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -31,6 +31,30 @@ const workerNotFound = /Worker "[^"]+"(?: \(env: [^)]+\))? not found\./;
 /** Cloudflare's reply when Wrangler reads back a Worker its first upload just created. */
 const firstDeployRace = /code: 10007\]/;
 
+const emailAddress = /^[^\s@]{1,64}@[a-z0-9.-]{1,189}\.[a-z]{2,}$/i;
+
+/** Wrangler has no binding flags, so email alerts deploy from a copy of the config with the binding. */
+function emailConfig(from: string): string {
+  const service = resolve(repository, servicePath);
+
+  const config = Object.assign(
+    {},
+    Bun.JSONC.parse(readFileSync(resolve(service, "wrangler.jsonc"), "utf8")),
+  );
+
+  const path = resolve(service, "wrangler.email.json");
+
+  writeFileSync(
+    path,
+    JSON.stringify({
+      ...config,
+      send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }],
+    }),
+  );
+
+  return path;
+}
+
 /** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
 async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
   const deployment = new Map<string, string>();
@@ -45,6 +69,12 @@ async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, st
 
       if (!parsed.success) return setupError(`Provide a valid Worker secret binding for ${name}`);
       deployment.set(name, parsed.data);
+    }
+
+    if (env.BROKER_EMAIL_FROM !== undefined) {
+      if (!emailAddress.test(env.BROKER_EMAIL_FROM))
+        return setupError("BROKER_EMAIL_FROM must be one email address on your onboarded domain");
+      deployment.set("BROKER_EMAIL_FROM", env.BROKER_EMAIL_FROM);
     }
 
     if (env.BROKER_OTLP_TRACES_ENDPOINT !== undefined) {
@@ -199,7 +229,11 @@ async function deployWrangler(
     const path = resolve(directory, "secrets.json");
     writeFileSync(path, JSON.stringify(secrets), { flag: "wx", mode: 0o600 });
 
-    const command = ["deploy:wrangler", ...args, "--secrets-file", path];
+    const config = secrets.BROKER_EMAIL_FROM
+      ? ["--config", emailConfig(secrets.BROKER_EMAIL_FROM)]
+      : [];
+
+    const command = ["deploy:wrangler", ...args, ...config, "--secrets-file", path];
     let raced = false;
     let tail = "";
     let printed = "";
@@ -223,6 +257,7 @@ async function deployWrangler(
     return { code, url: deployedOrigin(printed) };
   } finally {
     rmSync(directory, { recursive: true, force: true });
+    rmSync(resolve(repository, servicePath, "wrangler.email.json"), { force: true });
   }
 }
 

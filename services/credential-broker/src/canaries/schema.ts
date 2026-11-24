@@ -26,7 +26,7 @@ export const canaryEvents = sqliteTable(
   (table) => [index("canary_events_canary").on(table.canaryId, table.at)],
 );
 
-export type AlertKind = "slack" | "webhook";
+export type AlertKind = "slack" | "webhook" | "email";
 
 export const alertDestinations = sqliteTable("alert_destinations", {
   identity: text().primaryKey(),

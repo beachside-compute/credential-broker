@@ -90,6 +90,7 @@ Canaries (admin key)
 Canary alerts (admin key; each destination gets at most one alert an hour)
   alert add slack <id> (--to <webhook-url> | --to-stdin)
   alert add webhook <id> (--to <url> | --to-stdin) [--header Name=value]...
+  alert add email <id> --to <address>      Needs BROKER_EMAIL_FROM on the broker
   alert list
   alert test <id>                          Send a test event now
   alert delete <id>
@@ -506,7 +507,7 @@ async function alertTarget(
 
   if (values["to-stdin"] && values.to === undefined) return readSecret();
 
-  return usageError("Give the destination URL with exactly one of --to or --to-stdin");
+  return usageError("Give the destination with exactly one of --to or --to-stdin");
 }
 
 async function alertHeaders(
@@ -1031,20 +1032,25 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
       case "alert add": {
         const [kind, id, ...extra] = operands;
 
-        if ((kind !== "slack" && kind !== "webhook") || !id || extra.length)
-          return usageError("Use alert add <slack|webhook> <id>");
+        if ((kind !== "slack" && kind !== "webhook" && kind !== "email") || !id || extra.length)
+          return usageError("Use alert add <slack|webhook|email> <id>");
 
-        if (kind === "slack" && values.header?.length)
-          return usageError("Slack destinations take no headers");
+        if (kind !== "webhook" && values.header?.length)
+          return usageError("Only webhook destinations take headers");
 
         const admin = await adminKey();
+        const target = await alertTarget(values, io.env);
 
-        const created = await admin.alerts.create({
-          id,
-          kind,
-          url: await alertTarget(values, io.env),
-          ...(kind === "webhook" && { headers: await alertHeaders(values.header, io.env) }),
-        });
+        const created = await admin.alerts.create(
+          kind === "email"
+            ? { id, kind, to: target }
+            : {
+                id,
+                kind,
+                url: target,
+                ...(kind === "webhook" && { headers: await alertHeaders(values.header, io.env) }),
+              },
+        );
 
         print(
           created,

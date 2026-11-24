@@ -152,7 +152,9 @@ const options: V4MiniflareOptions = {
   durableObjects: {
     REGISTRY: { className: "GrantRegistry", useSQLite: true },
   },
+  email: { send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.test"] }] },
   bindings: {
+    BROKER_EMAIL_FROM: "canary@alerts.test",
     BROKER_ADMIN_KEY: adminKey,
     BROKER_ISSUER_KEY: apiKey,
     BROKER_ENCRYPTION_KEYS: encryptionKeys,
@@ -2416,6 +2418,19 @@ test("canaries answer like unknown grants, stay hidden from issuers and alert ea
     true,
     tested,
   );
+
+  const email = await admin(
+    "/alerts",
+    "POST",
+    JSON.stringify({ id: "inbox", kind: "email", to: "oncall@example.com" }),
+  );
+
+  assert.equal(email.status, 201);
+  assert.equal(z.object({ host: z.string() }).parse(await email.json()).host, "oncall@example.com");
+
+  const mailed = await (await admin("/alerts/inbox/test", "POST")).json();
+  assert.deepEqual(mailed, { id: "inbox", status: 202, delivered: true });
+  assert.equal((await admin("/alerts/inbox", "DELETE")).status, 204);
 
   assert.equal((await admin(`/canaries/${canary.id}`, "DELETE")).status, 204);
   assert.equal((await admin("/alerts/ops-chat", "DELETE")).status, 204);

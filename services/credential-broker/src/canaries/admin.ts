@@ -11,6 +11,7 @@ import {
   alertEvent,
   deliver,
   destinationInput,
+  mailer,
   newSigningSecret,
   sealDestination,
   testEvent,
@@ -54,7 +55,13 @@ export function alertOnTrip<E extends Worker>(context: Context<E>, trip: Trip | 
   context.executionCtx.waitUntil(
     Promise.all(
       trip.deliveries.map(async (delivery) => {
-        const status = await deliver(delivery, alertEvent(trip, delivery, host), keyring);
+        const status = await deliver(
+          delivery,
+          alertEvent(trip, delivery, host),
+          keyring,
+          mailer(context.env),
+        );
+
         await store.recordDelivery(delivery.identity, status).catch(() => {});
       }),
     ),
@@ -154,13 +161,21 @@ canaryAdminRoutes.post("/alerts", async (context) => {
 
   if (!input.success) return failure(400, "invalid_alert_destination");
 
-  const { id, kind, url, headers = {} } = input.data;
+  const destination = input.data;
+
+  if (destination.kind === "email" && !mailer(context.env))
+    return failure(400, "email_alerts_not_configured");
+
+  const { id, kind } = destination;
   const identity = crypto.randomUUID();
   const signingSecret = kind === "webhook" ? newSigningSecret() : undefined;
+  const headers = destination.kind === "email" ? {} : (destination.headers ?? {});
 
   const config = await sealDestination(
     { identity, id, kind },
-    { url: url.href, headers, ...(signingSecret && { signingSecret }) },
+    destination.kind === "email"
+      ? { to: destination.to }
+      : { url: destination.url.href, headers, ...(signingSecret && { signingSecret }) },
     context.get("keyring"),
   );
 
@@ -171,7 +186,7 @@ canaryAdminRoutes.post("/alerts", async (context) => {
     id,
     kind,
     config,
-    host: url.host,
+    host: destination.kind === "email" ? destination.to : destination.url.host,
     headerNames: Object.keys(headers),
   });
 
@@ -196,6 +211,7 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
     destination,
     testEvent(new URL(context.req.url).host),
     context.get("keyring"),
+    mailer(context.env),
   );
 
   await store.recordDelivery(destination.identity, status);

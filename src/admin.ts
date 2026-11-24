@@ -682,7 +682,9 @@ function requestLimits(
 
 const adminMessages = {
   invalid_alert_destination: () =>
-    "The broker rejected the alert destination. Use an HTTPS URL; Slack takes an incoming webhook URL and no headers",
+    "The broker rejected the alert destination. Use an HTTPS URL or, for email, one address; Slack takes an incoming webhook URL and no headers",
+  email_alerts_not_configured: () =>
+    "This broker has no email sender. Onboard a domain in Cloudflare Email Service, set BROKER_EMAIL_FROM in .env.deploy and redeploy",
   alert_destination_exists: (id) => `Alert destination ${id} already exists. Pick another ID`,
   alert_destination_not_found: (id) =>
     `Alert destination ${id} was not found. List them with \`${hint("alert list")}\``,
