@@ -2,4 +2,4 @@
 "@beachside-internal/credential-broker": minor
 ---
 
-Serve the broker on your own hostnames: set `BROKER_CUSTOM_DOMAINS=gateway.example.com` (comma-separated) in `.env.deploy` and `bun run deploy` attaches them as Cloudflare Custom Domains alongside `workers.dev`. The zone must be in the same Cloudflare account. Deployments without the setting are unchanged.
+Customize Wrangler settings for your own deployment without editing the tracked config: put them in `services/credential-broker/wrangler.local.jsonc` (ignored by git, see `wrangler.local.jsonc.example`) and `bun run deploy` merges its top-level keys over `wrangler.jsonc`. For example, add `routes` with `custom_domain: true` to serve the broker on your own hostname alongside `workers.dev`.

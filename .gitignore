@@ -30,3 +30,4 @@ coverage/
 .roo/
 .windsurf/
 wrangler.deploy.*.json
+wrangler.local.jsonc

@@ -311,15 +311,17 @@ test("help and dry run need no settings or Worker", () =>
     expect(existsSync(join(root, ".env.deploy"))).toBe(false);
   }));
 
-test("an email sender and custom domains deploy from a generated config only when set", () =>
+test("local Wrangler settings and an email sender deploy from a generated config", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
     writeFileSync(
-      join(root, ".env.deploy"),
-      "BROKER_EMAIL_FROM=canary@alerts.example.com\nBROKER_CUSTOM_DOMAINS=gateway.example.com\n",
-      { mode: 0o600 },
+      join(service, "wrangler.local.jsonc"),
+      '{ "routes": [{ "pattern": "gateway.example.com", "custom_domain": true }] }',
     );
+    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=canary@alerts.example.com\n", {
+      mode: 0o600,
+    });
 
     const run = spawn(command, { WORKER_SECRETS: deployed });
     expect(run.code, run.stderr).toBe(0);
@@ -336,14 +338,13 @@ test("an email sender and custom domains deploy from a generated config only whe
     expect(dryRun.code, dryRun.stderr).toBe(0);
     expect(calls(service)[1].config).toEqual(upload.config);
 
-    for (const invalid of [
-      "BROKER_EMAIL_FROM=not-an-address",
-      "BROKER_CUSTOM_DOMAINS=https://x.y/",
-    ]) {
-      writeFileSync(join(root, ".env.deploy"), `${invalid}\n`);
-      expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
-      expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
-    }
+    writeFileSync(join(service, "wrangler.local.jsonc"), '{ "migrations": [] }');
+    expect(spawn(command, { WORKER_SECRETS: deployed }).stderr).toContain("cannot set migrations");
+
+    writeFileSync(join(service, "wrangler.local.jsonc"), "{}");
+    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
+    expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
+    expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
 
     expect(calls(service)).toHaveLength(2);
   }));
