@@ -326,10 +326,10 @@ bun run broker canary show <canary-id>
 bun run broker canary revoke <canary-id>
 ```
 
-Every destination receives every canary's alerts. There are two kinds of destination:
+Every destination receives every canary's alerts, and a broker holds up to 5, because alerts go to all of them at once and a Worker opens at most six connections at a time. There are two kinds of destination:
 
 - **`slack`** takes a Slack incoming webhook URL on `hooks.slack.com` and posts a readable message.
-- **`webhook`** takes any HTTPS URL and up to 10 custom headers. It posts one flat JSON object of strings, signed per [Standard Webhooks](https://www.standardwebhooks.com/): `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<HMAC-SHA256>`. The signing secret is printed once, when you add the destination.
+- **`webhook`** takes any HTTPS URL and up to 10 custom headers, with at most 16 KB of URL and headers combined. It posts one flat JSON object of strings, signed per [Standard Webhooks](https://www.standardwebhooks.com/): `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<HMAC-SHA256>`. The signing secret is printed once, when you add the destination.
 
 The URL, header values and signing secret are sealed with the broker's encryption key. Listings show only the host and header names. Rotating the encryption key means re-adding destinations.
 

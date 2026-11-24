@@ -2303,6 +2303,22 @@ test("canaries answer like unknown grants, stay hidden from issuers and alert ea
     .object({ signingSecret: z.string().startsWith("whsec_") })
     .parse(await webhook.json());
 
+  const oversized = await admin(
+    "/alerts",
+    "POST",
+    JSON.stringify({
+      id: "oversized",
+      kind: "webhook",
+      url: "https://alerts.example.com/hook",
+      headers: Object.fromEntries(
+        ["a", "b", "c", "d"].map((name) => [`x-${name}`, "v".repeat(4096)]),
+      ),
+    }),
+  );
+
+  assert.equal(oversized.status, 400);
+  await oversized.text();
+
   for (const url of [
     "https://example.com/slack",
     "http://hooks.slack.com/x",

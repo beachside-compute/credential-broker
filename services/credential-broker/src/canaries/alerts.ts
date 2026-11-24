@@ -63,6 +63,9 @@ export const destinationInput = z
       kind === "webhook" || (url.hostname === "hooks.slack.com" && !headers),
   );
 
+/** The sealed configuration's plaintext limit, enforced when it is created and opened. */
+export const maxDestinationConfigBytes = 16_384;
+
 interface DestinationConfig {
   url: string;
   headers: Record<string, string>;
@@ -73,12 +76,17 @@ function sealContext(destination: { identity: string; id: string; kind: AlertKin
   return ["beachside-alert/v1", destination.identity, destination.id, destination.kind];
 }
 
-export function sealDestination(
+/** Seal a destination, or return nothing when delivery could not open it again. */
+export async function sealDestination(
   destination: { identity: string; id: string; kind: AlertKind },
   config: DestinationConfig,
   keyring: EncryptionKeyring,
-): Promise<EncryptedCredential> {
-  return sealValue(JSON.stringify(config), sealContext(destination), keyring);
+): Promise<EncryptedCredential | undefined> {
+  const json = JSON.stringify(config);
+
+  if (encoder.encode(json).byteLength > maxDestinationConfigBytes) return;
+
+  return sealValue(json, sealContext(destination), keyring);
 }
 
 /** A Standard Webhooks signing secret. */
@@ -151,7 +159,12 @@ export async function deliver(
   keyring: EncryptionKeyring,
 ): Promise<number> {
   try {
-    const json = await openValue(destination.config, sealContext(destination), keyring, 16_384);
+    const json = await openValue(
+      destination.config,
+      sealContext(destination),
+      keyring,
+      maxDestinationConfigBytes,
+    );
 
     if (json === undefined) return 0;
 
@@ -214,20 +227,25 @@ function slackMessage(event: AlertEvent) {
   return {
     text: event.title,
     blocks: [
-      { type: "section", text: { type: "mrkdwn", text: `*${escape(event.title)}*` } },
+      { type: "section", text: { type: "mrkdwn", text: clip(`*${escape(event.title)}*`, 3_000) } },
       ...(fields.length
         ? [
             {
               type: "section",
               fields: fields.map(([name, value]) => ({
                 type: "mrkdwn",
-                text: `*${name}*\n${escape(value)}`,
+                text: clip(`*${name}*\n${escape(value)}`, 2_000),
               })),
             },
           ]
         : []),
     ],
   };
+}
+
+/** Slack rejects a block over its limit, so cut long text and any entity the cut splits. */
+function clip(text: string, limit: number) {
+  return text.length <= limit ? text : `${text.slice(0, limit - 1).replace(/&[a-z]*$/, "")}…`;
 }
 
 function escape(text: string) {

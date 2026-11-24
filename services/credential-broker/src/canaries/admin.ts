@@ -164,6 +164,8 @@ canaryAdminRoutes.post("/alerts", async (context) => {
     context.get("keyring"),
   );
 
+  if (!config) return failure(400, "invalid_alert_destination");
+
   const result = await registry(context.env).createDestination({
     identity,
     id,

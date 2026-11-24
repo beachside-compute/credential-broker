@@ -686,7 +686,7 @@ const adminMessages = {
   alert_destination_exists: (id) => `Alert destination ${id} already exists. Pick another ID`,
   alert_destination_not_found: (id) =>
     `Alert destination ${id} was not found. List them with \`${hint("alert list")}\``,
-  alert_destination_limit: () => "The broker already holds its limit of 20 alert destinations",
+  alert_destination_limit: () => "The broker already holds its limit of 5 alert destinations",
   canary_not_found: (id) => `Canary ${id} was not found. List them with \`${hint("canary list")}\``,
   canary_limit: () => "The broker already holds its limit of 100 canaries",
   invalid_canary_request: () => "The broker rejected the canary request",

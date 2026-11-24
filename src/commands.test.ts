@@ -88,16 +88,30 @@ test("plants a canary as the variables a sandbox grant would set, and adds alert
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
-      bodies.push(await request.json());
+      const { pathname } = new URL(request.url);
 
-      return new URL(request.url).pathname === "/v1/admin/canaries"
+      if (request.method === "DELETE") {
+        bodies.push({ deleted: pathname });
+
+        return new Response(null, { status: 204 });
+      }
+
+      const body: { integrations?: string[] } = await request.json();
+      bodies.push(body);
+
+      return pathname === "/v1/admin/canaries"
         ? Response.json(
             {
               id: "0b0e6f6c-5f4e-4c3e-8a9b-1c2d3e4f5a6b",
               token,
               expiresAt: "2026-11-30T00:00:00.000Z",
-              integrations: ["github", "openrouter"],
-              kinds: { github: "github", openrouter: "openrouter" },
+              integrations: body.integrations,
+              kinds: Object.fromEntries(
+                (body.integrations ?? []).map((id) => [
+                  id,
+                  id.startsWith("github") ? "github" : id,
+                ]),
+              ),
             },
             { status: 201 },
           )
@@ -142,6 +156,11 @@ test("plants a canary as the variables a sandbox grant would set, and adds alert
     expect(out.at(-1)).toContain(`OPENROUTER_BASE_URL=${origin}/gateway/openrouter/v1`);
     expect(out.at(-1)).toContain(`OPENROUTER_API_KEY=${token}`);
     expect(out.at(-1)).toContain(`GH_ENTERPRISE_TOKEN=${token}`);
+
+    expect(await runBrokerCli(["canary", "issue", "github", "github-work", "--env"], io)).toBe(2);
+    expect(bodies.at(-1)).toEqual({
+      deleted: "/v1/admin/canaries/0b0e6f6c-5f4e-4c3e-8a9b-1c2d3e4f5a6b",
+    });
 
     expect(
       await runBrokerCli(

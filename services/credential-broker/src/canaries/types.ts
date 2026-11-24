@@ -56,7 +56,8 @@ export interface DestinationSummary {
 
 export const maxCanaries = 100;
 
-export const maxDestinations = 20;
+/** Every destination is sent at once, and a Worker opens at most six connections at a time. */
+export const maxDestinations = 5;
 
 export const maxCanaryEvents = 100;
 

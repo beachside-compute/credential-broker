@@ -940,7 +940,16 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
         });
 
         if (values.env) {
-          const env = canaryEnv(base, canary.token, canary.integrations, canary.kinds);
+          let env: ReturnType<typeof canaryEnv>;
+
+          try {
+            env = canaryEnv(base, canary.token, canary.integrations, canary.kinds);
+          } catch (error) {
+            // A canary never expires, so one that cannot be planted must not stay live.
+            await admin.canaries.revoke(canary.id).catch(() => {});
+            throw error;
+          }
+
           io.stdout(
             json
               ? JSON.stringify(env)
