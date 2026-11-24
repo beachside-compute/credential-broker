@@ -17,6 +17,15 @@ import type {
   StoredIntegration,
 } from "../integrations/types";
 import { grants, leases, usage } from "./schema";
+import { alertDestinations, canaries, canaryEvents } from "../canaries/schema";
+import { alertIntervalMs, maxCanaries, maxCanaryEvents, maxDestinations } from "../canaries/types";
+import type {
+  AlertDelivery,
+  CanarySummary,
+  DestinationSummary,
+  Trip,
+  TripRequest,
+} from "../canaries/types";
 
 const minuteMs = 60_000;
 
@@ -57,7 +66,31 @@ export interface GrantSummary {
   lastUsedAt: number | null;
 }
 
-type Renewal = { status: "renewed"; grant: GrantSummary } | { status: "not_found" };
+type Renewal = { status: "renewed"; grant: GrantSummary } | { status: "not_found"; trip?: Trip };
+
+type CanaryMatch = { hash: string } | { id: string };
+
+export interface CanaryRecord {
+  id: string;
+  hash: string;
+  integrations: string[];
+  label?: string;
+  note?: string;
+}
+
+type CanaryIssuance =
+  | { status: "created"; kinds: Record<string, IntegrationKind> }
+  | { status: "not_found"; integrations: string[] }
+  | { status: "limit" };
+
+export interface DestinationRecord {
+  identity: string;
+  id: string;
+  kind: AlertDelivery["kind"];
+  config: AlertDelivery["config"];
+  host: string;
+  headerNames: string[];
+}
 
 type IntegrationCreation = "exists" | "limit" | IntegrationMetadata;
 
@@ -68,7 +101,8 @@ export type Authorization =
       traceparent: string | null;
       integration: StoredIntegration;
     }
-  | { status: "invalid" | "forbidden" | "busy" };
+  | { status: "invalid"; trip?: Trip }
+  | { status: "forbidden" | "busy" };
 
 export class GrantRegistry extends DurableObject {
   private readonly db;
@@ -326,7 +360,12 @@ export class GrantRegistry extends DurableObject {
   }
 
   /** Move an active grant's expiry to `expiresAt`, keeping its scope and token. */
-  async renew(id: string, owner: string, expiresAt: number): Promise<Renewal> {
+  async renew(
+    id: string,
+    owner: string,
+    expiresAt: number,
+    request: TripRequest,
+  ): Promise<Renewal> {
     const now = Date.now();
 
     const renewed = this.db
@@ -336,7 +375,7 @@ export class GrantRegistry extends DurableObject {
       .returning()
       .get();
 
-    if (!renewed) return { status: "not_found" };
+    if (!renewed) return { status: "not_found", trip: this.tripCanary({ id }, request) };
 
     await this.scheduleCleanup(expiresAt);
 
@@ -405,10 +444,223 @@ export class GrantRegistry extends DurableObject {
     });
   }
 
-  revoke(id: string, owner: string): void {
-    this.db
+  /** Revoke a grant. Naming a canary instead trips it. */
+  revoke(id: string, owner: string, request: TripRequest): Trip | undefined {
+    const revoked = this.db
       .delete(grants)
       .where(and(eq(grants.id, id), eq(grants.owner, owner)))
+      .returning({ id: grants.id })
+      .get();
+
+    return revoked ? undefined : this.tripCanary({ id }, request);
+  }
+
+  /** Record a canary's use and claim the alerts that are due. Returns nothing for other tokens. */
+  tripCanary(match: CanaryMatch, request: TripRequest): Trip | undefined {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+
+      const canary = this.db
+        .update(canaries)
+        .set({
+          trips: sql`${canaries.trips} + 1`,
+          firstTrippedAt: sql`coalesce(${canaries.firstTrippedAt}, ${now})`,
+          lastTrippedAt: now,
+        })
+        .where("hash" in match ? eq(canaries.hash, match.hash) : eq(canaries.id, match.id))
+        .returning()
+        .get();
+
+      if (!canary) return;
+
+      const recorded = { ...request };
+      this.db.insert(canaryEvents).values({ canaryId: canary.id, event: recorded, at: now }).run();
+      this.db.run(sql`
+        DELETE FROM ${canaryEvents} WHERE ${canaryEvents.canaryId} = ${canary.id} AND ${canaryEvents.id} NOT IN (
+          SELECT ${canaryEvents.id} FROM ${canaryEvents} WHERE ${canaryEvents.canaryId} = ${canary.id}
+          ORDER BY ${canaryEvents.id} DESC LIMIT ${maxCanaryEvents}
+        )
+      `);
+
+      const label = canary.label ?? canary.id;
+      const deliveries: AlertDelivery[] = [];
+
+      for (const destination of this.db.select().from(alertDestinations).all()) {
+        const labels = [...new Set([...destination.pendingLabels, label])].slice(-20);
+
+        const due =
+          destination.lastAlertAt === null || now - destination.lastAlertAt >= alertIntervalMs;
+
+        this.db
+          .update(alertDestinations)
+          .set(
+            due
+              ? { lastAlertAt: now, pendingTrips: 0, pendingLabels: [] }
+              : { pendingTrips: destination.pendingTrips + 1, pendingLabels: labels },
+          )
+          .where(eq(alertDestinations.identity, destination.identity))
+          .run();
+
+        if (due)
+          deliveries.push({
+            identity: destination.identity,
+            id: destination.id,
+            kind: destination.kind,
+            config: destination.config,
+            trips: destination.pendingTrips + 1,
+            labels,
+          });
+      }
+
+      return {
+        event: {
+          canary_id: canary.id,
+          canary_label: label,
+          canary_note: canary.note ?? "",
+          canary_created_at: new Date(canary.createdAt).toISOString(),
+          occurred_at: new Date(now).toISOString(),
+          trips_total: String(canary.trips),
+          first_tripped_at: new Date(canary.firstTrippedAt ?? now).toISOString(),
+          ...Object.fromEntries(
+            Object.entries(request).map(([key, value]) => [`request_${key}`, value]),
+          ),
+        },
+        deliveries,
+      };
+    });
+  }
+
+  createCanary(record: CanaryRecord): CanaryIssuance {
+    return this.ctx.storage.transactionSync((): CanaryIssuance => {
+      const known = this.db
+        .select({ id: integrations.id, kind: integrations.kind })
+        .from(integrations)
+        .where(inArray(integrations.id, record.integrations))
+        .all();
+
+      const missing = record.integrations.filter((id) => !known.some((row) => row.id === id));
+
+      if (missing.length) return { status: "not_found", integrations: missing };
+
+      const { total } = this.db.select({ total: count() }).from(canaries).get()!;
+
+      if (total >= maxCanaries) return { status: "limit" };
+
+      this.db
+        .insert(canaries)
+        .values({
+          id: record.id,
+          hash: record.hash,
+          label: record.label,
+          note: record.note,
+          integrations: record.integrations,
+          createdAt: Date.now(),
+        })
+        .run();
+
+      return {
+        status: "created",
+        kinds: Object.fromEntries(known.map(({ id, kind }) => [id, kind])),
+      };
+    });
+  }
+
+  listCanaries(): CanarySummary[] {
+    return this.db
+      .select({
+        id: canaries.id,
+        label: canaries.label,
+        note: canaries.note,
+        integrations: canaries.integrations,
+        createdAt: canaries.createdAt,
+        trips: canaries.trips,
+        firstTrippedAt: canaries.firstTrippedAt,
+        lastTrippedAt: canaries.lastTrippedAt,
+      })
+      .from(canaries)
+      .orderBy(desc(canaries.createdAt), canaries.id)
+      .all();
+  }
+
+  /** A canary with its most recent trips, newest first. */
+  getCanary(id: string): (CanarySummary & { events: Record<string, string>[] }) | undefined {
+    const canary = this.listCanaries().find((row) => row.id === id);
+
+    if (!canary) return;
+
+    const events = this.db
+      .select({ event: canaryEvents.event, at: canaryEvents.at })
+      .from(canaryEvents)
+      .where(eq(canaryEvents.canaryId, id))
+      .orderBy(desc(canaryEvents.id))
+      .all()
+      .map(({ event, at }) => ({ at: new Date(at).toISOString(), ...event }));
+
+    return { ...canary, events };
+  }
+
+  revokeCanary(id: string): boolean {
+    return Boolean(
+      this.db.delete(canaries).where(eq(canaries.id, id)).returning({ id: canaries.id }).get(),
+    );
+  }
+
+  createDestination(record: DestinationRecord): "exists" | "limit" | DestinationSummary {
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.db
+        .select({ id: alertDestinations.id })
+        .from(alertDestinations)
+        .where(eq(alertDestinations.id, record.id))
+        .get();
+
+      if (existing) return "exists";
+
+      const { total } = this.db.select({ total: count() }).from(alertDestinations).get()!;
+
+      if (total >= maxDestinations) return "limit";
+
+      const created = this.db
+        .insert(alertDestinations)
+        .values({ ...record, createdAt: Date.now() })
+        .returning()
+        .get();
+
+      return destinationSummary(created);
+    });
+  }
+
+  listDestinations(): DestinationSummary[] {
+    return this.db
+      .select()
+      .from(alertDestinations)
+      .orderBy(alertDestinations.id)
+      .all()
+      .map(destinationSummary);
+  }
+
+  /** A destination's sealed configuration, for a test delivery. */
+  destination(id: string): Omit<AlertDelivery, "trips" | "labels"> | undefined {
+    return this.db
+      .select({
+        identity: alertDestinations.identity,
+        id: alertDestinations.id,
+        kind: alertDestinations.kind,
+        config: alertDestinations.config,
+      })
+      .from(alertDestinations)
+      .where(eq(alertDestinations.id, id))
+      .get();
+  }
+
+  deleteDestination(id: string): void {
+    this.db.delete(alertDestinations).where(eq(alertDestinations.id, id)).run();
+  }
+
+  recordDelivery(identity: string, status: number): void {
+    this.db
+      .update(alertDestinations)
+      .set({ lastDeliveryAt: Date.now(), lastStatus: status })
+      .where(eq(alertDestinations.identity, identity))
       .run();
   }
 
@@ -417,17 +669,18 @@ export class GrantRegistry extends DurableObject {
     selector: IntegrationSelector,
     usesApiKeyHeader: boolean,
     limits: RequestLimits,
+    request: TripRequest,
   ): Authorization {
     const now = Date.now();
 
-    return this.ctx.storage.transactionSync(() => {
+    return this.ctx.storage.transactionSync((): Authorization => {
       const grant = this.db
         .select()
         .from(grants)
         .where(and(eq(grants.hash, hash), gt(grants.expiresAt, now)))
         .get();
 
-      if (!grant) return { status: "invalid" };
+      if (!grant) return { status: "invalid", trip: this.tripCanary({ hash }, request) };
 
       const candidates = this.db
         .select()
@@ -546,6 +799,12 @@ export class GrantRegistry extends DurableObject {
 
     if (current == null || at < current) await this.ctx.storage.setAlarm(at);
   }
+}
+
+function destinationSummary(row: typeof alertDestinations.$inferSelect): DestinationSummary {
+  const { id, kind, host, headerNames, createdAt, lastAlertAt, lastDeliveryAt, lastStatus } = row;
+
+  return { id, kind, host, headerNames, createdAt, lastAlertAt, lastDeliveryAt, lastStatus };
 }
 
 function metadata(integration: StoredIntegration): IntegrationMetadata {

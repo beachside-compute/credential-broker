@@ -79,3 +79,115 @@ test("asks for the key a command needs when no setting supplies it", async () =>
     await server.stop(true);
   }
 });
+
+test("plants a canary as the variables a sandbox grant would set, and adds alert destinations", async () => {
+  const token = `bsg_${"a".repeat(64)}`;
+  const bodies: unknown[] = [];
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const { pathname } = new URL(request.url);
+
+      if (request.method === "DELETE") {
+        bodies.push({ deleted: pathname });
+
+        return new Response(null, { status: 204 });
+      }
+
+      const body: { integrations?: string[] } = await request.json();
+      bodies.push(body);
+
+      return pathname === "/v1/admin/canaries"
+        ? Response.json(
+            {
+              id: "0b0e6f6c-5f4e-4c3e-8a9b-1c2d3e4f5a6b",
+              token,
+              expiresAt: "2026-11-30T00:00:00.000Z",
+              integrations: body.integrations,
+              kinds: Object.fromEntries(
+                (body.integrations ?? []).map((id) => [
+                  id,
+                  id.startsWith("github") ? "github" : id,
+                ]),
+              ),
+            },
+            { status: 201 },
+          )
+        : Response.json(
+            {
+              id: "pager",
+              kind: "webhook",
+              host: "alerts.example.com",
+              headerNames: ["Authorization"],
+              createdAt: "2026-11-23T00:00:00.000Z",
+              lastAlertAt: null,
+              lastDeliveryAt: null,
+              lastStatus: null,
+              signingSecret: "whsec_c2VjcmV0",
+            },
+            { status: 201 },
+          );
+    },
+  });
+
+  try {
+    const out: string[] = [];
+    const origin = `http://127.0.0.1:${server.port}`;
+
+    const io = {
+      env: {
+        BEACHSIDE_BROKER_URL: origin,
+        BEACHSIDE_BROKER_ADMIN_KEY: `admin-key-${"k".repeat(32)}`,
+        PAGER_TOKEN: "Bearer from-env",
+      },
+      stdout: (text: string) => out.push(text),
+      stderr: () => {},
+    };
+
+    expect(
+      await runBrokerCli(
+        ["canary", "issue", "github", "openrouter", "--label", "decoy", "--env"],
+        io,
+      ),
+    ).toBe(0);
+    expect(bodies.at(-1)).toEqual({ integrations: ["github", "openrouter"], label: "decoy" });
+    expect(out.at(-1)).toContain(`OPENROUTER_BASE_URL=${origin}/gateway/openrouter/v1`);
+    expect(out.at(-1)).toContain(`OPENROUTER_API_KEY=${token}`);
+    expect(out.at(-1)).toContain(`GH_ENTERPRISE_TOKEN=${token}`);
+
+    expect(await runBrokerCli(["canary", "issue", "github", "github-work", "--env"], io)).toBe(2);
+    expect(bodies.at(-1)).toEqual({
+      deleted: "/v1/admin/canaries/0b0e6f6c-5f4e-4c3e-8a9b-1c2d3e4f5a6b",
+    });
+
+    expect(
+      await runBrokerCli(
+        [
+          "alert",
+          "add",
+          "webhook",
+          "pager",
+          "--to",
+          "https://alerts.example.com/hook",
+          "--header",
+          "Authorization=env:PAGER_TOKEN",
+        ],
+        io,
+      ),
+    ).toBe(0);
+    expect(bodies.at(-1)).toEqual({
+      id: "pager",
+      kind: "webhook",
+      url: "https://alerts.example.com/hook",
+      headers: { Authorization: "Bearer from-env" },
+    });
+    expect(out.at(-1)).toContain("whsec_c2VjcmV0");
+    expect(
+      await runBrokerCli(["alert", "add", "slack", "chat", "--to", "https://example.com/x"], io),
+    ).toBe(2);
+  } finally {
+    await server.stop(true);
+  }
+});

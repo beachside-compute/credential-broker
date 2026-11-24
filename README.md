@@ -106,6 +106,17 @@ bun run broker integration delete openrouter
 
 Deleting an integration also revokes its grants and removes it from the issuer allowlist. Requests already authorized may finish. Broker revocation leaves the upstream token active at GitHub or its provider. See the [deployment runbook](./services/credential-broker/README.md#manage-integrations) for lifecycle and key-rotation details.
 
+### Detect a leaked grant with a canary
+
+A canary is a decoy grant that nothing legitimate uses. Any use of it is refused like an unknown grant and alerts a Slack channel or a signed webhook (PagerDuty, incident.io or anything else), at most once an hour per destination.
+
+```sh
+bun run broker alert add slack ops-chat --to-stdin < /secure/path/slack-webhook-url
+bun run broker canary issue openrouter --label "decoy .env" --env > decoy.env
+```
+
+See [Canary tokens](./services/credential-broker/README.md#canary-tokens) for the alert payload and receiver setup.
+
 ### Command output
 
 Commands print text for people and JSON with `--json`. Errors name the fix, for example `Integration openrouter is not allowed to issue grants. Allow it with ...`. Exit codes match the Beachside CLI: 0 success, 1 other failure, 2 usage, 3 not found, 5 authentication or permission, 6 outcome unknown (a write may have applied; check before retrying), 7 retryable.

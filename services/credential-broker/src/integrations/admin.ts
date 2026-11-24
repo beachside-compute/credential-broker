@@ -24,6 +24,7 @@ import { grantView } from "../grants/view";
 import { finishSpan, parseTraceparent, startSpan } from "../observability/tracing";
 import type { AdminOperation } from "../observability/tracing";
 import { integrationKind, maxIntegrations } from "./types";
+import { canaryAdminRoutes, tripRoleKey } from "../canaries/admin";
 import type { IntegrationRevision } from "./types";
 
 const maxAdminBody = 16_384;
@@ -64,6 +65,8 @@ export const adminRoutes = new Hono<AdminWorker>();
 
 adminRoutes.use("*", async (context, next) => {
   if (!(await administrator(context.req.raw, context.env.BROKER_ADMIN_KEY))) {
+    await tripRoleKey(context, "admin-auth");
+
     return failure(401, "administrator_authentication_required");
   }
 
@@ -287,6 +290,8 @@ adminRoutes.delete(
     return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
   },
 );
+
+adminRoutes.route("/", canaryAdminRoutes);
 
 function traceAdmin(operation: AdminOperation): MiddlewareHandler<AdminWorker> {
   return async (context, next) => {

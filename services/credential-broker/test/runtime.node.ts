@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -1165,7 +1166,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 5 },
+        { count: 6 },
       ]);
 
       const path = "/gateway/openai/v1/models";
@@ -2269,4 +2270,154 @@ test("scopes GitHub Actions grant listing and renewal to the issuing run, and co
 
   assert.equal((await access(`/v1/grants/${record.id}`, authority, "DELETE")).status, 204);
   assert.equal((await access(`/v1/grants/${extra.id}`, apiKey, "DELETE")).status, 204);
+});
+
+test("canaries answer like unknown grants, stay hidden from issuers and alert each destination at most hourly", async () => {
+  const slack = await admin(
+    "/alerts",
+    "POST",
+    JSON.stringify({
+      id: "ops-chat",
+      kind: "slack",
+      url: "https://hooks.slack.com/services/T0/B0/slack-secret",
+    }),
+  );
+
+  assert.equal(slack.status, 201);
+  await slack.text();
+
+  const webhook = await admin(
+    "/alerts",
+    "POST",
+    JSON.stringify({
+      id: "pager",
+      kind: "webhook",
+      url: "https://alerts.example.com/hook?routing=url-secret",
+      headers: { Authorization: "Bearer header-secret" },
+    }),
+  );
+
+  assert.equal(webhook.status, 201);
+
+  const { signingSecret } = z
+    .object({ signingSecret: z.string().startsWith("whsec_") })
+    .parse(await webhook.json());
+
+  const oversized = await admin(
+    "/alerts",
+    "POST",
+    JSON.stringify({
+      id: "oversized",
+      kind: "webhook",
+      url: "https://alerts.example.com/hook",
+      headers: Object.fromEntries(
+        ["a", "b", "c", "d"].map((name) => [`x-${name}`, "v".repeat(4096)]),
+      ),
+    }),
+  );
+
+  assert.equal(oversized.status, 400);
+  await oversized.text();
+
+  for (const url of [
+    "https://example.com/slack",
+    "http://hooks.slack.com/x",
+    "https://1.2.3.4/x",
+  ]) {
+    const refused = await admin(
+      "/alerts",
+      "POST",
+      JSON.stringify({ id: "bad", kind: "slack", url }),
+    );
+
+    assert.equal(refused.status, 400);
+    await refused.text();
+  }
+
+  const destinations = await (await admin("/alerts")).text();
+
+  for (const value of ["slack-secret", "url-secret", "header-secret", signingSecret])
+    assert.ok(!destinations.includes(value));
+
+  const issued = await admin(
+    "/canaries",
+    "POST",
+    JSON.stringify({ integrations: ["openai"], label: "decoy env" }),
+  );
+
+  assert.equal(issued.status, 201);
+
+  const canary = grantSchema
+    .extend({ kinds: z.record(z.string(), z.string()) })
+    .parse(await issued.json());
+
+  assert.deepEqual(canary.kinds, { openai: "openai" });
+  assert.ok(!(await (await access("/v1/grants", apiKey)).text()).includes(canary.id));
+  assert.ok(!(await (await admin("/grants")).text()).includes(canary.id));
+
+  const sent = seen.length;
+  const unknown = await access("/gateway/openai/v1/models", `bsg_${"0".repeat(64)}`);
+  const tripped = await access("/gateway/openai/v1/models", canary.token);
+  assert.equal(tripped.status, unknown.status);
+  assert.deepEqual([...tripped.headers], [...unknown.headers]);
+  assert.equal(await tripped.text(), await unknown.text());
+
+  const alerts = () =>
+    seen
+      .slice(sent)
+      .filter(({ url }) => ["hooks.slack.com", "alerts.example.com"].includes(url.hostname));
+
+  for (let attempt = 0; attempt < 100 && alerts().length < 2; attempt++) await delay(20);
+  const [first, second] = alerts();
+  assert.ok(first && second);
+
+  for (const { body } of alerts()) assert.ok(!body.includes(canary.token));
+
+  const hook = first.url.hostname === "alerts.example.com" ? first : second;
+  const chat = hook === first ? second : first;
+  assert.match(z.object({ text: z.string() }).parse(JSON.parse(chat.body)).text, /decoy env/);
+  assert.equal(hook.headers.get("authorization"), "Bearer header-secret");
+
+  const id = hook.headers.get("webhook-id");
+  const timestamp = hook.headers.get("webhook-timestamp");
+
+  const signature = createHmac("sha256", Buffer.from(signingSecret.slice(6), "base64"))
+    .update(`${id}.${timestamp}.${hook.body}`)
+    .digest("base64");
+
+  assert.equal(hook.headers.get("webhook-signature"), `v1,${signature}`);
+
+  const event = z.record(z.string(), z.string()).parse(JSON.parse(hook.body));
+  assert.equal(event.type, "canary.triggered");
+  assert.equal(event.dedup_key, `beachside-canary-${canary.id}`);
+  assert.equal(event.request_route, "gateway");
+  assert.equal(event.request_integration, "openai");
+  assert.equal(event.trips_since_last_alert, "1");
+
+  const asIssuer = await issue(["openai"], canary.token);
+  assert.equal(asIssuer.status, 401);
+  await asIssuer.text();
+  await delay(200);
+  assert.equal(alerts().length, 2);
+
+  const shown = z
+    .object({ trips: z.number(), events: z.array(z.object({ route: z.string() })) })
+    .parse(await (await admin(`/canaries/${canary.id}`)).json());
+
+  assert.equal(shown.trips, 2);
+  assert.deepEqual(
+    shown.events.map(({ route }) => route),
+    ["issuer-auth", "gateway"],
+  );
+
+  const tested = await (await admin("/alerts/pager/test", "POST")).text();
+  assert.equal(
+    z.object({ delivered: z.boolean() }).parse(JSON.parse(tested)).delivered,
+    true,
+    tested,
+  );
+
+  assert.equal((await admin(`/canaries/${canary.id}`, "DELETE")).status, 204);
+  assert.equal((await admin("/alerts/ops-chat", "DELETE")).status, 204);
+  assert.equal((await admin("/alerts/pager", "DELETE")).status, 204);
 });
