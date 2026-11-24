@@ -7,6 +7,10 @@ import { pathToFileURL } from "node:url";
 
 const packageName = "@beachside/credential-client";
 
+const workerManifestPath = "services/credential-broker/package.json";
+
+const workerChangelogPath = "services/credential-broker/CHANGELOG.md";
+
 const registry = "https://registry.npmjs.org";
 
 const semver =
@@ -39,14 +43,6 @@ function clientManifest(text) {
 
 function git(...args) {
   return execFileSync("git", args, { encoding: "utf8" }).trim();
-}
-
-export function prepareVersion(version) {
-  versionTag(version);
-  const manifest = clientManifest(readFileSync("package.json", "utf8"));
-  assert.ok(Bun.semver.order(version, manifest.version) > 0, "The release version must increase");
-  manifest.version = version;
-  writeFileSync("package.json", `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 export function planRelease({ event, before, ref, dryRun }) {
@@ -83,6 +79,43 @@ export function planRelease({ event, before, ref, dryRun }) {
   }
 
   return { release: true, version, tag, distTag, dryRun, createTag, commit, tree };
+}
+
+function workerVersion(text) {
+  const manifest = JSON.parse(text);
+  assert.equal(manifest.name, "@beachside-internal/credential-broker");
+  assert.equal(manifest.private, true);
+  versionTag(manifest.version);
+
+  return manifest.version;
+}
+
+function planWorkerRelease({ event, before, ref, notesPath }) {
+  const version = workerVersion(readFileSync(workerManifestPath, "utf8"));
+  const tag = `broker-v${version}`;
+  const commit = git("rev-parse", "HEAD");
+  git("merge-base", "--is-ancestor", commit, "origin/main");
+
+  if (event === "push") {
+    assert.equal(ref, "refs/heads/main");
+    assert.match(before, /^[0-9a-f]{40}$/);
+    const prior = workerVersion(git("show", `${before}:${workerManifestPath}`));
+
+    if (version === prior) return { release: false };
+    assert.ok(Bun.semver.order(version, prior) > 0, "The Worker version must increase");
+  } else {
+    assert.equal(event, "workflow_dispatch");
+    assert.equal(ref, `refs/tags/${tag}`, `Select ${tag} for this Worker version`);
+    assert.equal(git("rev-parse", `${ref}^{commit}`), commit, "The tag must point to HEAD");
+  }
+
+  const sections = readFileSync(workerChangelogPath, "utf8").split(/^## /m);
+  const section = sections.find((entry) => entry.startsWith(`${version}\n`));
+  const notes = section?.slice(version.length).trim();
+  assert.ok(notes, `Missing Worker changelog notes for ${version}`);
+  writeFileSync(notesPath, `${notes}\n`);
+
+  return { release: true, version, tag, commit, prerelease: versionTag(version) === "next" };
 }
 
 export function integrity(archive) {
@@ -153,20 +186,24 @@ async function main() {
   const env = process.env;
 
   switch (command) {
-    case "version":
-      return prepareVersion(argument);
-    case "plan": {
-      assert.ok(
-        env.DRY_RUN === "true" || env.DRY_RUN === "false" || env.GITHUB_EVENT_NAME === "push",
-      );
+    case "plan":
+    case "worker-plan": {
       assert.equal(git("rev-parse", "HEAD"), env.GITHUB_SHA);
 
-      const plan = planRelease({
+      const input = {
         event: env.GITHUB_EVENT_NAME,
         before: env.BEFORE_SHA,
         ref: env.GITHUB_REF,
-        dryRun: env.DRY_RUN === "true",
-      });
+      };
+
+      let plan;
+
+      if (command === "worker-plan") {
+        plan = planWorkerRelease({ ...input, notesPath: argument });
+      } else {
+        assert.ok(env.DRY_RUN === "true" || env.DRY_RUN === "false" || input.event === "push");
+        plan = planRelease({ ...input, dryRun: env.DRY_RUN === "true" });
+      }
 
       appendFileSync(
         env.GITHUB_OUTPUT,
