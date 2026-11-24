@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -326,11 +327,16 @@ test("an email sender adds the send_email binding to that deploy only", () =>
       name: "broker",
       send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
     });
-    expect(existsSync(join(service, "wrangler.email.json"))).toBe(false);
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.email."))).toEqual([]);
+
+    const dryRun = spawn([...command, "--dry-run"]);
+    expect(dryRun.code, dryRun.stderr).toBe(0);
+    expect(calls(service)[1].config.send_email).toEqual(upload.config.send_email);
 
     writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
     expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
-    expect(calls(service)).toHaveLength(1);
+    expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    expect(calls(service)).toHaveLength(2);
   }));
 
 test(

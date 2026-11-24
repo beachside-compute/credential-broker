@@ -150,11 +150,17 @@ canaryAdminRoutes.delete("/canaries/:id", async (context) => {
     : failure(404, "canary_not_found");
 });
 
-canaryAdminRoutes.get("/alerts", async (context) =>
-  privateJson({
-    destinations: (await registry(context.env).listDestinations()).map(destinationView),
-  }),
-);
+canaryAdminRoutes.get("/alerts", async (context) => {
+  // Clients before email support reject unknown kinds, so they get only the kinds they parse.
+  const email = context.req.query("include") === "email";
+  const destinations = await registry(context.env).listDestinations();
+
+  return privateJson({
+    destinations: destinations
+      .filter((destination) => email || destination.kind !== "email")
+      .map(destinationView),
+  });
+});
 
 canaryAdminRoutes.post("/alerts", async (context) => {
   const input = destinationInput.safeParse(await readJson(context.req.raw, 64_000));
@@ -216,7 +222,10 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
 
   await store.recordDelivery(destination.identity, status);
 
-  return privateJson({ id: destination.id, status, delivered: status >= 200 && status < 300 });
+  // An accepted email can still bounce later, so it is not reported as delivered.
+  return destination.kind === "email"
+    ? privateJson({ id: destination.id, kind: "email", status, accepted: status === 202 })
+    : privateJson({ id: destination.id, status, delivered: status >= 200 && status < 300 });
 });
 
 canaryAdminRoutes.delete("/alerts/:id", async (context) => {

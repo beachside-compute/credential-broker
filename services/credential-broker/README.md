@@ -392,7 +392,7 @@ Email alerts use [Cloudflare Email Sending](https://developers.cloudflare.com/em
 2. Set `BROKER_EMAIL_FROM=canary@alerts.example.com` in `.env.deploy` and run `bun run deploy`. The deploy adds a `send_email` binding that may send only from that address.
 3. Add a destination and check it: `bun run broker alert add email inbox --to oncall@example.com`, then `bun run broker alert test inbox`.
 
-The subject is the alert title and the body lists the event's fields. A send the binding accepts shows as status 202 in `alert list`; a refused send shows as no answer. Without `BROKER_EMAIL_FROM`, the broker has no binding and refuses `email` destinations.
+The subject is the alert title and the body lists the event's fields. `alert test` reports a send that Cloudflare accepts as accepted, not delivered, because it can still bounce; bounces show in the Email Service logs. `alert list` shows an accepted send as status 202 and a refused one as no answer. Clients older than this release don't list email destinations. Without `BROKER_EMAIL_FROM`, the broker has no binding and refuses `email` destinations.
 
 ## Observability and trust
 

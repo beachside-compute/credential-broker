@@ -2428,8 +2428,17 @@ test("canaries answer like unknown grants, stay hidden from issuers and alert ea
   assert.equal(email.status, 201);
   assert.equal(z.object({ host: z.string() }).parse(await email.json()).host, "oncall@example.com");
 
+  const listedIds = async (path: string) =>
+    z
+      .object({ destinations: z.array(z.object({ id: z.string() })) })
+      .parse(await (await admin(path)).json())
+      .destinations.map(({ id }) => id);
+
+  assert.ok(!(await listedIds("/alerts")).includes("inbox"));
+  assert.ok((await listedIds("/alerts?include=email")).includes("inbox"));
+
   const mailed = await (await admin("/alerts/inbox/test", "POST")).json();
-  assert.deepEqual(mailed, { id: "inbox", status: 202, delivered: true });
+  assert.deepEqual(mailed, { id: "inbox", kind: "email", status: 202, accepted: true });
   assert.equal((await admin("/alerts/inbox", "DELETE")).status, 204);
 
   assert.equal((await admin(`/canaries/${canary.id}`, "DELETE")).status, 204);

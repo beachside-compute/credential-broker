@@ -1082,12 +1082,14 @@ export async function runBrokerCli(args: readonly string[], io: CliIo): Promise<
         const result = await (await adminKey()).alerts.test(id!);
         print(
           result,
-          result.delivered
-            ? `Delivered a test alert to ${id} (HTTP ${result.status}).`
-            : `The test alert to ${id} failed (${result.status ? `HTTP ${result.status}` : "no answer"}).`,
+          result.accepted
+            ? `Cloudflare accepted a test email for ${id}. Check the inbox; a bounce shows only in Email Service logs.`
+            : result.delivered
+              ? `Delivered a test alert to ${id} (HTTP ${result.status}).`
+              : `The test alert to ${id} failed (${result.status ? `HTTP ${result.status}` : "no answer"}).`,
         );
 
-        return result.delivered ? 0 : 7;
+        return result.delivered || result.accepted ? 0 : 7;
       }
 
       case "alert delete": {
