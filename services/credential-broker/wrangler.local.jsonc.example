@@ -1,0 +1,5 @@
+// Copy to wrangler.local.jsonc. Its top-level keys replace the same keys in wrangler.jsonc at deploy.
+{
+  // Serve the broker on your own hostname as well as workers.dev. The zone must be in this account.
+  "routes": [{ "pattern": "gateway.example.com", "custom_domain": true }],
+}

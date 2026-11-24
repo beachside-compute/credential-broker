@@ -29,4 +29,5 @@ coverage/
 .pi/
 .roo/
 .windsurf/
-wrangler.email.*.json
+wrangler.deploy.*.json
+wrangler.local.jsonc

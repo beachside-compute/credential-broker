@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -44,29 +44,55 @@ function emailSender(env: NodeJS.ProcessEnv): string | undefined {
     : setupError("BROKER_EMAIL_FROM must be one email address on your onboarded domain");
 }
 
+/** An operator's untracked Wrangler settings, merged over the tracked config at deploy. */
+const localConfig = "wrangler.local.jsonc";
+
+const repositoryOwnedKeys = ["main", "durable_objects", "migrations"];
+
+function readConfig(path: string) {
+  return Object.assign({}, Bun.JSONC.parse(readFileSync(path, "utf8")));
+}
+
 /**
- * Wrangler has no binding flags, so email alerts deploy from a copy of the config with the binding.
- * Each run writes its own copy beside the original, so relative paths resolve and runs never share one.
+ * Deploy from a generated config when the operator has local settings or an email sender. Each run
+ * writes its own copy beside the original, so relative paths resolve and runs never share one.
  */
-async function withEmailConfig<T>(
-  from: string | undefined,
+async function withDeployConfig<T>(
+  emailFrom: string | undefined,
   run: (args: string[]) => Promise<T>,
 ): Promise<T> {
-  if (!from) return run([]);
   const service = resolve(repository, servicePath);
+  const local = resolve(service, localConfig);
 
-  const config = Object.assign(
-    {},
-    Bun.JSONC.parse(readFileSync(resolve(service, "wrangler.jsonc"), "utf8")),
-  );
+  if (!emailFrom && !existsSync(local)) return run([]);
 
-  const path = resolve(service, `wrangler.email.${crypto.randomUUID()}.json`);
+  let config;
+  let overrides = {};
+
+  try {
+    if (existsSync(local)) overrides = readConfig(local);
+    config = { ...readConfig(resolve(service, "wrangler.jsonc")), ...overrides };
+  } catch {
+    return setupError(`Could not parse services/credential-broker/${localConfig}`);
+  }
+
+  const owned = repositoryOwnedKeys.filter((key) => key in overrides);
+
+  if (owned.length) {
+    return setupError(
+      `${localConfig} cannot set ${owned.join(", ")}; they belong to wrangler.jsonc`,
+    );
+  }
+
+  const path = resolve(service, `wrangler.deploy.${crypto.randomUUID()}.json`);
 
   writeFileSync(
     path,
     JSON.stringify({
       ...config,
-      send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }],
+      ...(emailFrom && {
+        send_email: [{ name: "EMAIL", allowed_sender_addresses: [emailFrom] }],
+      }),
     }),
     { flag: "wx" },
   );
@@ -204,10 +230,10 @@ function wranglerEnvironment(
 
 /** Names of the secrets the deployed Worker has, or none when it does not exist yet. */
 async function workerSecretNames(env: NodeJS.ProcessEnv): Promise<Set<string>> {
-  const { code, stdout, stderr } = await runCommand(
-    env,
-    ["wrangler", "secret", "list", "--format", "json"],
-    { capture: true },
+  const { code, stdout, stderr } = await withDeployConfig(undefined, (args) =>
+    runCommand(env, ["wrangler", "secret", "list", "--format", "json", ...args], {
+      capture: true,
+    }),
   );
 
   if (code !== 0) {
@@ -260,7 +286,7 @@ async function deployWrangler(
       raced ||= firstDeployRace.test(tail);
     };
 
-    const code = await withEmailConfig(secrets.BROKER_EMAIL_FROM, async (config) => {
+    const code = await withDeployConfig(secrets.BROKER_EMAIL_FROM, async (config) => {
       const command = ["deploy:wrangler", ...args, ...config, "--secrets-file", path];
       let { code } = await runCommand(env, command, { watch });
 
@@ -363,6 +389,7 @@ async function setup(
       `The broker Worker already has ${existing.join(", ")}. Setup never replaces keys: update the Worker with bun run deploy`,
     );
   const keys = generateKeys();
+
   const { code, url } = await deployWrangler(env, { ...secrets, ...keys }, []);
 
   if (code !== 0) {
@@ -391,10 +418,8 @@ async function deploy() {
       .code;
 
   if (args.length === 1 && args[0] === "--dry-run") {
-    const from = emailSender({ ...inherited, ...loadDeploymentFile(envPath) });
-
-    return withEmailConfig(
-      from,
+    return withDeployConfig(
+      emailSender({ ...inherited, ...loadDeploymentFile(envPath) }),
       async (config) =>
         (
           await runCommand(wranglerEnvironment(inherited, {}), [

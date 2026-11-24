@@ -66,6 +66,8 @@ function provisionStub(root: string) {
     import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
+      const config = args.includes("--config") ? JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8")) : {};
+      if (process.env.SECRET_LIST_NAME && config.name !== process.env.SECRET_LIST_NAME) process.exit(1);
       if (process.env.SECRET_LIST_ERROR) {
         console.error(process.env.SECRET_LIST_ERROR);
         process.exit(1);
@@ -311,31 +313,41 @@ test("help and dry run need no settings or Worker", () =>
     expect(existsSync(join(root, ".env.deploy"))).toBe(false);
   }));
 
-test("an email sender adds the send_email binding to that deploy only", () =>
+test("local Wrangler settings and an email sender deploy from a generated config", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
+    writeFileSync(
+      join(service, "wrangler.local.jsonc"),
+      '{ "name": "broker-dev", "routes": [{ "pattern": "gateway.example.com", "custom_domain": true }] }',
+    );
     writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=canary@alerts.example.com\n", {
       mode: 0o600,
     });
 
-    const run = spawn(command, { WORKER_SECRETS: deployed });
+    const run = spawn(command, { WORKER_SECRETS: deployed, SECRET_LIST_NAME: "broker-dev" });
     expect(run.code, run.stderr).toBe(0);
     const [upload] = calls(service);
     expect(upload.bindings.BROKER_EMAIL_FROM).toBe("canary@alerts.example.com");
     expect(upload.config).toEqual({
-      name: "broker",
+      name: "broker-dev",
       send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
+      routes: [{ pattern: "gateway.example.com", custom_domain: true }],
     });
-    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.email."))).toEqual([]);
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.deploy."))).toEqual([]);
 
     const dryRun = spawn([...command, "--dry-run"]);
     expect(dryRun.code, dryRun.stderr).toBe(0);
-    expect(calls(service)[1].config.send_email).toEqual(upload.config.send_email);
+    expect(calls(service)[1].config).toEqual(upload.config);
 
+    writeFileSync(join(service, "wrangler.local.jsonc"), '{ "migrations": [] }');
+    expect(spawn(command, { WORKER_SECRETS: deployed }).stderr).toContain("cannot set migrations");
+
+    writeFileSync(join(service, "wrangler.local.jsonc"), "{}");
     writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
     expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
     expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+
     expect(calls(service)).toHaveLength(2);
   }));
 
