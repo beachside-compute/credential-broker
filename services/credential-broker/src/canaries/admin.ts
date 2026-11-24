@@ -11,6 +11,7 @@ import {
   alertEvent,
   deliver,
   destinationInput,
+  mailer,
   newSigningSecret,
   sealDestination,
   testEvent,
@@ -54,7 +55,13 @@ export function alertOnTrip<E extends Worker>(context: Context<E>, trip: Trip | 
   context.executionCtx.waitUntil(
     Promise.all(
       trip.deliveries.map(async (delivery) => {
-        const status = await deliver(delivery, alertEvent(trip, delivery, host), keyring);
+        const status = await deliver(
+          delivery,
+          alertEvent(trip, delivery, host),
+          keyring,
+          mailer(context.env),
+        );
+
         await store.recordDelivery(delivery.identity, status).catch(() => {});
       }),
     ),
@@ -143,24 +150,38 @@ canaryAdminRoutes.delete("/canaries/:id", async (context) => {
     : failure(404, "canary_not_found");
 });
 
-canaryAdminRoutes.get("/alerts", async (context) =>
-  privateJson({
-    destinations: (await registry(context.env).listDestinations()).map(destinationView),
-  }),
-);
+canaryAdminRoutes.get("/alerts", async (context) => {
+  // Clients before email support reject unknown kinds, so they get only the kinds they parse.
+  const email = context.req.query("include") === "email";
+  const destinations = await registry(context.env).listDestinations();
+
+  return privateJson({
+    destinations: destinations
+      .filter((destination) => email || destination.kind !== "email")
+      .map(destinationView),
+  });
+});
 
 canaryAdminRoutes.post("/alerts", async (context) => {
   const input = destinationInput.safeParse(await readJson(context.req.raw, 64_000));
 
   if (!input.success) return failure(400, "invalid_alert_destination");
 
-  const { id, kind, url, headers = {} } = input.data;
+  const destination = input.data;
+
+  if (destination.kind === "email" && !mailer(context.env))
+    return failure(400, "email_alerts_not_configured");
+
+  const { id, kind } = destination;
   const identity = crypto.randomUUID();
   const signingSecret = kind === "webhook" ? newSigningSecret() : undefined;
+  const headers = destination.kind === "email" ? {} : (destination.headers ?? {});
 
   const config = await sealDestination(
     { identity, id, kind },
-    { url: url.href, headers, ...(signingSecret && { signingSecret }) },
+    destination.kind === "email"
+      ? { to: destination.to }
+      : { url: destination.url.href, headers, ...(signingSecret && { signingSecret }) },
     context.get("keyring"),
   );
 
@@ -171,7 +192,7 @@ canaryAdminRoutes.post("/alerts", async (context) => {
     id,
     kind,
     config,
-    host: url.host,
+    host: destination.kind === "email" ? destination.to : destination.url.host,
     headerNames: Object.keys(headers),
   });
 
@@ -196,11 +217,15 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
     destination,
     testEvent(new URL(context.req.url).host),
     context.get("keyring"),
+    mailer(context.env),
   );
 
   await store.recordDelivery(destination.identity, status);
 
-  return privateJson({ id: destination.id, status, delivered: status >= 200 && status < 300 });
+  // An accepted email can still bounce later, so it is not reported as delivered.
+  return destination.kind === "email"
+    ? privateJson({ id: destination.id, kind: "email", status, accepted: status === 202 })
+    : privateJson({ id: destination.id, status, delivered: status >= 200 && status < 300 });
 });
 
 canaryAdminRoutes.delete("/alerts/:id", async (context) => {

@@ -108,7 +108,7 @@ Deleting an integration also revokes its grants and removes it from the issuer a
 
 ### Detect a leaked grant with a canary
 
-A canary is a decoy grant that nothing legitimate uses. Any use of it is refused like an unknown grant and alerts a Slack channel or a signed webhook (PagerDuty, incident.io or anything else), at most once an hour per destination.
+A canary is a decoy grant that nothing legitimate uses. Any use of it is refused like an unknown grant and alerts a Slack channel, an email address or a signed webhook (PagerDuty, incident.io or anything else), at most once an hour per destination.
 
 ```sh
 bun run broker alert add slack ops-chat --to-stdin < /secure/path/slack-webhook-url

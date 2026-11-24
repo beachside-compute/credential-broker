@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -31,6 +31,53 @@ const workerNotFound = /Worker "[^"]+"(?: \(env: [^)]+\))? not found\./;
 /** Cloudflare's reply when Wrangler reads back a Worker its first upload just created. */
 const firstDeployRace = /code: 10007\]/;
 
+const emailAddress = /^[^\s@]{1,64}@[a-z0-9.-]{1,189}\.[a-z]{2,}$/i;
+
+/** The validated email alert sender, if the deployment sets one. */
+function emailSender(env: NodeJS.ProcessEnv): string | undefined {
+  const from = env.BROKER_EMAIL_FROM;
+
+  if (from === undefined) return;
+
+  return emailAddress.test(from)
+    ? from
+    : setupError("BROKER_EMAIL_FROM must be one email address on your onboarded domain");
+}
+
+/**
+ * Wrangler has no binding flags, so email alerts deploy from a copy of the config with the binding.
+ * Each run writes its own copy beside the original, so relative paths resolve and runs never share one.
+ */
+async function withEmailConfig<T>(
+  from: string | undefined,
+  run: (args: string[]) => Promise<T>,
+): Promise<T> {
+  if (!from) return run([]);
+  const service = resolve(repository, servicePath);
+
+  const config = Object.assign(
+    {},
+    Bun.JSONC.parse(readFileSync(resolve(service, "wrangler.jsonc"), "utf8")),
+  );
+
+  const path = resolve(service, `wrangler.email.${crypto.randomUUID()}.json`);
+
+  writeFileSync(
+    path,
+    JSON.stringify({
+      ...config,
+      send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }],
+    }),
+    { flag: "wx" },
+  );
+
+  try {
+    return await run(["--config", path]);
+  } finally {
+    rmSync(path, { force: true });
+  }
+}
+
 /** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
 async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
   const deployment = new Map<string, string>();
@@ -46,6 +93,10 @@ async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, st
       if (!parsed.success) return setupError(`Provide a valid Worker secret binding for ${name}`);
       deployment.set(name, parsed.data);
     }
+
+    const from = emailSender(env);
+
+    if (from) deployment.set("BROKER_EMAIL_FROM", from);
 
     if (env.BROKER_OTLP_TRACES_ENDPOINT !== undefined) {
       deployment.set("BROKER_OTLP_TRACES_ENDPOINT", traceEndpoint(env.BROKER_OTLP_TRACES_ENDPOINT));
@@ -199,7 +250,6 @@ async function deployWrangler(
     const path = resolve(directory, "secrets.json");
     writeFileSync(path, JSON.stringify(secrets), { flag: "wx", mode: 0o600 });
 
-    const command = ["deploy:wrangler", ...args, "--secrets-file", path];
     let raced = false;
     let tail = "";
     let printed = "";
@@ -210,15 +260,20 @@ async function deployWrangler(
       raced ||= firstDeployRace.test(tail);
     };
 
-    let { code } = await runCommand(env, command, { watch });
+    const code = await withEmailConfig(secrets.BROKER_EMAIL_FROM, async (config) => {
+      const command = ["deploy:wrangler", ...args, ...config, "--secrets-file", path];
+      let { code } = await runCommand(env, command, { watch });
 
-    if (code !== 0 && raced) {
-      // A Worker's first deploy can upload, then fail to read itself back while the Workers API
-      // catches up. The upload landed, so one more deploy finishes it.
-      console.info("Cloudflare had not registered the new Worker yet. Deploying again.");
-      await Bun.sleep(5_000);
-      ({ code } = await runCommand(env, command, { watch }));
-    }
+      if (code !== 0 && raced) {
+        // A Worker's first deploy can upload, then fail to read itself back while the Workers API
+        // catches up. The upload landed, so one more deploy finishes it.
+        console.info("Cloudflare had not registered the new Worker yet. Deploying again.");
+        await Bun.sleep(5_000);
+        ({ code } = await runCommand(env, command, { watch }));
+      }
+
+      return code;
+    });
 
     return { code, url: deployedOrigin(printed) };
   } finally {
@@ -331,9 +386,25 @@ async function deploy() {
   const envPath = resolve(repository, environmentFile);
   const inherited = process.env;
 
-  if (args.length === 1 && ["--help", "-h", "--dry-run"].includes(args[0]!))
+  if (args.length === 1 && ["--help", "-h"].includes(args[0]!))
     return (await runCommand(wranglerEnvironment(inherited, {}), ["deploy:wrangler", ...args]))
       .code;
+
+  if (args.length === 1 && args[0] === "--dry-run") {
+    const from = emailSender({ ...inherited, ...loadDeploymentFile(envPath) });
+
+    return withEmailConfig(
+      from,
+      async (config) =>
+        (
+          await runCommand(wranglerEnvironment(inherited, {}), [
+            "deploy:wrangler",
+            "--dry-run",
+            ...config,
+          ])
+        ).code,
+    );
+  }
 
   if (
     args.some((argument) => argument === "--secrets-file" || argument.startsWith("--secrets-file="))

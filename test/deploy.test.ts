@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -84,6 +85,7 @@ function provisionStub(root: string) {
       receivedAccount: process.env.CLOUDFLARE_ACCOUNT_ID === ${JSON.stringify(account)},
       inheritedRuntimeSecret: Boolean(process.env.BROKER_ADMIN_KEY || process.env.CREDENTIAL_DECLARED || process.env.BEACHSIDE_BROKER_ADMIN_KEY),
       ...(command === "deploy" && path && { path, mode: statSync(path).mode & 0o777, bindings: JSON.parse(readFileSync(path, "utf8")) }),
+      ...(args.includes("--config") && { config: JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8")) }),
     };
     appendFileSync("calls.jsonl", JSON.stringify(record) + "\\n");
     if (command === "deploy") process.exitCode = Number(process.env.DEPLOY_STATUS ?? 0);
@@ -307,6 +309,34 @@ test("help and dry run need no settings or Worker", () =>
       ["deploy", ["--dry-run"], false],
     ]);
     expect(existsSync(join(root, ".env.deploy"))).toBe(false);
+  }));
+
+test("an email sender adds the send_email binding to that deploy only", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
+    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=canary@alerts.example.com\n", {
+      mode: 0o600,
+    });
+
+    const run = spawn(command, { WORKER_SECRETS: deployed });
+    expect(run.code, run.stderr).toBe(0);
+    const [upload] = calls(service);
+    expect(upload.bindings.BROKER_EMAIL_FROM).toBe("canary@alerts.example.com");
+    expect(upload.config).toEqual({
+      name: "broker",
+      send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
+    });
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.email."))).toEqual([]);
+
+    const dryRun = spawn([...command, "--dry-run"]);
+    expect(dryRun.code, dryRun.stderr).toBe(0);
+    expect(calls(service)[1].config.send_email).toEqual(upload.config.send_email);
+
+    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
+    expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
+    expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    expect(calls(service)).toHaveLength(2);
   }));
 
 test(

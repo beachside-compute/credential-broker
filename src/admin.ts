@@ -449,7 +449,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
     },
     alerts: {
       async list(call: BrokerRequestOptions = {}) {
-        return json("/v1/admin/alerts", "GET", 200, call, (reply) =>
+        return json("/v1/admin/alerts?include=email", "GET", 200, call, (reply) =>
           "destinations" in reply && Array.isArray(reply.destinations)
             ? reply.destinations.map(parseDestination)
             : invalidCanaryResponse(),
@@ -480,10 +480,19 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
           "POST",
           200,
           call,
-          (reply) =>
-            "status" in reply && typeof reply.status === "number"
-              ? { id, status: reply.status, delivered: reply.status >= 200 && reply.status < 300 }
-              : invalidCanaryResponse(),
+          (reply) => {
+            if (!("status" in reply) || typeof reply.status !== "number")
+              return invalidCanaryResponse();
+
+            return "accepted" in reply
+              ? { id, status: reply.status, delivered: false, accepted: reply.accepted === true }
+              : {
+                  id,
+                  status: reply.status,
+                  delivered: reply.status >= 200 && reply.status < 300,
+                  accepted: false,
+                };
+          },
           undefined,
           id,
         );
@@ -682,7 +691,9 @@ function requestLimits(
 
 const adminMessages = {
   invalid_alert_destination: () =>
-    "The broker rejected the alert destination. Use an HTTPS URL; Slack takes an incoming webhook URL and no headers",
+    "The broker rejected the alert destination. Use an HTTPS URL or, for email, one address; Slack takes an incoming webhook URL and no headers",
+  email_alerts_not_configured: () =>
+    "This broker has no email sender. Onboard a domain in Cloudflare Email Service, set BROKER_EMAIL_FROM in .env.deploy and redeploy",
   alert_destination_exists: (id) => `Alert destination ${id} already exists. Pick another ID`,
   alert_destination_not_found: (id) =>
     `Alert destination ${id} was not found. List them with \`${hint("alert list")}\``,

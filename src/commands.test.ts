@@ -187,6 +187,10 @@ test("plants a canary as the variables a sandbox grant would set, and adds alert
     expect(
       await runBrokerCli(["alert", "add", "slack", "chat", "--to", "https://example.com/x"], io),
     ).toBe(2);
+    expect(
+      await runBrokerCli(["alert", "add", "email", "inbox", "--to", "oncall@example.com"], io),
+    ).toBe(0);
+    expect(bodies.at(-1)).toEqual({ id: "inbox", kind: "email", to: "oncall@example.com" });
   } finally {
     await server.stop(true);
   }

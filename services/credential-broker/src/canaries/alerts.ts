@@ -48,9 +48,11 @@ const destinationUrl = z
     return url;
   });
 
-export const destinationInput = z
+const destinationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
+
+const urlDestination = z
   .strictObject({
-    id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/),
+    id: destinationId,
     kind: z.enum(["slack", "webhook"]),
     url: destinationUrl,
     headers: z
@@ -63,13 +65,31 @@ export const destinationInput = z
       kind === "webhook" || (url.hostname === "hooks.slack.com" && !headers),
   );
 
+const emailDestination = z.strictObject({
+  id: destinationId,
+  kind: z.literal("email"),
+  to: z.email().max(254),
+});
+
+export const destinationInput = z.union([urlDestination, emailDestination]);
+
 /** The sealed configuration's plaintext limit, enforced when it is created and opened. */
 export const maxDestinationConfigBytes = 16_384;
 
-interface DestinationConfig {
-  url: string;
-  headers: Record<string, string>;
-  signingSecret?: string;
+type DestinationConfig =
+  | { url: string; headers: Record<string, string>; signingSecret?: string }
+  | { to: string };
+
+/** Email alerts go through the deployment's send_email binding from its configured sender. */
+export interface Mailer {
+  binding: SendEmail;
+  from: string;
+}
+
+export function mailer(env: { EMAIL?: SendEmail; BROKER_EMAIL_FROM?: string }): Mailer | undefined {
+  return env.EMAIL && env.BROKER_EMAIL_FROM
+    ? { binding: env.EMAIL, from: env.BROKER_EMAIL_FROM }
+    : undefined;
 }
 
 function sealContext(destination: { identity: string; id: string; kind: AlertKind }) {
@@ -152,11 +172,12 @@ export function testEvent(host: string): AlertEvent {
   };
 }
 
-/** Send one alert. Returns the HTTP status, or 0 when nothing answered. Never retries. */
+/** Send one alert. Returns the HTTP status (202 for accepted email), or 0 on failure. Never retries. */
 export async function deliver(
   destination: Pick<AlertDelivery, "identity" | "id" | "kind" | "config">,
   event: AlertEvent,
   keyring: EncryptionKeyring,
+  mail?: Mailer,
 ): Promise<number> {
   try {
     const json = await openValue(
@@ -169,6 +190,19 @@ export async function deliver(
     if (json === undefined) return 0;
 
     const config: DestinationConfig = JSON.parse(json);
+
+    if ("to" in config) {
+      if (!mail) return 0;
+
+      await mail.binding.send({
+        to: config.to,
+        from: { email: mail.from, name: "Beachside credential broker" },
+        subject: event.title!.slice(0, 200),
+        text: emailText(event),
+      });
+
+      return 202;
+    }
 
     const body = JSON.stringify(destination.kind === "slack" ? slackMessage(event) : event);
 
@@ -241,6 +275,14 @@ function slackMessage(event: AlertEvent) {
         : []),
     ],
   };
+}
+
+function emailText(event: AlertEvent) {
+  const lines = Object.entries(event)
+    .filter(([name, value]) => value && name !== "title")
+    .map(([name, value]) => `${name}: ${value}`);
+
+  return [event.title, "", ...lines].join("\n");
 }
 
 /** Slack rejects a block over its limit, so cut long text and any entity the cut splits. */
