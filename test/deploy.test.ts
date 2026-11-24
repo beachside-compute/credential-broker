@@ -311,13 +311,15 @@ test("help and dry run need no settings or Worker", () =>
     expect(existsSync(join(root, ".env.deploy"))).toBe(false);
   }));
 
-test("an email sender adds the send_email binding to that deploy only", () =>
+test("an email sender and custom domains deploy from a generated config only when set", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
-    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=canary@alerts.example.com\n", {
-      mode: 0o600,
-    });
+    writeFileSync(
+      join(root, ".env.deploy"),
+      "BROKER_EMAIL_FROM=canary@alerts.example.com\nBROKER_CUSTOM_DOMAINS=gateway.example.com\n",
+      { mode: 0o600 },
+    );
 
     const run = spawn(command, { WORKER_SECRETS: deployed });
     expect(run.code, run.stderr).toBe(0);
@@ -326,16 +328,23 @@ test("an email sender adds the send_email binding to that deploy only", () =>
     expect(upload.config).toEqual({
       name: "broker",
       send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
+      routes: [{ pattern: "gateway.example.com", custom_domain: true }],
     });
-    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.email."))).toEqual([]);
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.deploy."))).toEqual([]);
 
     const dryRun = spawn([...command, "--dry-run"]);
     expect(dryRun.code, dryRun.stderr).toBe(0);
-    expect(calls(service)[1].config.send_email).toEqual(upload.config.send_email);
+    expect(calls(service)[1].config).toEqual(upload.config);
 
-    writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
-    expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
-    expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    for (const invalid of [
+      "BROKER_EMAIL_FROM=not-an-address",
+      "BROKER_CUSTOM_DOMAINS=https://x.y/",
+    ]) {
+      writeFileSync(join(root, ".env.deploy"), `${invalid}\n`);
+      expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
+      expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    }
+
     expect(calls(service)).toHaveLength(2);
   }));
 

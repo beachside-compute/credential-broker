@@ -44,15 +44,37 @@ function emailSender(env: NodeJS.ProcessEnv): string | undefined {
     : setupError("BROKER_EMAIL_FROM must be one email address on your onboarded domain");
 }
 
+const hostname = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+
+/** Per-deployment Wrangler settings that a self-hosted checkout keeps out of wrangler.jsonc. */
+interface DeployOverrides {
+  emailFrom?: string;
+  domains: string[];
+}
+
+function deployOverrides(env: NodeJS.ProcessEnv): DeployOverrides {
+  const domains = (env.BROKER_CUSTOM_DOMAINS ?? "")
+    .split(",")
+    .map((domain) => domain.trim())
+    .filter(Boolean);
+
+  if (domains.some((domain) => !hostname.test(domain)))
+    return setupError(
+      "BROKER_CUSTOM_DOMAINS must be comma-separated hostnames on zones in your Cloudflare account",
+    );
+
+  return { emailFrom: emailSender(env), domains };
+}
+
 /**
- * Wrangler has no binding flags, so email alerts deploy from a copy of the config with the binding.
+ * Wrangler has no flags for bindings or custom domains, so overrides deploy from a copy of the config.
  * Each run writes its own copy beside the original, so relative paths resolve and runs never share one.
  */
-async function withEmailConfig<T>(
-  from: string | undefined,
+async function withDeployConfig<T>(
+  { emailFrom, domains }: DeployOverrides,
   run: (args: string[]) => Promise<T>,
 ): Promise<T> {
-  if (!from) return run([]);
+  if (!emailFrom && !domains.length) return run([]);
   const service = resolve(repository, servicePath);
 
   const config = Object.assign(
@@ -60,13 +82,18 @@ async function withEmailConfig<T>(
     Bun.JSONC.parse(readFileSync(resolve(service, "wrangler.jsonc"), "utf8")),
   );
 
-  const path = resolve(service, `wrangler.email.${crypto.randomUUID()}.json`);
+  const path = resolve(service, `wrangler.deploy.${crypto.randomUUID()}.json`);
 
   writeFileSync(
     path,
     JSON.stringify({
       ...config,
-      send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }],
+      ...(emailFrom && {
+        send_email: [{ name: "EMAIL", allowed_sender_addresses: [emailFrom] }],
+      }),
+      ...(domains.length && {
+        routes: domains.map((pattern) => ({ pattern, custom_domain: true })),
+      }),
     }),
     { flag: "wx" },
   );
@@ -242,6 +269,7 @@ async function deployWrangler(
   env: NodeJS.ProcessEnv,
   secrets: Record<string, string>,
   args: string[],
+  overrides: DeployOverrides,
 ): Promise<{ code: number; url?: string }> {
   // Wrangler reads secrets only from a file. It is private and removed as soon as Wrangler exits.
   const directory = mkdtempSync(resolve(tmpdir(), "broker-wrangler-"));
@@ -260,7 +288,7 @@ async function deployWrangler(
       raced ||= firstDeployRace.test(tail);
     };
 
-    const code = await withEmailConfig(secrets.BROKER_EMAIL_FROM, async (config) => {
+    const code = await withDeployConfig(overrides, async (config) => {
       const command = ["deploy:wrangler", ...args, ...config, "--secrets-file", path];
       let { code } = await runCommand(env, command, { watch });
 
@@ -363,7 +391,13 @@ async function setup(
       `The broker Worker already has ${existing.join(", ")}. Setup never replaces keys: update the Worker with bun run deploy`,
     );
   const keys = generateKeys();
-  const { code, url } = await deployWrangler(env, { ...secrets, ...keys }, []);
+
+  const { code, url } = await deployWrangler(
+    env,
+    { ...secrets, ...keys },
+    [],
+    deployOverrides(settings),
+  );
 
   if (code !== 0) {
     console.error(
@@ -391,10 +425,8 @@ async function deploy() {
       .code;
 
   if (args.length === 1 && args[0] === "--dry-run") {
-    const from = emailSender({ ...inherited, ...loadDeploymentFile(envPath) });
-
-    return withEmailConfig(
-      from,
+    return withDeployConfig(
+      deployOverrides({ ...inherited, ...loadDeploymentFile(envPath) }),
       async (config) =>
         (
           await runCommand(wranglerEnvironment(inherited, {}), [
@@ -438,7 +470,7 @@ async function deploy() {
       );
   }
 
-  const { code, url } = await deployWrangler(env, secrets, args);
+  const { code, url } = await deployWrangler(env, secrets, args, deployOverrides(settings));
 
   if (code === 0 && !dryRun) {
     recordURL(envPath, url ?? settings.BEACHSIDE_BROKER_URL);
