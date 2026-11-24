@@ -66,6 +66,8 @@ function provisionStub(root: string) {
     import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
+      const config = args.includes("--config") ? JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8")) : {};
+      if (process.env.SECRET_LIST_NAME && config.name !== process.env.SECRET_LIST_NAME) process.exit(1);
       if (process.env.SECRET_LIST_ERROR) {
         console.error(process.env.SECRET_LIST_ERROR);
         process.exit(1);
@@ -317,18 +319,18 @@ test("local Wrangler settings and an email sender deploy from a generated config
     writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
     writeFileSync(
       join(service, "wrangler.local.jsonc"),
-      '{ "routes": [{ "pattern": "gateway.example.com", "custom_domain": true }] }',
+      '{ "name": "broker-dev", "routes": [{ "pattern": "gateway.example.com", "custom_domain": true }] }',
     );
     writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=canary@alerts.example.com\n", {
       mode: 0o600,
     });
 
-    const run = spawn(command, { WORKER_SECRETS: deployed });
+    const run = spawn(command, { WORKER_SECRETS: deployed, SECRET_LIST_NAME: "broker-dev" });
     expect(run.code, run.stderr).toBe(0);
     const [upload] = calls(service);
     expect(upload.bindings.BROKER_EMAIL_FROM).toBe("canary@alerts.example.com");
     expect(upload.config).toEqual({
-      name: "broker",
+      name: "broker-dev",
       send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
       routes: [{ pattern: "gateway.example.com", custom_domain: true }],
     });

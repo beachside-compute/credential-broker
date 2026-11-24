@@ -230,10 +230,10 @@ function wranglerEnvironment(
 
 /** Names of the secrets the deployed Worker has, or none when it does not exist yet. */
 async function workerSecretNames(env: NodeJS.ProcessEnv): Promise<Set<string>> {
-  const { code, stdout, stderr } = await runCommand(
-    env,
-    ["wrangler", "secret", "list", "--format", "json"],
-    { capture: true },
+  const { code, stdout, stderr } = await withDeployConfig(undefined, (args) =>
+    runCommand(env, ["wrangler", "secret", "list", "--format", "json", ...args], {
+      capture: true,
+    }),
   );
 
   if (code !== 0) {
