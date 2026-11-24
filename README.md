@@ -28,7 +28,7 @@ Use Bun 1.4.4 and Node.js 22 or later. From a clone of this repository:
 
    On a remote machine, run `bun run --cwd services/credential-broker wrangler login --device --browser=false`. Open the printed URL in your browser and enter the displayed code.
 
-2. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname) in `wrangler.jsonc`.
+2. Optionally [configure a custom hostname](./services/credential-broker/README.md#use-a-custom-hostname) in `services/credential-broker/wrangler.local.jsonc`.
 
 3. Deploy the broker for the first time.
 
