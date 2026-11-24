@@ -34,7 +34,9 @@
     "deploy": "bun scripts/deploy.ts",
     "deploy:setup": "bun scripts/deploy.ts --setup-only",
     "deploy:wrangler": "bun run --cwd services/credential-broker deploy:wrangler",
-    "dev": "bun run --cwd services/credential-broker dev"
+    "dev": "bun run --cwd services/credential-broker dev",
+    "changeset": "changeset",
+    "release:version": "changeset version && bun install --frozen-lockfile --ignore-scripts"
   },
   "license": "Apache-2.0",
   "repository": {
@@ -55,12 +57,14 @@
     "node": ">=22"
   },
   "workspaces": [
-    "services/*"
+    "services/*",
+    "."
   ],
   "dependencies": {
     "@clack/prompts": "1.9.0"
   },
   "devDependencies": {
+    "@changesets/cli": "3.0.0",
     "@oxlint/plugins": "1.94.0",
     "@types/bun": "1.4.2",
     "oxfmt": "0.79.0",

@@ -1,0 +1,103 @@
+name: Release credential broker Worker
+
+on:
+  push:
+    branches: [main]
+    paths: [services/credential-broker/package.json]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-worker
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'beachside-compute/credential-broker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      commit: ${{ steps.plan.outputs.commit }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+          no-cache: true
+      - id: plan
+        name: Check Worker version and extract release notes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: bun scripts/release.mjs worker-plan "$RUNNER_TEMP/worker-release-notes.md"
+      - uses: actions/setup-node@v6
+        if: steps.plan.outputs.release == 'true'
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Validate Wrangler deployment bundle
+        if: steps.plan.outputs.release == 'true'
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          bun install --frozen-lockfile
+          bun run deploy:wrangler --dry-run --outdir "$RUNNER_TEMP/wrangler-dry-run"
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.release == 'true'
+        with:
+          name: worker-release-notes
+          path: ${{ runner.temp }}/worker-release-notes.md
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    needs: qualify
+    if: needs.qualify.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.qualify.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-release-notes
+          path: ${{ runner.temp }}
+      - name: Create matching tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.qualify.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.qualify.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.qualify.outputs.version }}
+          PRERELEASE: ${{ needs.qualify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$RELEASE_COMMIT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${RELEASE_TAG}" -f sha="$RELEASE_COMMIT" >/dev/null
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          flags=(--verify-tag --latest=false)
+          if [[ "$PRERELEASE" == 'true' ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${flags[@]}" --title "Credential broker Worker v${RELEASE_VERSION}" \
+            --notes-file "$RUNNER_TEMP/worker-release-notes.md"

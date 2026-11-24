@@ -4,6 +4,8 @@ The broker lets a sandbox use GitHub over HTTPS or call HTTPS APIs with expiring
 
 ## Deploy
 
+For a versioned checkout and upgrade notes, see [Release and deploy the Worker](../../docs/releasing.md#release-and-deploy-the-worker).
+
 Use Bun 1.4.4, Node.js 22 or later, and a Cloudflare account with permission to create a Worker, Worker secrets, and a SQLite Durable Object namespace. Run these commands from the repository root.
 
 ```sh

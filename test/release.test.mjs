@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { integrity, publishArchive, versionTag } from "../scripts/release.mjs";
@@ -19,7 +19,7 @@ function fixture(use) {
     .finally(() => rmSync(cwd, { recursive: true, force: true }));
 }
 
-test("version preparation and release planning require an increase and a matching protected ref", () =>
+test("release planning requires an increase and a matching protected ref for each package", () =>
   fixture((cwd) => {
     const manifest = {
       name: packageName,
@@ -49,9 +49,10 @@ test("version preparation and release planning require an increase and a matchin
         },
       });
 
-    const plan = (env) => {
+    const plan = (env, args = ["plan"]) => {
       writeFileSync(output, "");
-      const result = run(["plan"], env);
+      const result = run(args, env);
+      expect(result.stderr).toBe("");
       expect(result.status).toBe(0);
 
       return Object.fromEntries(
@@ -67,9 +68,20 @@ test("version preparation and release planning require an increase and a matchin
     git("init", "--initial-branch=main");
     git("config", "user.name", "Fixture");
     git("config", "user.email", "fixture@example.com");
+    const worker = join(cwd, "services/credential-broker");
+    mkdirSync(worker, { recursive: true });
+
+    const writeWorkerVersion = (version) =>
+      writeFileSync(
+        join(worker, "package.json"),
+        JSON.stringify({ name: "@beachside-internal/credential-broker", private: true, version }),
+      );
+
+    const notes = join(cwd, "worker-notes.md");
+    const workerPlan = ["worker-plan", notes];
+    writeWorkerVersion("0.0.0");
     writeFileSync(join(cwd, "package.json"), JSON.stringify(manifest));
-    writeFileSync(join(cwd, "bun.lock"), "fixture lock unchanged");
-    git("add", "package.json", "bun.lock");
+    git("add", "package.json", "services");
     git("commit", "-m", "Start release fixture");
     const before = git("rev-parse", "HEAD");
 
@@ -81,9 +93,11 @@ test("version preparation and release planning require an increase and a matchin
     git("commit", "-am", "Tooling change without version bump");
     git("update-ref", "refs/remotes/origin/main", "HEAD");
     expect(plan({ ...push, BEFORE_SHA: before })).toEqual({ release: "false" });
-    expect(run(["version", "0.0.1"]).status).not.toBe(0);
-    expect(run(["version", "0.2.0-rc.1"]).status).toBe(0);
-    expect(readFileSync(join(cwd, "bun.lock"), "utf8")).toBe("fixture lock unchanged");
+    expect(plan({ ...push, BEFORE_SHA: before }, workerPlan)).toEqual({ release: "false" });
+    writeFileSync(
+      join(cwd, "package.json"),
+      JSON.stringify({ ...manifest, version: "0.2.0-rc.1" }),
+    );
     git("commit", "-am", "Version bump");
     git("update-ref", "refs/remotes/origin/main", "HEAD");
     const commit = git("rev-parse", "HEAD");
@@ -106,10 +120,40 @@ test("version preparation and release planning require an increase and a matchin
     expect(run(["plan"], tagged).status).not.toBe(0);
     git("tag", "-f", "v0.2.0-rc.1", commit);
     expect(plan(tagged).createTag).toBe("false");
-    expect(run(["version", "0.2.0"]).status).toBe(0);
+    writeFileSync(join(cwd, "package.json"), JSON.stringify({ ...manifest, version: "0.2.0" }));
     git("commit", "-am", "Unmerged draft");
     git("tag", "v0.2.0");
     expect(run(["plan"], { ...manual, GITHUB_REF: "refs/tags/v0.2.0" }).status).not.toBe(0);
+
+    const workerBase = git("rev-parse", "HEAD");
+    writeWorkerVersion("0.1.0");
+    git("commit", "-am", "Worker version bump");
+    git("update-ref", "refs/remotes/origin/main", "HEAD");
+    const workerPush = { ...push, BEFORE_SHA: workerBase };
+    expect(plan(workerPush)).toEqual({ release: "false" });
+    expect(run(workerPlan, workerPush).status).not.toBe(0);
+    writeFileSync(
+      join(worker, "CHANGELOG.md"),
+      "# Worker\n\n## 0.1.0\n\n- First release\n\n## 0.0.1\n\n- Older notes\n",
+    );
+    git("add", "services");
+    git("commit", "--amend", "--no-edit");
+    git("update-ref", "refs/remotes/origin/main", "HEAD");
+
+    const expected = {
+      release: "true",
+      version: "0.1.0",
+      tag: "broker-v0.1.0",
+      commit: git("rev-parse", "HEAD"),
+      prerelease: "false",
+    };
+
+    expect(plan(workerPush, workerPlan)).toEqual(expected);
+    expect(readFileSync(notes, "utf8")).toBe("- First release\n");
+    const workerTag = { ...manual, GITHUB_REF: "refs/tags/broker-v0.1.0" };
+    expect(run(workerPlan, workerTag).status).not.toBe(0);
+    git("tag", "broker-v0.1.0");
+    expect(plan(workerTag, workerPlan)).toEqual(expected);
   }));
 
 test("archive publication uses the qualified bytes, verifies duplicates, and protects latest", () =>
