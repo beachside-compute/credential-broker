@@ -44,15 +44,39 @@ function emailSender(env: NodeJS.ProcessEnv): string | undefined {
     : setupError("BROKER_EMAIL_FROM must be one email address on your onboarded domain");
 }
 
+const hostname = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+/** The validated custom domains the Worker should also answer on, if the deployment sets any. */
+function customDomains(env: NodeJS.ProcessEnv): string[] {
+  const names = (env.BROKER_CUSTOM_DOMAINS ?? "").toLowerCase().split(/[\s,]+/);
+  const domains = [...new Set(names.filter(Boolean))];
+
+  return domains.every((domain) => hostname.test(domain))
+    ? domains
+    : setupError(
+        "BROKER_CUSTOM_DOMAINS must list hostnames such as broker.example.com, separated by commas",
+      );
+}
+
+/** Deployment-specific settings Wrangler reads only from its config file. */
+interface DeployConfig {
+  from?: string;
+  domains: string[];
+}
+
+function deployConfig(env: NodeJS.ProcessEnv): DeployConfig {
+  return { from: emailSender(env), domains: customDomains(env) };
+}
+
 /**
- * Wrangler has no binding flags, so email alerts deploy from a copy of the config with the binding.
+ * Wrangler has no binding or custom domain flags, so these deploy from a copy of the config.
  * Each run writes its own copy beside the original, so relative paths resolve and runs never share one.
  */
-async function withEmailConfig<T>(
-  from: string | undefined,
+async function withDeployConfig<T>(
+  { from, domains }: DeployConfig,
   run: (args: string[]) => Promise<T>,
 ): Promise<T> {
-  if (!from) return run([]);
+  if (!from && !domains.length) return run([]);
   const service = resolve(repository, servicePath);
 
   const config = Object.assign(
@@ -60,13 +84,16 @@ async function withEmailConfig<T>(
     Bun.JSONC.parse(readFileSync(resolve(service, "wrangler.jsonc"), "utf8")),
   );
 
-  const path = resolve(service, `wrangler.email.${crypto.randomUUID()}.json`);
+  const path = resolve(service, `wrangler.deploy.${crypto.randomUUID()}.json`);
 
   writeFileSync(
     path,
     JSON.stringify({
       ...config,
-      send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }],
+      ...(from && { send_email: [{ name: "EMAIL", allowed_sender_addresses: [from] }] }),
+      ...(domains.length && {
+        routes: domains.map((pattern) => ({ pattern, custom_domain: true })),
+      }),
     }),
     { flag: "wx" },
   );
@@ -241,6 +268,7 @@ function deployedOrigin(output: string): string | undefined {
 async function deployWrangler(
   env: NodeJS.ProcessEnv,
   secrets: Record<string, string>,
+  config: DeployConfig,
   args: string[],
 ): Promise<{ code: number; url?: string }> {
   // Wrangler reads secrets only from a file. It is private and removed as soon as Wrangler exits.
@@ -260,8 +288,8 @@ async function deployWrangler(
       raced ||= firstDeployRace.test(tail);
     };
 
-    const code = await withEmailConfig(secrets.BROKER_EMAIL_FROM, async (config) => {
-      const command = ["deploy:wrangler", ...args, ...config, "--secrets-file", path];
+    const code = await withDeployConfig(config, async (configArgs) => {
+      const command = ["deploy:wrangler", ...args, ...configArgs, "--secrets-file", path];
       let { code } = await runCommand(env, command, { watch });
 
       if (code !== 0 && raced) {
@@ -354,6 +382,7 @@ async function setup(
     );
 
   const secrets = await settingSecrets(settings);
+  const config = deployConfig(settings);
   const env = wranglerEnvironment(inherited, settings);
   const workerSecrets = await workerSecretNames(env);
   const existing = keySecrets.filter((name) => workerSecrets.has(name));
@@ -363,7 +392,7 @@ async function setup(
       `The broker Worker already has ${existing.join(", ")}. Setup never replaces keys: update the Worker with bun run deploy`,
     );
   const keys = generateKeys();
-  const { code, url } = await deployWrangler(env, { ...secrets, ...keys }, []);
+  const { code, url } = await deployWrangler(env, { ...secrets, ...keys }, config, []);
 
   if (code !== 0) {
     console.error(
@@ -391,10 +420,8 @@ async function deploy() {
       .code;
 
   if (args.length === 1 && args[0] === "--dry-run") {
-    const from = emailSender({ ...inherited, ...loadDeploymentFile(envPath) });
-
-    return withEmailConfig(
-      from,
+    return withDeployConfig(
+      deployConfig({ ...inherited, ...loadDeploymentFile(envPath) }),
       async (config) =>
         (
           await runCommand(wranglerEnvironment(inherited, {}), [
@@ -426,6 +453,7 @@ async function deploy() {
 
   if (plaintext.length) console.warn(`${plaintextWarning(plaintext)} Deploys never upload keys.`);
   const secrets = await settingSecrets(settings);
+  const config = deployConfig(settings);
   const env = wranglerEnvironment(inherited, settings);
   const dryRun = args.includes("--dry-run");
 
@@ -438,7 +466,7 @@ async function deploy() {
       );
   }
 
-  const { code, url } = await deployWrangler(env, secrets, args);
+  const { code, url } = await deployWrangler(env, secrets, config, args);
 
   if (code === 0 && !dryRun) {
     recordURL(envPath, url ?? settings.BEACHSIDE_BROKER_URL);

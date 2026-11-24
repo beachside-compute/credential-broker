@@ -42,6 +42,7 @@ Before deploying, add a `routes` entry to [`wrangler.jsonc`](./wrangler.jsonc). 
 | `CREDENTIAL_…`                                                | Upstream keys for optional Worker-secret integrations named in `BROKER_CONFIG.workerSecretBindings`.              |
 | `BROKER_OTLP_TRACES_ENDPOINT` and `BROKER_OTLP_AUTHORIZATION` | Optional trace endpoint and collector authorization.                                                              |
 | `BROKER_EMAIL_FROM`                                           | Optional sender for `email` canary alerts. Deploys add the `send_email` binding only when it is set.              |
+| `BROKER_CUSTOM_DOMAINS`                                       | Optional comma-separated hostnames the Worker also serves as Cloudflare custom domains, next to `workers.dev`.    |
 | `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`            | Optional provisioning credentials and account selection for Wrangler automation.                                  |
 
 The deployment command passes only Worker bindings to Wrangler in a private temporary secrets file and removes it after the command completes; on the first deploy that file briefly holds the generated keys. Wrangler runs without the broker settings or `BEACHSIDE_BROKER_*` keys from your environment. It uploads `BROKER_CONFIG` as a Worker secret binding. A Worker's very first deploy can upload and then fail with Cloudflare error 10007 while the Workers API catches up; the command deploys once more when that happens.
@@ -97,6 +98,10 @@ BEACHSIDE_BROKER_ADMIN_KEY="$(sed -n 's/^BROKER_ADMIN_KEY=//p' services/credenti
 ```
 
 Keys referenced from `.env.deploy` take precedence, so run this from a checkout without one, or use the installed `beachside-broker` command, which reads only the environment.
+
+## Serve the broker on your own domain
+
+Set `BROKER_CUSTOM_DOMAINS=broker.example.com` in `.env.deploy` and run `bun run deploy`. The hostname must be on a zone in the same Cloudflare account; Cloudflare creates its DNS record and certificate. Separate several hostnames with commas. The broker keeps answering on its `workers.dev` URL, so existing grants, canaries and `BEACHSIDE_BROKER_URL` keep working. Point clients at the new origin by changing `BEACHSIDE_BROKER_URL`. Run `bun run deploy --dry-run` first to see the generated config.
 
 ## Manage integrations
 

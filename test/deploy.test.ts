@@ -327,7 +327,7 @@ test("an email sender adds the send_email binding to that deploy only", () =>
       name: "broker",
       send_email: [{ name: "EMAIL", allowed_sender_addresses: ["canary@alerts.example.com"] }],
     });
-    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.email."))).toEqual([]);
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.deploy."))).toEqual([]);
 
     const dryRun = spawn([...command, "--dry-run"]);
     expect(dryRun.code, dryRun.stderr).toBe(0);
@@ -336,6 +336,46 @@ test("an email sender adds the send_email binding to that deploy only", () =>
     writeFileSync(join(root, ".env.deploy"), "BROKER_EMAIL_FROM=not-an-address\n");
     expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
     expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    expect(calls(service)).toHaveLength(2);
+  }));
+
+test("custom domains add custom domain routes to the deploy and dry run", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    writeFileSync(join(service, "wrangler.jsonc"), '{\n  // comment\n  "name": "broker",\n}');
+    writeFileSync(
+      join(root, ".env.deploy"),
+      "BROKER_CUSTOM_DOMAINS=Gateway.Example.sh, broker.example.com,gateway.example.sh\n",
+      { mode: 0o600 },
+    );
+
+    const run = spawn(command, { WORKER_SECRETS: deployed });
+    expect(run.code, run.stderr).toBe(0);
+    const [upload] = calls(service);
+    expect(upload.config).toEqual({
+      name: "broker",
+      routes: [
+        { pattern: "gateway.example.sh", custom_domain: true },
+        { pattern: "broker.example.com", custom_domain: true },
+      ],
+    });
+    expect(upload.bindings.BROKER_CUSTOM_DOMAINS).toBeUndefined();
+    expect(readdirSync(service).filter((name) => name.startsWith("wrangler.deploy."))).toEqual([]);
+
+    const dryRun = spawn([...command, "--dry-run"]);
+    expect(dryRun.code, dryRun.stderr).toBe(0);
+    expect(calls(service)[1].config.routes).toEqual(upload.config.routes);
+
+    for (const invalid of [
+      "https://gateway.example.sh",
+      "gateway.example.sh/path",
+      "*.example.sh",
+    ]) {
+      writeFileSync(join(root, ".env.deploy"), `BROKER_CUSTOM_DOMAINS=${invalid}\n`);
+      expect(spawn(command, { WORKER_SECRETS: deployed }).code).not.toBe(0);
+      expect(spawn([...command, "--dry-run"]).code).not.toBe(0);
+    }
+
     expect(calls(service)).toHaveLength(2);
   }));
 
