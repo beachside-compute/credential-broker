@@ -22,7 +22,9 @@ For a remote terminal, use `bun run --cwd services/credential-broker wrangler lo
 
 ### Use a custom hostname
 
-Put deployment-specific Wrangler settings in `services/credential-broker/wrangler.local.jsonc`, starting from [`wrangler.local.jsonc.example`](./wrangler.local.jsonc.example). Git ignores that file, and `bun run deploy` merges its top-level keys over the tracked [`wrangler.jsonc`](./wrangler.jsonc), so upstream changes such as Durable Object migrations still reach you. It cannot set `main`, `durable_objects` or `migrations`. For a custom hostname, add a `routes` entry in a Cloudflare zone on the account you deploy to. Set `workers_dev` to `false` to disable the default `workers.dev` hostname. [Cloudflare Worker Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
+If you deploy from your own fork, edit [`wrangler.jsonc`](./wrangler.jsonc) there and commit it. Merging upstream then brings in new Durable Object migrations, and a conflict tells you when an upstream change touches the same settings.
+
+Without a fork, put deployment-specific Wrangler settings in `services/credential-broker/wrangler.local.jsonc`, starting from [`wrangler.local.jsonc.example`](./wrangler.local.jsonc.example). Git ignores that file, and `bun run deploy` merges its top-level keys over the tracked [`wrangler.jsonc`](./wrangler.jsonc), so upstream changes such as Durable Object migrations still reach you. It cannot set `main`, `durable_objects` or `migrations`. For a custom hostname, add a `routes` entry in a Cloudflare zone on the account you deploy to. Set `workers_dev` to `false` to disable the default `workers.dev` hostname. [Cloudflare Worker Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
 
 ```jsonc
 {
