@@ -255,19 +255,23 @@ async function workerSecretNames(env: NodeJS.ProcessEnv): Promise<Set<string>> {
 }
 
 /** The origin Wrangler printed for the deployed Worker. */
-function deployedOrigin(output: string): string | undefined {
-  const workersDev = /https:\/\/[\w.-]+\.workers\.dev\b/.exec(output)?.[0];
+function deployedOrigin(output: string, saved?: string): string | undefined {
+  const origins = [
+    ...Array.from(output.matchAll(/https:\/\/[\w.-]+\.workers\.dev\b/g), ([origin]) => origin),
+    ...Array.from(
+      output.matchAll(/^\s*([\w.-]+\.[a-z]{2,}) \(custom domain\)\s*$/gim),
+      ([, host]) => `https://${host}`,
+    ),
+  ];
 
-  if (workersDev) return workersDev;
-  const custom = /^\s*([\w.-]+\.[a-z]{2,}) \(custom domain\)\s*$/im.exec(output)?.[1];
-
-  return custom && `https://${custom}`;
+  return origins.find((origin) => saved && URL.parse(saved)?.origin === origin) ?? origins[0];
 }
 
 async function deployWrangler(
   env: NodeJS.ProcessEnv,
   secrets: Record<string, string>,
   args: string[],
+  savedURL?: string,
 ): Promise<{ code: number; url?: string }> {
   // Wrangler reads secrets only from a file. It is private and removed as soon as Wrangler exits.
   const directory = mkdtempSync(resolve(tmpdir(), "broker-wrangler-"));
@@ -301,7 +305,7 @@ async function deployWrangler(
       return code;
     });
 
-    return { code, url: deployedOrigin(printed) };
+    return { code, url: deployedOrigin(printed, savedURL) };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -463,7 +467,7 @@ async function deploy() {
       );
   }
 
-  const { code, url } = await deployWrangler(env, secrets, args);
+  const { code, url } = await deployWrangler(env, secrets, args, settings.BEACHSIDE_BROKER_URL);
 
   if (code === 0 && !dryRun) {
     recordURL(envPath, url ?? settings.BEACHSIDE_BROKER_URL);
