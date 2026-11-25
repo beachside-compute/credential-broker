@@ -297,6 +297,19 @@ test("updates never upload broker keys, resolve setting references and follow th
       `Replaced BEACHSIDE_BROKER_URL ${setting.BEACHSIDE_BROKER_URL} with ${fixtureURL}`,
     );
     expect(loadDeploymentFile(file)?.BEACHSIDE_BROKER_URL).toBe(fixtureURL);
+
+    const custom = "https://gateway.example.com";
+    writeFileSync(file, readFileSync(file, "utf8").replace(fixtureURL, custom));
+
+    const withDomain = spawn(command, {
+      WORKER_SECRETS: deployed,
+      DECLARED_SOURCE: "x",
+      COLLECTOR_AUTH: "Bearer y",
+      DEPLOY_URL: `${fixtureURL}\n  gateway.example.com (custom domain)`,
+    });
+
+    expect(withDomain.code, withDomain.stderr).toBe(0);
+    expect(loadDeploymentFile(file)?.BEACHSIDE_BROKER_URL).toBe(custom);
   }));
 
 test("help and dry run need no settings or Worker", () =>
