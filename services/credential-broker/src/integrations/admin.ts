@@ -6,8 +6,7 @@ import {
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
-import { administrator } from "../auth";
-import { integrationId, parseConfig, requestLimit } from "../config";
+import { integrationId, requestLimit } from "../config";
 import { credentialInput } from "../credentials/source";
 import type { CredentialInput, CredentialReference } from "../credentials/source";
 import {
@@ -17,7 +16,7 @@ import {
 } from "../credentials/sources/encrypted-store";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import { workerSecretSource } from "../credentials/sources/worker-secret";
-import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "../http";
+import { privateJson, privateNoContent, readJson } from "../http";
 import type { Worker } from "../http";
 import { failure } from "../proxy/forward";
 import { grantView } from "../grants/view";
@@ -26,6 +25,8 @@ import type { AdminOperation } from "../observability/tracing";
 import { integrationKind, maxIntegrations } from "./types";
 import { canaryAdminRoutes, tripRoleKey } from "../canaries/admin";
 import type { IntegrationRevision } from "./types";
+import { defaultTenant, tenantFor } from "../tenants/tenant";
+import type { Tenant } from "../tenants/tenant";
 
 const maxAdminBody = 16_384;
 
@@ -64,18 +65,21 @@ type AdminWorker = Worker & { Variables: { keyring: EncryptionKeyring } };
 export const adminRoutes = new Hono<AdminWorker>();
 
 adminRoutes.use("*", async (context, next) => {
-  if (!(await administrator(context.req.raw, context.env.BROKER_ADMIN_KEY))) {
+  const tenant = tenantFor(context.env, defaultTenant);
+  context.set("tenant", tenant);
+
+  if (!(await tenant.administrator(context.req.raw))) {
     await tripRoleKey(context, "admin-auth");
 
     return failure(401, "administrator_authentication_required");
   }
 
-  context.set("keyring", managementKeyring(context.env));
+  context.set("keyring", await tenant.keyring());
   await next();
 });
 
 adminRoutes.get("/integrations", traceAdmin("admin.integration.list"), async (context) => {
-  const store = registry(context.env);
+  const store = context.get("tenant").store;
   const issuable = new Set(await store.listIssuerIntegrations());
   const list = await store.listIntegrations();
 
@@ -85,17 +89,18 @@ adminRoutes.get("/integrations", traceAdmin("admin.integration.list"), async (co
 });
 
 adminRoutes.get("/grants", traceAdmin("admin.grant.list"), async (context) => {
-  const grants = await registry(context.env).listGrants();
+  const grants = await context.get("tenant").store.listGrants();
 
   return privateJson({ grants: grants.map((grant) => grantView(grant, true)) });
 });
 
 adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const tenant = context.get("tenant");
+  const config = await tenant.config();
 
   // Binding names stay private. The workflow trust policy is configuration, not a secret.
   const limits = config.limits ?? {};
-  const known = await registry(context.env).listIntegrations();
+  const known = await tenant.store.listIntegrations();
 
   return privateJson({
     githubActions: config.githubActions ?? null,
@@ -107,7 +112,7 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
     ),
     unknownLimitIds: Object.keys(limits).filter((id) => !known.some((row) => row.id === id)),
     workerSecretBindings: config.workerSecretBindings.length,
-    issuerKey: Boolean(context.env.BROKER_ISSUER_KEY),
+    issuerKey: await tenant.hasIssuerKey(),
   });
 });
 
@@ -132,12 +137,18 @@ adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async 
 
     credential = await sealEndpointValues(values, { ...revision, kind: "http", endpoint }, keyring);
   } else {
-    credential = await prepareCredential(input.data.credential, revision, context.env, keyring);
+    credential = await prepareCredential(
+      input.data.credential,
+      revision,
+      context.env,
+      context.get("tenant"),
+      keyring,
+    );
   }
 
   if (!credential) return failure(503, "credential_unavailable");
 
-  const result = await registry(context.env).createIntegration({
+  const result = await context.get("tenant").store.createIntegration({
     ...revision,
     credential,
     enabled: true,
@@ -157,7 +168,7 @@ adminRoutes.get("/integrations/:id", traceAdmin("admin.integration.read"), async
 
   if (!id.success) return failure(400, "invalid_integration_id");
 
-  const store = registry(context.env);
+  const store = context.get("tenant").store;
   const result = await store.getIntegration(id.data);
 
   if (!result) return failure(404, "integration_not_found");
@@ -173,7 +184,9 @@ adminRoutes.patch("/integrations/:id", traceAdmin("admin.integration.update"), a
 
   if (!id.success || !input.success) return failure(400, "invalid_integration");
 
-  const result = await registry(context.env).setIntegrationEnabled(id.data, input.data.enabled);
+  const result = await context
+    .get("tenant")
+    .store.setIntegrationEnabled(id.data, input.data.enabled);
 
   return result ? privateJson(result) : failure(404, "integration_not_found");
 });
@@ -190,7 +203,7 @@ adminRoutes.put(
 
     if (!id.success || !input.success) return failure(400, "invalid_credential");
 
-    const store = registry(context.env);
+    const store = context.get("tenant").store;
     const revision = await store.credentialRevision(id.data);
 
     if (!revision) return failure(404, "integration_not_found");
@@ -221,7 +234,13 @@ adminRoutes.put(
     } else {
       if ("values" in input.data) return failure(400, "invalid_credential");
 
-      credential = await prepareCredential(input.data, next, context.env, keyring);
+      credential = await prepareCredential(
+        input.data,
+        next,
+        context.env,
+        context.get("tenant"),
+        keyring,
+      );
     }
 
     if (!credential) return failure(503, "credential_unavailable");
@@ -237,7 +256,7 @@ adminRoutes.delete("/integrations/:id", traceAdmin("admin.integration.delete"), 
 
   if (!id.success) return failure(400, "invalid_integration_id");
 
-  await registry(context.env).deleteIntegration(id.data);
+  await context.get("tenant").store.deleteIntegration(id.data);
 
   return privateNoContent();
 });
@@ -246,7 +265,7 @@ adminRoutes.get(
   "/issuer-permissions",
   traceAdmin("admin.issuer_permissions.read"),
   async (context) =>
-    privateJson({ integrations: await registry(context.env).listIssuerIntegrations() }),
+    privateJson({ integrations: await context.get("tenant").store.listIssuerIntegrations() }),
 );
 
 adminRoutes.put(
@@ -257,7 +276,9 @@ adminRoutes.put(
 
     if (!input.success) return failure(400, "invalid_issuer_permissions");
 
-    const integrations = await registry(context.env).setIssuerIntegrations(input.data.integrations);
+    const integrations = await context
+      .get("tenant")
+      .store.setIssuerIntegrations(input.data.integrations);
 
     return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
   },
@@ -271,7 +292,7 @@ adminRoutes.put(
 
     if (!id.success) return failure(400, "invalid_integration_id");
 
-    const integrations = await registry(context.env).allowIssuerIntegration(id.data);
+    const integrations = await context.get("tenant").store.allowIssuerIntegration(id.data);
 
     return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
   },
@@ -285,7 +306,7 @@ adminRoutes.delete(
 
     if (!id.success) return failure(400, "invalid_integration_id");
 
-    const integrations = await registry(context.env).denyIssuerIntegration(id.data);
+    const integrations = await context.get("tenant").store.denyIssuerIntegration(id.data);
 
     return integrations ? privateJson({ integrations }) : failure(404, "integration_not_found");
   },
@@ -297,6 +318,7 @@ function traceAdmin(operation: AdminOperation): MiddlewareHandler<AdminWorker> {
   return async (context, next) => {
     const span = startSpan(
       context.env,
+      context.get("tenant").id,
       (work) => context.executionCtx.waitUntil(work),
       operation,
       parseTraceparent(context.req.raw.headers.get("traceparent")),
@@ -314,13 +336,14 @@ async function prepareCredential(
   input: CredentialInput,
   revision: IntegrationRevision,
   env: Worker["Bindings"],
+  tenant: Tenant,
   keyring: EncryptionKeyring,
 ) {
   if (input.source === "encrypted-store") {
     return sealCredential(input.value, revision, keyring);
   }
 
-  const config = parseConfig(env.BROKER_CONFIG ?? "{}");
+  const config = await tenant.config();
 
   if (!config.workerSecretBindings.includes(input.binding)) return;
 

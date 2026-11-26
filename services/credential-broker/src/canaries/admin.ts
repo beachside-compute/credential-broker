@@ -3,8 +3,9 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { grantLabel, integrationId } from "../config";
 import { newGrantToken, tokenHash, grantTokenPattern, bearer } from "../grants/tokens";
-import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "../http";
+import { privateJson, privateNoContent, readJson } from "../http";
 import type { Worker } from "../http";
+import type { Tenant } from "../tenants/tenant";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import { failure } from "../proxy/forward";
 import {
@@ -40,31 +41,29 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{1
 export function alertOnTrip<E extends Worker>(context: Context<E>, trip: Trip | undefined): void {
   if (!trip?.deliveries.length) return;
 
-  const store = registry(context.env);
+  const tenant: Tenant = context.get("tenant");
   const host = new URL(context.req.url).host;
 
   // A broken keyring must not change the caller's response, or a canary would stand out.
-  let keyring: EncryptionKeyring;
-
-  try {
-    keyring = managementKeyring(context.env);
-  } catch {
-    return;
-  }
+  const keyring = tenant.keyring().catch(() => undefined);
 
   context.executionCtx.waitUntil(
-    Promise.all(
-      trip.deliveries.map(async (delivery) => {
-        const status = await deliver(
-          delivery,
-          alertEvent(trip, delivery, host),
-          keyring,
-          mailer(context.env),
-        );
+    keyring.then(async (keys) => {
+      if (!keys) return;
 
-        await store.recordDelivery(delivery.identity, status).catch(() => {});
-      }),
-    ),
+      await Promise.all(
+        trip.deliveries.map(async (delivery) => {
+          const status = await deliver(
+            delivery,
+            alertEvent(trip, delivery, host),
+            keys,
+            mailer(context.env),
+          );
+
+          await tenant.store.recordDelivery(delivery.identity, status).catch(() => {});
+        }),
+      );
+    }),
   );
 }
 
@@ -77,10 +76,12 @@ export async function tripRoleKey<E extends Worker>(
 
   if (!token || !grantTokenPattern.test(token)) return;
 
-  const trip = await registry(context.env).tripCanary(
-    { hash: await tokenHash(token) },
-    tripRequest(context.req.raw, route, "", token),
-  );
+  const trip = await context
+    .get("tenant")
+    .store.tripCanary(
+      { hash: await tokenHash(token) },
+      tripRequest(context.req.raw, route, "", token),
+    );
 
   alertOnTrip(context, trip);
 }
@@ -96,7 +97,7 @@ canaryAdminRoutes.post("/canaries", async (context) => {
   const id = crypto.randomUUID();
   const { integrations, label, note } = input.data;
 
-  const result = await registry(context.env).createCanary({
+  const result = await context.get("tenant").store.createCanary({
     id,
     hash: await tokenHash(token),
     integrations,
@@ -125,7 +126,7 @@ canaryAdminRoutes.post("/canaries", async (context) => {
 });
 
 canaryAdminRoutes.get("/canaries", async (context) =>
-  privateJson({ canaries: (await registry(context.env).listCanaries()).map(canaryView) }),
+  privateJson({ canaries: (await context.get("tenant").store.listCanaries()).map(canaryView) }),
 );
 
 canaryAdminRoutes.get("/canaries/:id", async (context) => {
@@ -133,7 +134,7 @@ canaryAdminRoutes.get("/canaries/:id", async (context) => {
 
   if (!uuid.test(id)) return failure(400, "invalid_canary_id");
 
-  const canary = await registry(context.env).getCanary(id);
+  const canary = await context.get("tenant").store.getCanary(id);
 
   return canary
     ? privateJson({ ...canaryView(canary), events: canary.events })
@@ -145,7 +146,7 @@ canaryAdminRoutes.delete("/canaries/:id", async (context) => {
 
   if (!uuid.test(id)) return failure(400, "invalid_canary_id");
 
-  return (await registry(context.env).revokeCanary(id))
+  return (await context.get("tenant").store.revokeCanary(id))
     ? privateNoContent()
     : failure(404, "canary_not_found");
 });
@@ -153,7 +154,7 @@ canaryAdminRoutes.delete("/canaries/:id", async (context) => {
 canaryAdminRoutes.get("/alerts", async (context) => {
   // Clients before email support reject unknown kinds, so they get only the kinds they parse.
   const email = context.req.query("include") === "email";
-  const destinations = await registry(context.env).listDestinations();
+  const destinations = await context.get("tenant").store.listDestinations();
 
   return privateJson({
     destinations: destinations
@@ -187,7 +188,7 @@ canaryAdminRoutes.post("/alerts", async (context) => {
 
   if (!config) return failure(400, "invalid_alert_destination");
 
-  const result = await registry(context.env).createDestination({
+  const result = await context.get("tenant").store.createDestination({
     identity,
     id,
     kind,
@@ -208,7 +209,7 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
 
   if (!id.success) return failure(400, "invalid_alert_destination_id");
 
-  const store = registry(context.env);
+  const store = context.get("tenant").store;
   const destination = await store.destination(id.data);
 
   if (!destination) return failure(404, "alert_destination_not_found");
@@ -233,7 +234,7 @@ canaryAdminRoutes.delete("/alerts/:id", async (context) => {
 
   if (!id.success) return failure(400, "invalid_alert_destination_id");
 
-  await registry(context.env).deleteDestination(id.data);
+  await context.get("tenant").store.deleteDestination(id.data);
 
   return privateNoContent();
 });

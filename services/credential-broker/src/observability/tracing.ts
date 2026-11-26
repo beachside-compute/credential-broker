@@ -49,6 +49,7 @@ type Operation =
 
 export function startSpan(
   env: TraceExportBindings,
+  tenant: string,
   waitUntil: (work: Promise<void>) => void,
   operation: Operation,
   parent?: SpanContext,
@@ -79,13 +80,15 @@ export function startSpan(
       ],
     });
 
-    return provider
-      .getTracer(scope, "0.0.0")
-      .startSpan(
-        `beachside.broker.${operation}`,
-        { kind: SpanKind.SERVER, links: origin ? [{ context: origin }] : [] },
-        parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT,
-      );
+    return provider.getTracer(scope, "0.0.0").startSpan(
+      `beachside.broker.${operation}`,
+      {
+        kind: SpanKind.SERVER,
+        attributes: { "beachside.broker.tenant": tenant },
+        links: origin ? [{ context: origin }] : [],
+      },
+      parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT,
+    );
   } catch {
     return;
   }

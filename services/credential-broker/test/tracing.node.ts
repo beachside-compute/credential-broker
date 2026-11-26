@@ -46,6 +46,10 @@ const spanSchema = z.object({
   endTimeUnixNano: z.coerce.bigint(),
   attributes: z.tuple([
     z.object({
+      key: z.literal("beachside.broker.tenant"),
+      value: z.object({ stringValue: z.literal("default") }),
+    }),
+    z.object({
       key: z.literal("http.response.status_code"),
       value: z.object({ intValue: z.coerce.number() }),
     }),
@@ -215,12 +219,12 @@ test("exports safe sampled grant and gateway spans with the verified parent and 
     const issuance = spans.find(({ name }) => name === "beachside.broker.grant.create")!;
     const gateway = spans.find(({ name }) => name === "beachside.broker.gateway")!;
     assert.partialDeepStrictEqual(issuance, { traceId, parentSpanId, links: [] });
-    assert.equal(issuance.attributes[0].value.intValue, 201);
+    assert.equal(issuance.attributes[1].value.intValue, 201);
     assert.equal(gateway.parentSpanId, undefined);
     assert.notEqual(gateway.traceId, traceId);
     assert.notEqual(gateway.traceId, "f".repeat(32));
     assert.deepEqual(gateway.links, [{ traceId, spanId: issuance.spanId }]);
-    assert.equal(gateway.attributes[0].value.intValue, 200);
+    assert.equal(gateway.attributes[1].value.intValue, 200);
 
     for (const span of spans) assert.ok(span.endTimeUnixNano >= span.startTimeUnixNano);
 
@@ -288,6 +292,7 @@ for (const [index, bindings] of [
   test(`invalid runtime tracing settings skip instrumentation ${index}`, () => {
     const span = startSpan(
       bindings,
+      "default",
       () => {
         throw new Error("Unexpected export");
       },
@@ -330,7 +335,7 @@ test("exports a static administrator span without integration IDs or request cre
     assert.equal(span.name, "beachside.broker.admin.integration.create");
     assert.equal(span.traceId, traceId);
     assert.equal(span.parentSpanId, parentSpanId);
-    assert.equal(span.attributes[0].value.intValue, 201);
+    assert.equal(span.attributes[1].value.intValue, 201);
 
     for (const canary of [adminKey, id, value, "/v1/admin/integrations"]) {
       assert.ok(!broker.exported[0].body.includes(canary));
