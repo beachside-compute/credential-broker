@@ -24,7 +24,7 @@ import {
   CredentialBrokerError,
 } from "../../../src/index";
 import { requireApiKey } from "../../../src/transport";
-import { assertSeparateRoleKeys } from "../src/auth";
+import { assertSeparateRoleKeys } from "../src/tenants/role-keys";
 import { isBrokerApiKey, matchesKey } from "../src/auth/api-key";
 import { parseConfig } from "../src/config";
 import {

@@ -18,6 +18,7 @@ import { finishSpan, grantOrigin, parseTraceparent, startSpan } from "./observab
 import { alertOnTrip, tripRoleKey } from "./canaries/admin";
 import { tripRequest } from "./canaries/alerts";
 import { defaultTenant, tenantFor } from "./tenants/tenant";
+import type { Tenant } from "./tenants/tenant";
 
 export { GrantRegistry };
 
@@ -37,12 +38,13 @@ const renewRequest = z.strictObject({ ttlSeconds });
  */
 async function traced(
   context: Context<Worker>,
+  tenant: Tenant,
   operation: "grant.list" | "grant.renew" | "status",
   work: () => Promise<Response>,
 ): Promise<Response> {
   const span = startSpan(
     context.env,
-    context.get("tenant").id,
+    tenant.id,
     (task) => context.executionCtx.waitUntil(task),
     operation,
     parseTraceparent(context.req.header("traceparent") ?? null),
@@ -73,7 +75,7 @@ app.post("/v1/grants", async (context) => {
   const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
@@ -84,7 +86,7 @@ app.post("/v1/grants", async (context) => {
 
   const span = startSpan(
     context.env,
-    context.get("tenant").id,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "grant.create",
     parent,
@@ -172,7 +174,7 @@ app.get("/v1/status", async (context) => {
   if (await tenant.administrator(request)) {
     await tenant.keyring();
 
-    return traced(context, "status", async () =>
+    return traced(context, tenant, "status", async () =>
       privateJson({
         apiVersion,
         role: "admin",
@@ -185,12 +187,12 @@ app.get("/v1/status", async (context) => {
   const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "authentication_required");
   }
 
-  return traced(context, "status", async () =>
+  return traced(context, tenant, "status", async () =>
     privateJson({
       apiVersion,
       role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
@@ -205,12 +207,12 @@ app.get("/v1/grants", async (context) => {
   const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  return traced(context, "grant.list", async () => {
+  return traced(context, tenant, "grant.list", async () => {
     const grants = await tenant.store.listGrants(principal.owner);
 
     return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
@@ -224,12 +226,12 @@ app.post("/v1/grants/:id/renew", async (context) => {
   const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  return traced(context, "grant.renew", async () => {
+  return traced(context, tenant, "grant.renew", async () => {
     const id = context.req.param("id");
     const input = renewRequest.safeParse(await readJson(request, 1_024));
 
@@ -243,7 +245,7 @@ app.post("/v1/grants/:id/renew", async (context) => {
     );
 
     if (result.status === "not_found") {
-      alertOnTrip(context, result.trip);
+      alertOnTrip(context, tenant, result.trip);
 
       return failure(404, "grant_not_found");
     }
@@ -258,7 +260,7 @@ app.delete("/v1/grants/:id", async (context) => {
   const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
@@ -269,7 +271,7 @@ app.delete("/v1/grants/:id", async (context) => {
 
   const span = startSpan(
     context.env,
-    context.get("tenant").id,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "grant.revoke",
     parent,
@@ -288,6 +290,7 @@ app.delete("/v1/grants/:id", async (context) => {
 
     alertOnTrip(
       context,
+      tenant,
       await tenant.store.revoke(id, principal.owner, tripRequest(context.req.raw, "revoke")),
     );
     status = 204;
@@ -332,7 +335,7 @@ app.all("*", async (context) => {
   );
 
   if (authorized.status === "invalid") {
-    alertOnTrip(context, authorized.trip);
+    alertOnTrip(context, tenant, authorized.trip);
 
     return failure(401, "grant_invalid", isGit);
   }
@@ -345,7 +348,7 @@ app.all("*", async (context) => {
 
   const span = startSpan(
     context.env,
-    context.get("tenant").id,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "gateway",
     undefined,

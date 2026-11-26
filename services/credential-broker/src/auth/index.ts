@@ -8,8 +8,6 @@ export interface Principal {
   integrations?: string[];
 }
 
-export { assertSeparateRoleKeys } from "../tenants/role-keys";
-
 export async function administrator(request: Request, key: string | undefined): Promise<boolean> {
   const token = authenticationToken(request);
 

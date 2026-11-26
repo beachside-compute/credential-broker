@@ -38,10 +38,13 @@ const canaryRequest = z.strictObject({
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 /** Send the alerts a trip claimed, without delaying the response or retrying. */
-export function alertOnTrip<E extends Worker>(context: Context<E>, trip: Trip | undefined): void {
+export function alertOnTrip<E extends Worker>(
+  context: Context<E>,
+  tenant: Tenant,
+  trip: Trip | undefined,
+): void {
   if (!trip?.deliveries.length) return;
 
-  const tenant: Tenant = context.get("tenant");
   const host = new URL(context.req.url).host;
 
   // A broken keyring must not change the caller's response, or a canary would stand out.
@@ -70,6 +73,7 @@ export function alertOnTrip<E extends Worker>(context: Context<E>, trip: Trip | 
 /** Trip a canary presented as a role key. Real role keys never look like grant tokens. */
 export async function tripRoleKey<E extends Worker>(
   context: Context<E>,
+  tenant: Tenant,
   route: string,
 ): Promise<void> {
   const token = bearer(context.req.header("authorization") ?? null);
@@ -83,7 +87,7 @@ export async function tripRoleKey<E extends Worker>(
       tripRequest(context.req.raw, route, "", token),
     );
 
-  alertOnTrip(context, trip);
+  alertOnTrip(context, tenant, trip);
 }
 
 export const canaryAdminRoutes = new Hono<AdminWorker>();

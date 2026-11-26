@@ -69,7 +69,7 @@ adminRoutes.use("*", async (context, next) => {
   context.set("tenant", tenant);
 
   if (!(await tenant.administrator(context.req.raw))) {
-    await tripRoleKey(context, "admin-auth");
+    await tripRoleKey(context, tenant, "admin-auth");
 
     return failure(401, "administrator_authentication_required");
   }
