@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
-import { asc, eq, gt } from "drizzle-orm";
+import { asc, desc, eq, gt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle-directory/migrations";
 import type { TenantProvision } from "../grants/registry";
 import type { Env } from "../http";
-import { tenants } from "./directory-schema";
+import { platformAudit, tenants } from "./directory-schema";
 import type { TenantRole } from "./identity";
 
 type TenantRow = typeof tenants.$inferSelect;
@@ -103,6 +103,28 @@ export class TenantDirectory extends DurableObject<Env> {
 
       return true;
     });
+  }
+
+  startAudit(
+    input: Pick<typeof platformAudit.$inferInsert, "actor" | "tenant" | "operation">,
+  ): number {
+    return this.db
+      .insert(platformAudit)
+      .values({ ...input, startedAt: Date.now() })
+      .returning({ id: platformAudit.id })
+      .get()!.id;
+  }
+
+  finishAudit(id: number, outcome: "ok" | "failed"): void {
+    this.db
+      .update(platformAudit)
+      .set({ outcome, finishedAt: Date.now() })
+      .where(eq(platformAudit.id, id))
+      .run();
+  }
+
+  auditLog() {
+    return this.db.select().from(platformAudit).orderBy(desc(platformAudit.id)).limit(100).all();
   }
 
   private operable(row: TenantRow): boolean {

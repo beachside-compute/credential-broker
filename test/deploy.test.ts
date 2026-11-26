@@ -70,7 +70,7 @@ function provisionStub(root: string) {
         const key = readFileSync(0, "utf8");
         appendFileSync("calls.jsonl", JSON.stringify({
           command, name: args[1], validKey: /^[A-Za-z0-9_-]{43}$/.test(key),
-          fromEnvironment: Boolean(process.env.BROKER_PLATFORM_KEY),
+          fromEnvironment: Boolean(process.env.BROKER_PLATFORM_KEY || process.env.BROKER_PLATFORM_OPERATOR_KEY),
           usedFile: args.includes("--secrets-file"),
         }) + "\\n");
         process.exit(0);
@@ -193,7 +193,7 @@ test("setup deploys fresh keys once, prints the role keys and saves only the URL
     expect(calls(service)).toHaveLength(1);
   }));
 
-test("hosted setup uploads a fresh platform key only over standard input", () =>
+test("HTTP platform setup uploads independent keys only over standard input", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);
     const setup = [...command, "--setup-only", "--platform-key-only", "--print-keys"];
@@ -201,14 +201,19 @@ test("hosted setup uploads a fresh platform key only over standard input", () =>
     const run = spawn(setup, env);
 
     expect(run.code, run.stderr).toBe(0);
-    expect(run.stdout.match(/BROKER_PLATFORM_KEY=[A-Za-z0-9_-]{43}/g)).toHaveLength(1);
+    const issued = run.stdout.match(/BROKER_PLATFORM(?:_OPERATOR)?_KEY=[A-Za-z0-9_-]{43}/g) ?? [];
+    expect(new Set(issued.map((line) => line.split("=")[1])).size).toBe(2);
     expect(existsSync(join(root, ".env.deploy"))).toBe(false);
 
-    const updated = { ...env, WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY" };
+    const updated = {
+      ...env,
+      WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY,BROKER_PLATFORM_OPERATOR_KEY",
+    };
+
     expect(spawn(setup, updated).code).toBe(1);
     expect(spawn(command, updated).code).toBe(0);
 
-    const [setupCall, deployCall] = calls(service);
+    const [setupCall, operatorCall, deployCall] = calls(service);
     expect(setupCall).toEqual({
       command: "secret",
       name: "BROKER_PLATFORM_KEY",
@@ -216,7 +221,9 @@ test("hosted setup uploads a fresh platform key only over standard input", () =>
       fromEnvironment: false,
       usedFile: false,
     });
+    expect(operatorCall).toEqual({ ...setupCall, name: "BROKER_PLATFORM_OPERATOR_KEY" });
     expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_KEY");
+    expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_OPERATOR_KEY");
   }));
 
 test("setup and dry run agree on whether unpinned trusted issuers are enabled", () =>

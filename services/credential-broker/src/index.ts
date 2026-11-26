@@ -23,6 +23,8 @@ import { defaultTenant } from "./tenants/identity";
 import { isBrokerHost } from "./tenants/hosts";
 import { platformRoutes } from "./tenants/platform";
 
+export { PlatformControl, PlatformOperator } from "./tenants/platform-rpc";
+
 export { TenantDirectory } from "./tenants/directory";
 
 export { GrantRegistry };

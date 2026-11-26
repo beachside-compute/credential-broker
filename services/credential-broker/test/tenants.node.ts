@@ -5,6 +5,8 @@ import { build } from "esbuild";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { convertV4MiniflareOptions, Miniflare, Response as RuntimeResponse } from "miniflare";
 import { z } from "zod";
+import type { V4WorkerOptions } from "miniflare";
+import type { PlatformControl, PlatformOperator } from "../src/tenants/platform-rpc";
 import { brokerHosts, isBrokerHost, requestTenant } from "../src/tenants/hosts";
 import { parseConfig } from "../src/config";
 import type { TrustedIssuer } from "../src/config";
@@ -15,6 +17,8 @@ const admin = "default-admin-fixture-0123456789abcdef";
 const issuer = "default-issuer-fixture-0123456789abcdef";
 
 const platform = "platform-fixture-0123456789abcdef";
+
+const platformOperator = "platform-operator-fixture-0123456789abcdef";
 
 const domain = "broker.example.org";
 
@@ -89,59 +93,82 @@ const worker = await build({
   loader: { ".sql": "text" },
 });
 
-function options(enabled = true, root = "v1", registry = true, policyEntry?: TrustedIssuer) {
+function options(
+  enabled = true,
+  root = "v1",
+  registry = true,
+  policyEntry?: TrustedIssuer,
+  rpc = false,
+) {
   const alerts: string[] = [];
+
+  const broker: V4WorkerOptions = {
+    name: "broker",
+    modules: true,
+    script: worker.outputFiles[0].text,
+    compatibilityDate: "2026-09-25",
+    unsafeInspectDurableObjects: true,
+    durableObjects: {
+      ...(registry && { REGISTRY: { className: "GrantRegistry", useSQLite: true } }),
+      ...(enabled && { DIRECTORY: { className: "TenantDirectory", useSQLite: true } }),
+    },
+    bindings: {
+      BROKER_ADMIN_KEY: admin,
+      BROKER_ISSUER_KEY: issuer,
+      BROKER_ENCRYPTION_KEYS: rootKeys,
+      BROKER_ENCRYPTION_KEY_VERSION: root,
+      ...(enabled && { BROKER_TENANT_DOMAIN: domain }),
+      BROKER_HOST_ALIASES: "default-broker.example.net",
+      BROKER_CONFIG: JSON.stringify({
+        githubActions: { audience: "default-audience", workflows: [policy] },
+        ...(policyEntry && { trustedIssuers: [policyEntry] }),
+      }),
+      ...(enabled && {
+        BROKER_PLATFORM_KEY: platform,
+        BROKER_PLATFORM_OPERATOR_KEY: platformOperator,
+        ...(!rpc && { BROKER_PLATFORM_HTTP_ENABLED: "true" }),
+      }),
+    },
+    async outboundService(request) {
+      const url = new URL(request.url);
+
+      if (url.href === `${oidcIssuer}/.well-known/jwks`)
+        return RuntimeResponse.json({ keys: [githubJwk] });
+
+      if (url.href === trustedJWKS) return RuntimeResponse.json({ keys: [trustedJwk] });
+
+      if (url.hostname === "api.openai.com" || url.hostname === "github.com")
+        return RuntimeResponse.json({ auth: request.headers.get("authorization") });
+
+      if (url.hostname === "alerts.example.net") {
+        alerts.push(url.pathname);
+
+        return RuntimeResponse.json({ received: true });
+      }
+
+      throw new Error("Unexpected fixture destination");
+    },
+  };
+
+  const client: V4WorkerOptions = {
+    name: "platform-client",
+    modules: true,
+    script: "export default {fetch: () => new Response(null, {status: 404})};",
+    compatibilityDate: "2026-09-25",
+    serviceBindings: {
+      CONTROL: { name: "broker", entrypoint: "PlatformControl" },
+      OPERATOR: { name: "broker", entrypoint: "PlatformOperator" },
+    },
+  };
 
   return {
     alerts,
-    worker: convertV4MiniflareOptions({
-      name: "broker",
-      modules: true,
-      script: worker.outputFiles[0].text,
-      compatibilityDate: "2026-09-25",
-      unsafeInspectDurableObjects: true,
-      durableObjects: {
-        ...(registry && { REGISTRY: { className: "GrantRegistry", useSQLite: true } }),
-        ...(enabled && { DIRECTORY: { className: "TenantDirectory", useSQLite: true } }),
-      },
-      bindings: {
-        BROKER_ADMIN_KEY: admin,
-        BROKER_ISSUER_KEY: issuer,
-        BROKER_ENCRYPTION_KEYS: rootKeys,
-        BROKER_ENCRYPTION_KEY_VERSION: root,
-        ...(enabled && { BROKER_TENANT_DOMAIN: domain }),
-        BROKER_HOST_ALIASES: "default-broker.example.net",
-        BROKER_CONFIG: JSON.stringify({
-          githubActions: { audience: "default-audience", workflows: [policy] },
-          ...(policyEntry && { trustedIssuers: [policyEntry] }),
-        }),
-        ...(enabled && { BROKER_PLATFORM_KEY: platform }),
-      },
-      async outboundService(request) {
-        const url = new URL(request.url);
-
-        if (url.href === `${oidcIssuer}/.well-known/jwks`)
-          return RuntimeResponse.json({ keys: [githubJwk] });
-
-        if (url.href === trustedJWKS) return RuntimeResponse.json({ keys: [trustedJwk] });
-
-        if (url.hostname === "api.openai.com" || url.hostname === "github.com")
-          return RuntimeResponse.json({ auth: request.headers.get("authorization") });
-
-        if (url.hostname === "alerts.example.net") {
-          alerts.push(url.pathname);
-
-          return RuntimeResponse.json({ received: true });
-        }
-
-        throw new Error("Unexpected fixture destination");
-      },
-    }),
+    worker: convertV4MiniflareOptions(rpc ? { workers: [broker, client] } : broker),
   };
 }
 
-function fixture(enabled = true, registry = true, entry?: TrustedIssuer) {
-  const { worker, alerts } = options(enabled, "v1", registry, entry);
+function fixture(enabled = true, registry = true, entry?: TrustedIssuer, rpc = false) {
+  const { worker, alerts } = options(enabled, "v1", registry, entry, rpc);
   const runtime = new Miniflare(worker);
 
   async function call<Payload>(
@@ -164,7 +191,15 @@ function fixture(enabled = true, registry = true, entry?: TrustedIssuer) {
   }
 
   const operate = <Payload>(path = "", method = "GET", payload?: Payload) =>
-    call(domain, platformPath + path, platform, method, payload);
+    call(
+      domain,
+      platformPath + path,
+      method === "PATCH" || method === "DELETE" || (method === "POST" && path)
+        ? platformOperator
+        : platform,
+      method,
+      payload,
+    );
 
   async function provision(id: string) {
     const reply = await operate("", "POST", { id });
@@ -764,6 +799,73 @@ test("a pinned issuer works on the default hostname without a directory", async 
     );
     await error(await issue(a, await signed()), 401, "orchestrator_authentication_required");
     await error(await operate(), 404, "unsupported_route");
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("private platform bindings work with public platform HTTP off", async () => {
+  const { runtime, call } = fixture(true, true, undefined, true);
+
+  try {
+    const { CONTROL, OPERATOR } = await runtime.getBindings<{
+      CONTROL: Pick<PlatformControl, "provision" | "inspect" | "list">;
+      OPERATOR: Pick<PlatformOperator, "erase" | "rotateRoleKey" | "setStatus" | "auditLog">;
+    }>("platform-client");
+
+    await error(await call(domain, platformPath, platform), 404, "unsupported_route");
+    await error(await call(domain, platformPath, platformOperator), 404, "unsupported_route");
+
+    const created = await CONTROL.provision({ id: tenantA });
+    assert.equal((await CONTROL.inspect({ id: tenantA })).status, "active");
+    assert.deepEqual(
+      (await CONTROL.list()).tenants.map(({ id }) => id),
+      [tenantA],
+    );
+    assert.equal((await call(a, "/v1/status", created.adminKey)).status, 200);
+    await assert.rejects(async () => CONTROL.provision({ id: "default" }), /invalid_tenant/);
+
+    // SAFETY: Deliberately test a forbidden RPC method against the routine binding.
+    const wrongBinding = CONTROL as typeof CONTROL & Pick<typeof OPERATOR, "erase">;
+    await assert.rejects(async () => wrongBinding.erase({ id: tenantA }));
+    await OPERATOR.setStatus({ id: tenantA, status: "suspended" });
+    assert.equal((await CONTROL.inspect({ id: tenantA })).status, "suspended");
+    await OPERATOR.rotateRoleKey({ id: tenantA, role: "admin" });
+    await OPERATOR.erase({ id: tenantA });
+
+    const audit = await OPERATOR.auditLog();
+    assert.deepEqual(
+      audit.map(({ actor, operation, outcome }) => ({ actor, operation, outcome })),
+      [
+        { actor: "operator-binding", operation: "erase", outcome: "ok" },
+        { actor: "operator-binding", operation: "rotate_admin", outcome: "ok" },
+        { actor: "operator-binding", operation: "suspend", outcome: "ok" },
+      ],
+    );
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("opt-in platform HTTP separates the routine and operator bearer credentials", async () => {
+  const { runtime, call, provision } = fixture();
+
+  try {
+    await provision(tenantA);
+    await error(
+      await call(domain, `${platformPath}/${tenantA}`, platform, "DELETE"),
+      403,
+      "platform_operator_required",
+    );
+    await error(
+      await call(domain, platformPath, platformOperator),
+      403,
+      "platform_control_required",
+    );
+    assert.equal(
+      (await call(domain, `${platformPath}/${tenantA}`, platformOperator, "DELETE")).status,
+      204,
+    );
   } finally {
     await runtime.dispose();
   }

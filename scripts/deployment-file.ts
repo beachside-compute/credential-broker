@@ -85,7 +85,7 @@ export function generateKeys(): Record<(typeof keySecrets)[number], string> {
 
 /** Keys an older setup saved in the file as values rather than references. */
 export function plaintextKeys(file: NodeJS.ProcessEnv | undefined): string[] {
-  return [...keySecrets, "BROKER_PLATFORM_KEY"].filter((name) => {
+  return [...keySecrets, "BROKER_PLATFORM_KEY", "BROKER_PLATFORM_OPERATOR_KEY"].filter((name) => {
     const value = file?.[name];
 
     return (

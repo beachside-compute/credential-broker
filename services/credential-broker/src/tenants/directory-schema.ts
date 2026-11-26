@@ -7,3 +7,27 @@ export const tenants = sqliteTable("tenants", {
   updatedAt: integer("updated_at").notNull(),
   deleting: integer("deleting", { mode: "boolean" }).notNull().default(false),
 });
+
+export const platformAudit = sqliteTable("platform_audit", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  tenant: text("tenant").notNull(),
+  actor: text("actor", { enum: ["operator-http", "operator-binding"] }).notNull(),
+  operation: text("operation", {
+    enum: [
+      "suspend",
+      "reactivate",
+      "rotate_admin",
+      "rotate_issuer",
+      "rewrap",
+      "erase",
+      "rotate_data_key",
+    ],
+  }).notNull(),
+  startedAt: integer("started_at").notNull(),
+  finishedAt: integer("finished_at"),
+  outcome: text("outcome", { enum: ["ok", "failed"] }),
+});
+
+export type PlatformActor = typeof platformAudit.$inferSelect.actor;
+
+export type PlatformAction = typeof platformAudit.$inferSelect.operation;

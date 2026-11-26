@@ -455,7 +455,7 @@ async function setupPlatformKey(
 ): Promise<number> {
   if (!printAnyway && !process.stdout.isTTY)
     return setupError(
-      "Setup prints the platform key once. Run it in a terminal or pass --print-keys",
+      "Setup prints each new platform key once. Run it in a terminal or pass --print-keys",
     );
 
   const env = wranglerEnvironment(inherited, settings);
@@ -464,23 +464,29 @@ async function setupPlatformKey(
   if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
     return setupError("Run bun run deploy:setup before setting up the platform key");
 
-  if (existing.has("BROKER_PLATFORM_KEY"))
-    return setupError("The Worker already has BROKER_PLATFORM_KEY. Setup never replaces role keys");
-
-  const key = randomKey();
-
-  const { code } = await withDeployConfig(undefined, (config) =>
-    runCommand(env, ["wrangler", "secret", "put", "BROKER_PLATFORM_KEY", ...config], {
-      stdin: new Blob([key]),
-    }),
+  const names = ["BROKER_PLATFORM_KEY", "BROKER_PLATFORM_OPERATOR_KEY"].filter(
+    (name) => !existing.has(name),
   );
 
-  if (code === 0)
-    console.info(`Save this key in your password manager now. It cannot be read back.
+  if (!names.length)
+    return setupError("The Worker already has both platform keys. Setup never replaces role keys");
 
-  BROKER_PLATFORM_KEY=${key}`);
+  return withDeployConfig(undefined, async (config) => {
+    for (const name of names) {
+      const key = randomKey();
 
-  return code;
+      const { code } = await runCommand(env, ["wrangler", "secret", "put", name, ...config], {
+        stdin: new Blob([key]),
+      });
+
+      if (code !== 0) return code;
+      console.info(`Save this key in your password manager now. It cannot be read back.
+
+  ${name}=${key}`);
+    }
+
+    return 0;
+  });
 }
 
 async function deploy() {
