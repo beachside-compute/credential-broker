@@ -13,7 +13,7 @@ import {
 } from "./deployment-file";
 import { isSecretReference, resolveSecret } from "../src/secret-ref.js";
 import { CredentialBrokerError } from "../src/transport.js";
-import { brokerHosts } from "../services/credential-broker/src/tenants/hosts";
+import { brokerHosts, wranglerHostConfig } from "../services/credential-broker/src/tenants/hosts";
 import { parseConfig } from "../services/credential-broker/src/config";
 import { credentialValue } from "../services/credential-broker/src/credentials/source";
 import {
@@ -79,7 +79,7 @@ async function withDeployConfig<T>(
   }
 
   try {
-    brokerHosts(config.vars ?? {});
+    brokerHosts(wranglerHostConfig.parse(config).vars ?? {});
   } catch {
     return setupError(
       "Invalid BROKER_TENANT_DOMAIN or BROKER_HOST_ALIASES in wrangler.local.jsonc",

@@ -10,6 +10,15 @@ export const tenantDomain = hostname.max(220);
 
 const brokerAliases = z.array(hostname).max(32);
 
+export const wranglerHostConfig = z.object({
+  vars: z
+    .object({
+      BROKER_TENANT_DOMAIN: z.string().optional(),
+      BROKER_HOST_ALIASES: z.string().optional(),
+    })
+    .optional(),
+});
+
 export interface TenantHostBindings {
   BROKER_TENANT_DOMAIN?: string;
   BROKER_HOST_ALIASES?: string;
