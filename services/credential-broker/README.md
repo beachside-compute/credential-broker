@@ -102,6 +102,44 @@ BEACHSIDE_BROKER_ADMIN_KEY="$(sed -n 's/^BROKER_ADMIN_KEY=//p' services/credenti
 
 Keys referenced from `.env.deploy` take precedence, so run this from a checkout without one, or use the installed `beachside-broker` command, which reads only the environment.
 
+## Hosted tenants
+
+A deployment with no `BROKER_PLATFORM_KEY` serves just the built-in broker. Its hostname, `grant-registry` object, role keys, and configuration stay in place. Apply the bundled Worker upgrade before enabling tenant access.
+
+Set a hostname suffix under a Cloudflare zone you control. Use a proxied wildcard DNS record, a TLS certificate for that wildcard, and a Workers Route. Continue to serve your existing broker hostname. For example, add this to `wrangler.local.jsonc` and keep every other broker hostname in `BROKER_HOST_ALIASES`, including your `workers.dev` hostname if enabled. The broker blocks hosted-tenant HTTP integrations and alert destinations from targeting these names or any tenant subdomain. Keep the list current when adding an alias. [Cloudflare Workers Routes](https://developers.cloudflare.com/workers/configuration/routing/routes/)
+
+```jsonc
+{
+  "routes": [
+    { "pattern": "broker.example.com", "custom_domain": true },
+    { "pattern": "*.broker.example.com/*", "zone_name": "example.com" },
+  ],
+  "workers_dev": false,
+  "vars": {
+    "BROKER_TENANT_DOMAIN": "broker.example.com",
+    "BROKER_HOST_ALIASES": "another-broker.example.com",
+  },
+}
+```
+
+After deploying the routes and variables, run `bun run deploy:setup --platform-key-only` on the existing Worker. It creates `BROKER_PLATFORM_KEY` through Wrangler secret input, prints it once, and refuses to replace an existing platform key. Store it in your secret manager. Plain `bun run deploy` omits platform and role keys.
+
+Send the platform key as a bearer credential to the existing broker's `/v1/platform/tenants` endpoint. It controls the lifecycle of every hosted tenant and can rotate any tenant's admin or issuer key. Treat it as full control of those tenants. The platform API returns new role keys once and exposes tenant status and counts. Stored upstream credentials and tenant data keys are never returned.
+
+| Platform route                                    | Behaviour                                                                                                                                                                                                        |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/platform/tenants`                       | Creates a tenant with a caller-chosen lowercase alphanumeric ID of 8–32 characters. Returns `id`, `adminKey` and `issuerKey`. Retry a tenant in `provisioning`. Active, suspended, and deleted IDs are reserved. |
+| `GET /v1/platform/tenants`                        | Lists tenant IDs, statuses, and timestamps. Pass `limit` and then `after` with the returned `next` cursor.                                                                                                       |
+| `GET /v1/platform/tenants/:id`                    | Reads the lifecycle state and counts when the registry is available.                                                                                                                                             |
+| `PATCH /v1/platform/tenants/:id`                  | Sets `status` to `active` or `suspended`. Allow up to 30 seconds for cached lookups to expire.                                                                                                                   |
+| `POST /v1/platform/tenants/:id/keys/:role/rotate` | Replaces an `admin` or `issuer` key. Returns the replacement once and invalidates the old key.                                                                                                                   |
+| `POST /v1/platform/tenants/:id/rewrap`            | Re-encrypts the tenant's data key under the active root key.                                                                                                                                                     |
+| `DELETE /v1/platform/tenants/:id`                 | Suspends access, erases tenant data, and keeps a tombstone for the ID. Safe to retry.                                                                                                                            |
+
+Use `https://<id>.broker.example.com` as the tenant's broker URL in the client, Git remotes, and gateways. Tenant role keys work only on that hostname. Sandbox grants keep the existing `bsg_<64 hex>` format. Hosted canaries presented on proxy, management, or platform routes trip on their own hostname. Tenant admins use `PUT /v1/admin/config` or the admin client's `setConfig` to replace the stored `githubActions` policy and per-grant `limits`. GitHub Actions tokens must have the exact audience `beachside-broker:<id>` and go to the matching tenant hostname. Hosted tenants can use encrypted-store integrations and Slack or webhook alert destinations.
+
+For root key rotation, keep the old root in `BROKER_ENCRYPTION_KEYS` while you add the replacement and set `BROKER_ENCRYPTION_KEY_VERSION` to make it active. Call `rewrap` for each active or suspended tenant and verify success before retiring the old root. Rewrap preserves the tenant data key, so existing tenant integration ciphertext and grants remain usable. The built-in broker's ciphertext is encrypted directly with the root keyring. Keep old root versions until those integrations and alert destinations have also been rotated or recreated.
+
 ## Manage integrations
 
 From the deployment checkout, open the integration setup wizard. Choose OpenRouter, keep the ID `openrouter`, and enter its upstream API key when prompted. The command runs the management CLI with the URL and the admin key referenced from `.env.deploy`, and lets the issuer mint grants for the new integration unless you pass `--no-allow-issue`.
@@ -406,4 +444,4 @@ Any sandbox workload or provider infrastructure able to read a grant can use it 
 
 ## Validate locally
 
-Run `bun run test` from the repository root. The suite uses Node.js 22 or later to run workerd on loopback with fixture upstreams. It uses local Git and GitHub CLI and creates a temporary loopback certificate with OpenSSL. They run without Cloudflare credentials or upstream API accounts.
+Run `bun run test` from the repository root. The suite uses Node.js 22 or later to run workerd on loopback with fixture upstreams. It uses local Git and GitHub CLI and creates a temporary loopback certificate with OpenSSL. They run without Cloudflare credentials or upstream API accounts. The hosted-tenant fixture uses its own directory binding, synthetic tenant hostnames, and fixture upstreams to exercise isolation, lifecycle operations, and the unchanged sandbox token format. Generate directory schema changes with `bun run --cwd services/credential-broker db:generate --config drizzle.directory.config.ts --name your_change`.

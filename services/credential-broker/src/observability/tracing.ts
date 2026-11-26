@@ -36,7 +36,8 @@ export type AdminOperation =
   | "admin.issuer_permissions.read"
   | "admin.issuer_permissions.update"
   | "admin.grant.list"
-  | "admin.config.read";
+  | "admin.config.read"
+  | "admin.config.update";
 
 type Operation =
   | "grant.create"

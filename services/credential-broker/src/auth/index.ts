@@ -28,7 +28,7 @@ export async function orchestrator(
   return githubActionsPrincipal(token, config);
 }
 
-function authenticationToken(request: Request): string | undefined {
+export function authenticationToken(request: Request): string | undefined {
   const token = bearer(request.headers.get("authorization"));
 
   return token && token.length <= 8192 ? token : undefined;

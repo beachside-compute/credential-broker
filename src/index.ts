@@ -47,6 +47,7 @@ export {
   type BrokerEndpointCredential,
   type BrokerIntegrationInput,
   type BrokerDeploymentConfig,
+  type BrokerTenantConfigInput,
   type BrokerRequestLimit,
   type BrokerWorkflowPolicy,
 } from "./admin.js";
@@ -329,7 +330,7 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         "UNAUTHENTICATED",
         "apiKey" in auth
           ? "The broker rejected the issuer key. Use BROKER_ISSUER_KEY from the deployment, not the admin key"
-          : "The broker rejected the GitHub Actions identity. Check the audience and the workflow policy in BROKER_CONFIG",
+          : "The broker rejected the GitHub Actions identity. Check the audience and the workflow policy in the broker configuration",
       );
     }
 

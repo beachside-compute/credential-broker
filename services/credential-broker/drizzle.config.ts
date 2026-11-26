@@ -1,7 +1,12 @@
 import { defineConfig } from "drizzle-kit";
 
 export default defineConfig({
-  schema: ["./src/grants/schema.ts", "./src/integrations/schema.ts", "./src/canaries/schema.ts"],
+  schema: [
+    "./src/grants/schema.ts",
+    "./src/integrations/schema.ts",
+    "./src/canaries/schema.ts",
+    "./src/tenants/schema.ts",
+  ],
   out: "./drizzle",
   dialect: "sqlite",
   driver: "durable-sqlite",

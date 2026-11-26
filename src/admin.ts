@@ -569,11 +569,42 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
     async config(call: BrokerRequestOptions = {}): Promise<BrokerDeploymentConfig> {
       return json("/v1/admin/config", "GET", 200, call, deploymentConfig);
     },
+    /** Replace a hosted tenant's GitHub Actions policy and request limits. */
+    async setConfig(
+      config: BrokerTenantConfigInput,
+      call: BrokerRequestOptions = {},
+    ): Promise<void> {
+      await request("/v1/admin/config", "PUT", 204, call, JSON.stringify(config), async () => {});
+    },
     /** Check the broker URL and admin key, with integration and grant counts. */
     async status(call: BrokerRequestOptions = {}): Promise<BrokerStatus> {
       return json("/v1/status", "GET", 200, call, brokerStatus, undefined, "status");
     },
   };
+}
+
+export interface BrokerTenantConfigInput {
+  readonly githubActions?: {
+    readonly audience: string;
+    readonly workflows: readonly {
+      readonly repositoryId: string;
+      readonly repositoryOwnerId: string;
+      readonly repository: string;
+      readonly ref: string;
+      readonly workflowRef: string;
+      readonly jobWorkflowRef?: string;
+      readonly event:
+        | "push"
+        | "schedule"
+        | "workflow_dispatch"
+        | "workflow_run"
+        | "pull_request_target";
+      readonly integrations: readonly string[];
+    }[];
+  };
+  readonly limits?: Readonly<
+    Record<string, Partial<Pick<BrokerRequestLimit, "requestsPerMinute" | "concurrentRequests">>>
+  >;
 }
 
 export interface BrokerDeploymentConfig {
@@ -712,6 +743,9 @@ const adminMessages = {
   invalid_integration: () => "The broker rejected the integration configuration",
   invalid_integration_id: () =>
     "Integration IDs use 1 to 32 lowercase letters, digits or hyphens, starting with a letter",
+  invalid_config: () => "The broker rejected the hosted tenant configuration",
+  config_managed_by_deployment: () =>
+    "Set this broker's configuration in BROKER_CONFIG and redeploy",
   invalid_issuer_permissions: () => "The broker rejected the issuer allowlist",
   credential_unavailable: () =>
     "The Worker secret binding is not declared in BROKER_CONFIG.workerSecretBindings or has no value on the deployment",

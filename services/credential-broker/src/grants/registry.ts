@@ -5,8 +5,8 @@ import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
 import type { Principal } from "../auth";
 import { requestLimit } from "../config";
-import type { RequestLimits } from "../config";
-import type { CredentialReference } from "../credentials/source";
+import type { RequestLimits, TenantConfig } from "../config";
+import type { CredentialReference, EncryptedCredential } from "../credentials/source";
 import { integrations, issuerIntegrations } from "../integrations/schema";
 import { maxIntegrations } from "../integrations/types";
 import type {
@@ -26,6 +26,18 @@ import type {
   Trip,
   TripRequest,
 } from "../canaries/types";
+
+import { dataKeys, roleKeys, tenant } from "../tenants/schema";
+import type { TenantRole } from "../tenants/identity";
+
+export interface TenantProvision {
+  id: string;
+  dataKey: EncryptedCredential;
+  adminHash: string;
+  issuerHash: string;
+}
+
+export const tenantDataKeyVersion = "t1";
 
 const minuteMs = 60_000;
 
@@ -115,6 +127,96 @@ export class GrantRegistry extends DurableObject {
     });
   }
 
+  provision({ id, dataKey, adminHash, issuerHash }: TenantProvision): void {
+    this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      this.db.delete(tenant).run();
+      this.db.delete(roleKeys).run();
+      this.db.delete(dataKeys).run();
+      this.db.insert(tenant).values({ id, createdAt: now }).run();
+      this.db
+        .insert(roleKeys)
+        .values([
+          { role: "admin", hash: adminHash, createdAt: now },
+          { role: "issuer", hash: issuerHash, createdAt: now },
+        ])
+        .run();
+      this.db
+        .insert(dataKeys)
+        .values({
+          version: tenantDataKeyVersion,
+          wrapped: dataKey,
+          createdAt: now,
+        })
+        .run();
+    });
+  }
+
+  role(hash: string): TenantRole | undefined {
+    return this.db
+      .select({ role: roleKeys.role })
+      .from(roleKeys)
+      .where(eq(roleKeys.hash, hash))
+      .get()?.role;
+  }
+
+  hasRoleKey(role: TenantRole): boolean {
+    return Boolean(
+      this.db.select({ role: roleKeys.role }).from(roleKeys).where(eq(roleKeys.role, role)).get(),
+    );
+  }
+
+  setRoleKey(role: TenantRole, hash: string): void {
+    const values = { hash, createdAt: Date.now() };
+    this.db
+      .insert(roleKeys)
+      .values({ role, ...values })
+      .onConflictDoUpdate({
+        target: roleKeys.role,
+        set: values,
+      })
+      .run();
+  }
+
+  dataKeys() {
+    return { active: tenantDataKeyVersion, keys: this.db.select().from(dataKeys).all() };
+  }
+
+  rewrapDataKeys(previous: EncryptedCredential, wrapped: EncryptedCredential): boolean {
+    return Boolean(
+      this.db
+        .update(dataKeys)
+        .set({ wrapped })
+        .where(and(eq(dataKeys.version, tenantDataKeyVersion), eq(dataKeys.wrapped, previous)))
+        .returning({ version: dataKeys.version })
+        .get(),
+    );
+  }
+
+  storedConfig(): TenantConfig {
+    return this.db.select({ config: tenant.config }).from(tenant).get()?.config ?? {};
+  }
+
+  setStoredConfig(config: TenantConfig): void {
+    this.db.update(tenant).set({ config }).run();
+  }
+
+  async destroy(): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      await migrate(this.db, migrations);
+    });
+  }
+
+  private assertProvisioned(): void {
+    if (
+      this.ctx.id.name?.startsWith("tenant/") &&
+      !this.db.select({ id: tenant.id }).from(tenant).get()
+    )
+      throw new Error("Broker registry unavailable");
+  }
+
   listIntegrations(): IntegrationMetadata[] {
     return this.db.select().from(integrations).orderBy(integrations.id).all().map(metadata);
   }
@@ -126,6 +228,8 @@ export class GrantRegistry extends DurableObject {
   }
 
   createIntegration(integration: StoredIntegration): IntegrationCreation {
+    this.assertProvisioned();
+
     return this.ctx.storage.transactionSync(() => {
       if (this.findIntegration(integration.id)) return "exists";
 
@@ -606,6 +710,8 @@ export class GrantRegistry extends DurableObject {
   }
 
   createDestination(record: DestinationRecord): "exists" | "limit" | DestinationSummary {
+    this.assertProvisioned();
+
     return this.ctx.storage.transactionSync(() => {
       const existing = this.db
         .select({ id: alertDestinations.id })

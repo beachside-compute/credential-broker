@@ -7,6 +7,7 @@ import {
   loadDeploymentFile,
   plaintextKeys,
   plaintextWarning,
+  randomKey,
   saveBrokerURL,
   setupError,
 } from "./deployment-file";
@@ -149,6 +150,7 @@ async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, st
 interface Run {
   /** Sees stdout and stderr as they are forwarded. */
   watch?: (text: string) => void;
+  stdin?: Blob;
   /** Captures stdout and stderr instead of forwarding them. */
   capture?: boolean;
 }
@@ -156,14 +158,14 @@ interface Run {
 async function runCommand(
   env: NodeJS.ProcessEnv,
   args: string[],
-  { watch, capture }: Run = {},
+  { watch, capture, stdin }: Run = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const piped = Boolean(watch || capture);
 
   const child = Bun.spawn([process.execPath, "run", ...args], {
     cwd: resolve(repository, servicePath),
     env,
-    stdin: capture ? "ignore" : "inherit",
+    stdin: stdin ?? (capture ? "ignore" : "inherit"),
     stdout: piped ? "pipe" : "inherit",
     stderr: piped ? "pipe" : "inherit",
   });
@@ -411,6 +413,41 @@ async function setup(
   return 0;
 }
 
+async function setupPlatformKey(
+  inherited: NodeJS.ProcessEnv,
+  settings: NodeJS.ProcessEnv,
+  printAnyway: boolean,
+): Promise<number> {
+  if (!printAnyway && !process.stdout.isTTY)
+    return setupError(
+      "Setup prints the platform key once. Run it in a terminal or pass --print-keys",
+    );
+
+  const env = wranglerEnvironment(inherited, settings);
+  const existing = await workerSecretNames(env);
+
+  if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
+    return setupError("Run bun run deploy:setup before setting up the platform key");
+
+  if (existing.has("BROKER_PLATFORM_KEY"))
+    return setupError("The Worker already has BROKER_PLATFORM_KEY. Setup never replaces role keys");
+
+  const key = randomKey();
+
+  const { code } = await withDeployConfig(undefined, (config) =>
+    runCommand(env, ["wrangler", "secret", "put", "BROKER_PLATFORM_KEY", ...config], {
+      stdin: new Blob([key]),
+    }),
+  );
+
+  if (code === 0)
+    console.info(`Save this key in your password manager now. It cannot be read back.
+
+  BROKER_PLATFORM_KEY=${key}`);
+
+  return code;
+}
+
 async function deploy() {
   const args = process.argv.slice(2);
   const setupOnly = args[0] === "--setup-only";
@@ -445,10 +482,14 @@ async function deploy() {
   if (setupOnly) {
     const options = args.slice(1);
 
-    if (options.some((option) => option !== "--print-keys"))
-      return setupError("bun run deploy:setup takes only --print-keys");
+    if (options.some((option) => !["--print-keys", "--platform-key-only"].includes(option)))
+      return setupError("bun run deploy:setup accepts --print-keys and --platform-key-only");
 
-    return setup(envPath, inherited, file, settings, options.length > 0);
+    const printAnyway = options.includes("--print-keys");
+
+    return options.includes("--platform-key-only")
+      ? setupPlatformKey(inherited, settings, printAnyway)
+      : setup(envPath, inherited, file, settings, printAnyway);
   }
 
   const plaintext = plaintextKeys(file);

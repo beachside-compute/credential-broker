@@ -6,6 +6,8 @@ import { newGrantToken, tokenHash, grantTokenPattern, bearer } from "../grants/t
 import { privateJson, privateNoContent, readJson } from "../http";
 import type { Worker } from "../http";
 import type { Tenant } from "../tenants/tenant";
+import { defaultTenant } from "../tenants/identity";
+import { isBrokerHost } from "../tenants/hosts";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import { failure } from "../proxy/forward";
 import {
@@ -46,6 +48,7 @@ export function alertOnTrip<E extends Worker>(
   if (!trip?.deliveries.length) return;
 
   const host = new URL(context.req.url).host;
+  const hosted = tenant.id !== defaultTenant;
 
   // A broken keyring must not change the caller's response, or a canary would stand out.
   const keyring = tenant.keyring().catch(() => undefined);
@@ -60,7 +63,8 @@ export function alertOnTrip<E extends Worker>(
             delivery,
             alertEvent(trip, delivery, host),
             keys,
-            mailer(context.env),
+            hosted ? undefined : mailer(context.env),
+            hosted ? (url) => !isBrokerHost(context.env, context.req.url, url) : undefined,
           );
 
           await tenant.store.recordDelivery(delivery.identity, status).catch(() => {});
@@ -174,8 +178,17 @@ canaryAdminRoutes.post("/alerts", async (context) => {
 
   const destination = input.data;
 
-  if (destination.kind === "email" && !mailer(context.env))
+  const hosted = context.get("tenant").id !== defaultTenant;
+
+  if (destination.kind === "email" && (hosted || !mailer(context.env)))
     return failure(400, "email_alerts_not_configured");
+
+  if (
+    hosted &&
+    destination.kind !== "email" &&
+    isBrokerHost(context.env, context.req.url, destination.url)
+  )
+    return failure(400, "invalid_alert_destination");
 
   const { id, kind } = destination;
   const identity = crypto.randomUUID();
@@ -218,11 +231,14 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
 
   if (!destination) return failure(404, "alert_destination_not_found");
 
+  const hosted = context.get("tenant").id !== defaultTenant;
+
   const status = await deliver(
     destination,
     testEvent(new URL(context.req.url).host),
     context.get("keyring"),
-    mailer(context.env),
+    hosted ? undefined : mailer(context.env),
+    hosted ? (url) => !isBrokerHost(context.env, context.req.url, url) : undefined,
   );
 
   await store.recordDelivery(destination.identity, status);

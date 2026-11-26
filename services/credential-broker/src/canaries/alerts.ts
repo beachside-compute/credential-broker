@@ -178,6 +178,7 @@ export async function deliver(
   event: AlertEvent,
   keyring: EncryptionKeyring,
   mail?: Mailer,
+  allowsDestination?: (url: URL) => boolean,
 ): Promise<number> {
   try {
     const json = await openValue(
@@ -203,6 +204,8 @@ export async function deliver(
 
       return 202;
     }
+
+    if (allowsDestination && !allowsDestination(new URL(config.url))) return 0;
 
     const body = JSON.stringify(destination.kind === "slack" ? slackMessage(event) : event);
 

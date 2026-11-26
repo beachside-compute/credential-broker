@@ -6,7 +6,7 @@ import {
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
-import { integrationId, requestLimit } from "../config";
+import { integrationId, requestLimit, tenantConfigFor } from "../config";
 import { credentialInput } from "../credentials/source";
 import type { CredentialInput, CredentialReference } from "../credentials/source";
 import {
@@ -25,7 +25,9 @@ import type { AdminOperation } from "../observability/tracing";
 import { integrationKind, maxIntegrations } from "./types";
 import { canaryAdminRoutes, tripRoleKey } from "../canaries/admin";
 import type { IntegrationRevision } from "./types";
-import { defaultTenant, tenantFor } from "../tenants/tenant";
+import { defaultTenant } from "../tenants/identity";
+import { resolveTenant } from "../tenants/resolve";
+import { isBrokerHost } from "../tenants/hosts";
 import type { Tenant } from "../tenants/tenant";
 
 const maxAdminBody = 16_384;
@@ -65,8 +67,9 @@ type AdminWorker = Worker & { Variables: { keyring: EncryptionKeyring } };
 export const adminRoutes = new Hono<AdminWorker>();
 
 adminRoutes.use("*", async (context, next) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "administrator_authentication_required");
 
   if (!(await tenant.administrator(context.req.raw))) {
     await tripRoleKey(context, tenant, "admin-auth");
@@ -116,10 +119,31 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
   });
 });
 
+adminRoutes.put("/config", traceAdmin("admin.config.update"), async (context) => {
+  const tenant = context.get("tenant");
+
+  if (tenant.id === defaultTenant) return failure(409, "config_managed_by_deployment");
+
+  const config = tenantConfigFor(tenant.id).safeParse(
+    await readJson(context.req.raw, maxEndpointBody),
+  );
+
+  if (!config.success) return failure(400, "invalid_config");
+
+  await tenant.store.setStoredConfig(config.data);
+
+  return privateNoContent();
+});
+
 adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async (context) => {
   const input = createInput.safeParse(await readJson(context.req.raw, maxEndpointBody));
 
   if (!input.success) return failure(400, "invalid_integration");
+
+  const tenant = context.get("tenant");
+
+  if (tenant.id !== defaultTenant && input.data.credential.source === "worker-secret")
+    return failure(400, "invalid_integration");
 
   const { id, kind } = input.data;
   const now = Date.now();
@@ -132,7 +156,13 @@ adminRoutes.post("/integrations", traceAdmin("admin.integration.create"), async 
   if (input.data.kind === "http") {
     const values = normalizeEndpointValues(input.data.credential.values);
 
-    if (!endpoint || !values || !matchingEndpointValues(endpoint, values, "full"))
+    if (
+      !endpoint ||
+      !values ||
+      !matchingEndpointValues(endpoint, values, "full") ||
+      (tenant.id !== defaultTenant &&
+        isBrokerHost(context.env, context.req.url, new URL(endpoint.baseURL)))
+    )
       return failure(400, "invalid_integration");
 
     credential = await sealEndpointValues(values, { ...revision, kind: "http", endpoint }, keyring);
@@ -203,7 +233,16 @@ adminRoutes.put(
 
     if (!id.success || !input.success) return failure(400, "invalid_credential");
 
-    const store = context.get("tenant").store;
+    const tenant = context.get("tenant");
+
+    if (
+      tenant.id !== defaultTenant &&
+      "source" in input.data &&
+      input.data.source === "worker-secret"
+    )
+      return failure(400, "invalid_integration");
+
+    const store = tenant.store;
     const revision = await store.credentialRevision(id.data);
 
     if (!revision) return failure(404, "integration_not_found");

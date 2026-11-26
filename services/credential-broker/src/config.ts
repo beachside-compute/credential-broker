@@ -73,18 +73,29 @@ export function requestLimit(
   };
 }
 
-const configuration = z.strictObject({
+const tenantConfiguration = z.strictObject({
   limits: z
     .record(integrationId, limitOverride)
     .refine((limits) => Object.keys(limits).length <= 100)
     .optional(),
-  workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),
   githubActions: z
     .strictObject({
       audience: z.string().min(1).max(256),
       workflows: z.array(workflowPolicy).min(1).max(32),
     })
     .optional(),
+});
+
+export type TenantConfig = z.infer<typeof tenantConfiguration>;
+
+export function tenantConfigFor(id: string) {
+  return tenantConfiguration.refine(
+    (config) => !config.githubActions || config.githubActions.audience === `beachside-broker:${id}`,
+  );
+}
+
+const configuration = tenantConfiguration.extend({
+  workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),
 });
 
 export type BrokerConfig = z.infer<typeof configuration>;

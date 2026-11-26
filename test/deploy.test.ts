@@ -66,6 +66,15 @@ function provisionStub(root: string) {
     import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
+      if (args[0] === "put") {
+        const key = readFileSync(0, "utf8");
+        appendFileSync("calls.jsonl", JSON.stringify({
+          command, name: args[1], validKey: /^[A-Za-z0-9_-]{43}$/.test(key),
+          fromEnvironment: Boolean(process.env.BROKER_PLATFORM_KEY),
+          usedFile: args.includes("--secrets-file"),
+        }) + "\\n");
+        process.exit(0);
+      }
       const config = args.includes("--config") ? JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8")) : {};
       if (process.env.SECRET_LIST_NAME && config.name !== process.env.SECRET_LIST_NAME) process.exit(1);
       if (process.env.SECRET_LIST_ERROR) {
@@ -182,6 +191,32 @@ test("setup deploys fresh keys once, prints the role keys and saves only the URL
     expect(unreadable.code).toBe(1);
     expect(unreadable.stderr).toContain("Could not read the Worker's secrets");
     expect(calls(service)).toHaveLength(1);
+  }));
+
+test("hosted setup uploads a fresh platform key only over standard input", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    const setup = [...command, "--setup-only", "--platform-key-only", "--print-keys"];
+    const env = { WORKER_SECRETS: deployed, BROKER_PLATFORM_KEY: "fixture-derived-key" };
+    const run = spawn(setup, env);
+
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.stdout.match(/BROKER_PLATFORM_KEY=[A-Za-z0-9_-]{43}/g)).toHaveLength(1);
+    expect(existsSync(join(root, ".env.deploy"))).toBe(false);
+
+    const updated = { ...env, WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY" };
+    expect(spawn(setup, updated).code).toBe(1);
+    expect(spawn(command, updated).code).toBe(0);
+
+    const [setupCall, deployCall] = calls(service);
+    expect(setupCall).toEqual({
+      command: "secret",
+      name: "BROKER_PLATFORM_KEY",
+      validKey: true,
+      fromEnvironment: false,
+      usedFile: false,
+    });
+    expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_KEY");
   }));
 
 test("setup prints the keys even when it cannot save the URL", () =>

@@ -43,6 +43,13 @@
       "when": 1795473432963,
       "tag": "0005_canaries",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1795673387744,
+      "tag": "0006_tenants",
+      "breakpoints": true
     }
   ]
 }

@@ -17,8 +17,13 @@ import type { IntegrationSelector } from "./integrations/types";
 import { finishSpan, grantOrigin, parseTraceparent, startSpan } from "./observability/tracing";
 import { alertOnTrip, tripRoleKey } from "./canaries/admin";
 import { tripRequest } from "./canaries/alerts";
-import { defaultTenant, tenantFor } from "./tenants/tenant";
 import type { Tenant } from "./tenants/tenant";
+import { resolveTenant } from "./tenants/resolve";
+import { defaultTenant } from "./tenants/identity";
+import { isBrokerHost } from "./tenants/hosts";
+import { platformRoutes } from "./tenants/platform";
+
+export { TenantDirectory } from "./tenants/directory";
 
 export { GrantRegistry };
 
@@ -68,9 +73,13 @@ app.onError(() => failure(503, "broker_unavailable"));
 
 app.route("/v1/admin", adminRoutes);
 
+app.route("/v1/platform", platformRoutes);
+
 app.post("/v1/grants", async (context) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const request = context.req.raw;
   const principal = await tenant.orchestrator(request);
 
@@ -164,8 +173,10 @@ app.post("/v1/grants", async (context) => {
 });
 
 app.get("/v1/status", async (context) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "authentication_required");
+
   const request = context.req.raw;
   const limits = { maxGrantTtlSeconds };
 
@@ -202,8 +213,10 @@ app.get("/v1/status", async (context) => {
 });
 
 app.get("/v1/grants", async (context) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
@@ -220,8 +233,10 @@ app.get("/v1/grants", async (context) => {
 });
 
 app.post("/v1/grants/:id/renew", async (context) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const request = context.req.raw;
   const principal = await tenant.orchestrator(request);
 
@@ -255,8 +270,10 @@ app.post("/v1/grants/:id/renew", async (context) => {
 });
 
 app.delete("/v1/grants/:id", async (context) => {
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
@@ -313,8 +330,9 @@ app.all("*", async (context) => {
 
   if (!token) return failure(401, "grant_authentication_required", isGit);
 
-  const tenant = tenantFor(context.env, defaultTenant);
-  context.set("tenant", tenant);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "grant_invalid", isGit);
 
   const store = tenant.store;
 
@@ -375,7 +393,8 @@ app.all("*", async (context) => {
 
   const blockedEndpoint =
     target?.type === "http" &&
-    (request.headers.has("upgrade") ||
+    ((tenant.id !== defaultTenant && isBrokerHost(context.env, request.url, target.url)) ||
+      request.headers.has("upgrade") ||
       path === undefined ||
       path.includes(token) ||
       [...requestUrl.searchParams].some(
@@ -402,7 +421,9 @@ app.all("*", async (context) => {
     } else {
       credential =
         reference.source === "worker-secret"
-          ? await workerSecretSource(context.env).resolve(reference)
+          ? tenant.id === defaultTenant
+            ? await workerSecretSource(context.env).resolve(reference)
+            : undefined
           : await encryptedStoreSource(integration, await tenant.keyring()).resolve(reference);
     }
   } catch {
