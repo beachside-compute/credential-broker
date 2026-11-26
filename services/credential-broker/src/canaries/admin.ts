@@ -51,7 +51,7 @@ export function alertOnTrip<E extends Worker>(
   const hosted = tenant.id !== defaultTenant;
 
   // A broken keyring must not change the caller's response, or a canary would stand out.
-  const keyring = tenant.keyring().catch(() => undefined);
+  const keyring = tenant.keyring(trip.keyState).catch(() => undefined);
 
   context.executionCtx.waitUntil(
     keyring.then(async (keys) => {
@@ -84,12 +84,10 @@ export async function tripRoleKey<E extends Worker>(
 
   if (!token || !grantTokenPattern.test(token)) return;
 
-  const trip = await context
-    .get("tenant")
-    .store.tripCanary(
-      { hash: await tokenHash(token) },
-      tripRequest(context.req.raw, route, "", token),
-    );
+  const trip = await tenant.store.tripCanary(
+    { hash: await tokenHash(token) },
+    tripRequest(context.req.raw, route, "", token),
+  );
 
   alertOnTrip(context, tenant, trip);
 }
@@ -226,17 +224,18 @@ canaryAdminRoutes.post("/alerts/:id/test", async (context) => {
 
   if (!id.success) return failure(400, "invalid_alert_destination_id");
 
-  const store = context.get("tenant").store;
+  const tenant = context.get("tenant");
+  const store = tenant.store;
   const destination = await store.destination(id.data);
 
   if (!destination) return failure(404, "alert_destination_not_found");
 
-  const hosted = context.get("tenant").id !== defaultTenant;
+  const hosted = tenant.id !== defaultTenant;
 
   const status = await deliver(
     destination,
     testEvent(new URL(context.req.url).host),
-    context.get("keyring"),
+    await tenant.keyring(destination.keyState),
     hosted ? undefined : mailer(context.env),
     hosted ? (url) => !isBrokerHost(context.env, context.req.url, url) : undefined,
   );

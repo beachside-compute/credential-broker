@@ -4,7 +4,7 @@ import type { Env } from "../http";
 import { newDataKey, rootKeyring, unwrapDataKey, wrapDataKey } from "./data-key";
 import type { PlatformAction, PlatformActor, tenants } from "./directory-schema";
 import { brokerHosts } from "./hosts";
-import { tenantId, tenantRole } from "./identity";
+import { initialTenantKeyVersion, tenantId, tenantRole } from "./identity";
 import { invalidateActive, tenantDirectory } from "./resolve";
 import { newRoleKey } from "./role-keys";
 import { invalidateTenantKeyring, tenantStore } from "./tenant";
@@ -84,7 +84,7 @@ export async function provisionTenant(
     const [adminHash, issuerHash, dataKey] = await Promise.all([
       tokenHash(adminKey),
       tokenHash(issuerKey),
-      wrapDataKey(newDataKey(), id, rootKeyring(env)),
+      wrapDataKey(newDataKey(), id, rootKeyring(env), initialTenantKeyVersion),
     ]);
 
     if (!(await tenantDirectory(env).provision({ id, adminHash, issuerHash, dataKey })))
@@ -187,7 +187,8 @@ export async function rewrapTenantKeys(
     const store = await operableTenant(env, id);
     const { active, keys } = await store.dataKeys();
 
-    if (!keys.some(({ version }) => version === active)) throw new PlatformError(409, "tenant_key_changed");
+    if (!keys.some(({ version }) => version === active))
+      throw new PlatformError(409, "tenant_key_changed");
     const root = rootKeyring(env);
 
     for (const { version, wrapped: previous } of keys) {

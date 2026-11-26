@@ -26,27 +26,26 @@ const headerName = z
 
 const headerValue = z.string().regex(/^[\x20-\x7e]{1,4096}$/);
 
-const destinationUrl = z
-  .string()
-  .max(2048)
-  .transform((value, ctx) => {
-    const url = URL.parse(value);
+const storedDestinationUrl = z.string().transform((value, ctx) => {
+  const url = URL.parse(value);
 
-    if (
-      !url ||
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      url.hash ||
-      /^[0-9.]+$|^\[/.test(url.hostname)
-    ) {
-      ctx.addIssue({ code: "custom", message: "invalid destination URL" });
+  if (
+    !url ||
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    /^[0-9.]+$|^\[/.test(url.hostname)
+  ) {
+    ctx.addIssue({ code: "custom", message: "invalid destination URL" });
 
-      return z.NEVER;
-    }
+    return z.NEVER;
+  }
 
-    return url;
-  });
+  return url;
+});
+
+const destinationUrl = z.string().max(2048).pipe(storedDestinationUrl);
 
 const destinationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
@@ -76,9 +75,7 @@ export const destinationInput = z.union([urlDestination, emailDestination]);
 /** The sealed configuration's plaintext limit, enforced when it is created and opened. */
 export const maxDestinationConfigBytes = 16_384;
 
-type DestinationConfig =
-  | { url: string; headers: Record<string, string>; signingSecret?: string }
-  | { to: string };
+type DestinationConfig = z.input<typeof sealedDestinationConfig>;
 
 /** Email alerts go through the deployment's send_email binding from its configured sender. */
 export interface Mailer {
@@ -104,7 +101,11 @@ export async function sealDestination(
 ): Promise<EncryptedCredential | undefined> {
   const json = JSON.stringify(config);
 
-  if (encoder.encode(json).byteLength > maxDestinationConfigBytes) return;
+  if (
+    encoder.encode(json).byteLength > maxDestinationConfigBytes ||
+    !sealedDestinationConfig.safeParse(config).success
+  )
+    return;
 
   return sealValue(json, sealContext(destination), keyring);
 }
@@ -114,8 +115,10 @@ type SealedDestination = Pick<AlertDelivery, "identity" | "id" | "kind" | "confi
 const sealedDestinationConfig = z.union([
   z.strictObject({ to: z.email().max(254) }),
   z.strictObject({
-    url: destinationUrl,
-    headers: z.record(headerName, headerValue),
+    url: storedDestinationUrl,
+    headers: z
+      .record(headerName, headerValue)
+      .refine((headers) => Object.keys(headers).length <= 10),
     signingSecret: z.string().startsWith("whsec_").optional(),
   }),
 ]);

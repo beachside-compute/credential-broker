@@ -71,7 +71,11 @@ async function traced(
 
 const app = new Hono<Worker>();
 
-app.onError(() => failure(503, "broker_unavailable"));
+app.onError((error) =>
+  error.message === "tenant_key_changed"
+    ? failure(409, "tenant_key_changed")
+    : failure(503, "broker_unavailable"),
+);
 
 app.route("/v1/admin", adminRoutes);
 

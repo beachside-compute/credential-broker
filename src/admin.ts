@@ -776,6 +776,7 @@ const adminMessages = {
   invalid_integration: () => "The broker rejected the integration configuration",
   invalid_integration_id: () =>
     "Integration IDs use 1 to 32 lowercase letters, digits or hyphens, starting with a letter",
+  tenant_key_changed: () => "The tenant encryption key changed during the write. Retry the request",
   invalid_config: () => "The broker rejected the hosted tenant configuration",
   config_managed_by_deployment: () =>
     "Set this broker's configuration in BROKER_CONFIG and redeploy",

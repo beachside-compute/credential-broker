@@ -17,6 +17,7 @@ import {
   setTenantStatus,
 } from "./platform-operations";
 import { rotateTenantDataKey } from "./rotate-data-key";
+import type { KeyRotationRequest } from "./rotate-data-key";
 
 export class PlatformControl extends WorkerEntrypoint<Env> {
   provision(request: z.input<typeof idInput>) {
@@ -45,7 +46,7 @@ export class PlatformOperator extends WorkerEntrypoint<Env> {
     return rewrapTenantKeys(this.env, "operator-binding", request);
   }
 
-  rotateDataKey(request: z.input<typeof idInput>) {
+  rotateDataKey(request: KeyRotationRequest) {
     return rotateTenantDataKey(this.env, "operator-binding", request);
   }
 

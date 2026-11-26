@@ -8,6 +8,10 @@ import { z } from "zod";
 import type { V4WorkerOptions } from "miniflare";
 import type { PlatformControl, PlatformOperator } from "../src/tenants/platform-rpc";
 import { brokerHosts, isBrokerHost, requestTenant } from "../src/tenants/hosts";
+import { resealDestination, tripRequest } from "../src/canaries/alerts";
+import { encryptionKeyring } from "../src/credentials/sources/encrypted-store";
+import type { GrantRegistry } from "../src/grants/registry";
+import { unwrapDataKey } from "../src/tenants/data-key";
 import { parseConfig } from "../src/config";
 import type { TrustedIssuer } from "../src/config";
 import { createCredentialBrokerAdmin } from "../../../src/admin";
@@ -1013,9 +1017,12 @@ test("tenant data key rotation resumes and retires the old key only after reseal
     );
     await store.exec("UPDATE alert_destinations SET config = ?", destination.config);
 
-    const retry = await operate(rotate, "POST");
+    const retry = await operate(rotate, "POST", { expectedKeyVersion: "t1" });
     assert.equal(retry.status, 200);
     assert.deepEqual(await retry.json(), { id: tenantA, keyVersion: "t2" });
+    const replay = await operate(rotate, "POST", { expectedKeyVersion: "t1" });
+    assert.equal(replay.status, 200);
+    assert.deepEqual(await replay.json(), { id: tenantA, keyVersion: "t2" });
     assert.deepEqual(await store.exec("SELECT version FROM data_keys"), [{ version: "t2" }]);
     const [updated] = await store.exec("SELECT credential FROM integrations WHERE id = 'model'");
     assert.notEqual(updated.credential, credential.credential);
@@ -1029,6 +1036,75 @@ test("tenant data key rotation resumes and retires the old key only after reseal
     assert.deepEqual(await (await storage(tenantB)).exec("SELECT version FROM data_keys"), [
       { version: "t1" },
     ]);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("a claimed canary delivery keeps the key snapshot across retirement", async () => {
+  const { runtime, call, seed, storage } = fixture(true, true, undefined, true);
+
+  try {
+    const { CONTROL, OPERATOR } = await runtime.getBindings<{
+      CONTROL: Pick<PlatformControl, "provision">;
+      OPERATOR: Pick<PlatformOperator, "rotateDataKey">;
+    }>("platform-client");
+
+    const tenant = await CONTROL.provision({ id: tenantA });
+    await seed(a, tenant.adminKey, "model", "rotation-canary");
+    assert.equal(
+      (
+        await call(a, "/v1/admin/alerts", tenant.adminKey, "POST", {
+          id: "alerts",
+          kind: "webhook",
+          url: "https://alerts.example.net/rotation",
+        })
+      ).status,
+      201,
+    );
+
+    const canary = grantToken.parse(
+      await (
+        await call(a, "/v1/admin/canaries", tenant.adminKey, "POST", {
+          integrations: ["model"],
+        })
+      ).json(),
+    );
+
+    const namespace = await runtime.getDurableObjectNamespace("REGISTRY");
+
+    // SAFETY: This fixture binds REGISTRY to GrantRegistry, whose tripCanary method claims the sealed alert.
+    const registry: Pick<GrantRegistry, "tripCanary"> = namespace.getByName(
+      `tenant/${tenantA}`,
+    ) as never;
+
+    const trip = await registry.tripCanary(
+      { id: canary.id },
+      tripRequest(new Request(`https://${a}/`), "revoke"),
+    );
+
+    assert.ok(trip?.keyState);
+    const [delivery] = trip.deliveries;
+    assert.equal(delivery.config.keyVersion, "t1");
+
+    const rotation = await OPERATOR.rotateDataKey({ id: tenantA, expectedKeyVersion: "t1" });
+    assert.equal(rotation.id, tenantA);
+    assert.equal(rotation.keyVersion, "t2");
+    assert.deepEqual(await (await storage(tenantA)).exec("SELECT version FROM data_keys"), [
+      { version: "t2" },
+    ]);
+
+    const oldKey = trip.keyState.keys.find(({ version }) => version === delivery.config.keyVersion);
+    assert.ok(oldKey);
+    const root = encryptionKeyring({ BROKER_ENCRYPTION_KEYS: rootKeys });
+    const key = await unwrapDataKey(oldKey.wrapped, tenantA, root, oldKey.version);
+
+    const recovered = await resealDestination(delivery, {
+      active: oldKey.version,
+      keys: new Map([[oldKey.version, key]]),
+    });
+
+    assert.ok(recovered);
   } finally {
     await runtime.dispose();
   }

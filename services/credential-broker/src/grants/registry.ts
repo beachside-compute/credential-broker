@@ -28,6 +28,7 @@ import type {
 } from "../canaries/types";
 
 import { dataKeys, roleKeys, tenant } from "../tenants/schema";
+import { initialTenantKeyVersion } from "../tenants/identity";
 import type { TenantRole } from "../tenants/identity";
 
 export interface TenantProvision {
@@ -36,8 +37,6 @@ export interface TenantProvision {
   adminHash: string;
   issuerHash: string;
 }
-
-export const tenantDataKeyVersion = "t1";
 
 const rotationBatchSize = 8;
 
@@ -141,7 +140,10 @@ export class GrantRegistry extends DurableObject {
       this.db.delete(tenant).run();
       this.db.delete(roleKeys).run();
       this.db.delete(dataKeys).run();
-      this.db.insert(tenant).values({ id, createdAt: now }).run();
+      this.db
+        .insert(tenant)
+        .values({ id, createdAt: now, activeDataKey: initialTenantKeyVersion })
+        .run();
       this.db
         .insert(roleKeys)
         .values([
@@ -152,7 +154,7 @@ export class GrantRegistry extends DurableObject {
       this.db
         .insert(dataKeys)
         .values({
-          version: tenantDataKeyVersion,
+          version: initialTenantKeyVersion,
           wrapped: dataKey,
           createdAt: now,
         })
@@ -187,7 +189,7 @@ export class GrantRegistry extends DurableObject {
   }
 
   dataKeys(): TenantKeyState {
-    return this.readDataKeys(this.activeDataKey() ?? tenantDataKeyVersion);
+    return this.readDataKeys(this.activeDataKey() ?? initialTenantKeyVersion);
   }
 
   private readDataKeys(active: string): TenantKeyState {
@@ -199,6 +201,12 @@ export class GrantRegistry extends DurableObject {
         .orderBy(dataKeys.version)
         .all(),
     };
+  }
+
+  private alertKeyState(): TenantKeyState | null {
+    const active = this.activeDataKey();
+
+    return active ? this.readDataKeys(active) : null;
   }
 
   rewrapDataKeys(
@@ -238,6 +246,7 @@ export class GrantRegistry extends DurableObject {
       .select()
       .from(integrations)
       .where(needsRotation(integrations.credential, active))
+      .orderBy(integrations.identity)
       .limit(rotationBatchSize)
       .all();
 
@@ -250,6 +259,7 @@ export class GrantRegistry extends DurableObject {
       })
       .from(alertDestinations)
       .where(needsRotation(alertDestinations.config, active))
+      .orderBy(alertDestinations.identity)
       .limit(rotationBatchSize)
       .all();
 
@@ -260,38 +270,44 @@ export class GrantRegistry extends DurableObject {
     identity: string,
     previous: EncryptedCredential,
     credential: EncryptedCredential,
-  ): void {
-    if (this.activeDataKey() !== credential.keyVersion) return;
+  ): boolean {
+    if (this.activeDataKey() !== credential.keyVersion) return false;
 
-    this.db
-      .update(integrations)
-      .set({ credential })
-      .where(
-        and(
-          eq(integrations.identity, identity),
-          envelopeMatches(integrations.credential, previous),
-        ),
-      )
-      .run();
+    return Boolean(
+      this.db
+        .update(integrations)
+        .set({ credential })
+        .where(
+          and(
+            eq(integrations.identity, identity),
+            envelopeMatches(integrations.credential, previous),
+          ),
+        )
+        .returning({ identity: integrations.identity })
+        .get(),
+    );
   }
 
   changeDestinationEnvelope(
     identity: string,
     previous: EncryptedCredential,
     config: EncryptedCredential,
-  ): void {
-    if (this.activeDataKey() !== config.keyVersion) return;
+  ): boolean {
+    if (this.activeDataKey() !== config.keyVersion) return false;
 
-    this.db
-      .update(alertDestinations)
-      .set({ config })
-      .where(
-        and(
-          eq(alertDestinations.identity, identity),
-          envelopeMatches(alertDestinations.config, previous),
-        ),
-      )
-      .run();
+    return Boolean(
+      this.db
+        .update(alertDestinations)
+        .set({ config })
+        .where(
+          and(
+            eq(alertDestinations.identity, identity),
+            envelopeMatches(alertDestinations.config, previous),
+          ),
+        )
+        .returning({ identity: alertDestinations.identity })
+        .get(),
+    );
   }
 
   finishDataKeyRotation(active: string): boolean {
@@ -310,7 +326,15 @@ export class GrantRegistry extends DurableObject {
           .where(needsRotation(alertDestinations.config, active))
           .get();
 
-      if (pending) return false;
+      if (
+        pending ||
+        !this.db
+          .select({ version: dataKeys.version })
+          .from(dataKeys)
+          .where(eq(dataKeys.version, active))
+          .get()
+      )
+        return false;
 
       this.db.delete(dataKeys).where(ne(dataKeys.version, active)).run();
 
@@ -327,7 +351,7 @@ export class GrantRegistry extends DurableObject {
 
     const active = this.activeDataKey();
 
-    if (active && active !== reference.keyVersion) throw new Error("Tenant encryption key changed");
+    if (active && active !== reference.keyVersion) throw new Error("tenant_key_changed");
   }
 
   storedConfig(): TenantConfig {
@@ -766,6 +790,7 @@ export class GrantRegistry extends DurableObject {
           ),
         },
         deliveries,
+        keyState: deliveries.length ? this.alertKeyState() : null,
       };
     });
   }
@@ -882,8 +907,8 @@ export class GrantRegistry extends DurableObject {
   }
 
   /** A destination's sealed configuration, for a test delivery. */
-  destination(id: string): Omit<AlertDelivery, "trips" | "labels"> | undefined {
-    return this.db
+  destination(id: string) {
+    const destination = this.db
       .select({
         identity: alertDestinations.identity,
         id: alertDestinations.id,
@@ -893,6 +918,8 @@ export class GrantRegistry extends DurableObject {
       .from(alertDestinations)
       .where(eq(alertDestinations.id, id))
       .get();
+
+    return destination && { ...destination, keyState: this.alertKeyState() };
   }
 
   deleteDestination(id: string): void {

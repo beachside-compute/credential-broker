@@ -19,7 +19,7 @@ import {
   setTenantStatus,
   stateInput,
 } from "./platform-operations";
-import { rotateTenantDataKey } from "./rotate-data-key";
+import { rotateTenantDataKey, rotationOptions } from "./rotate-data-key";
 import { resolveTenant } from "./resolve";
 
 type PlatformWorker = Worker & { Variables: { platformRole: "control" | "operator" } };
@@ -39,7 +39,10 @@ export const platformRoutes = new Hono<PlatformWorker>();
 
 platformRoutes.onError((error) => {
   if (error instanceof PlatformError)
-    return privateJson({ error: error.code, ...(error.record && { record: error.record }) }, error.status);
+    return privateJson(
+      { error: error.code, ...(error.record && { record: error.record }) },
+      error.status,
+    );
 
   console.error(JSON.stringify({ event: "platform_operation_failed" }));
 
@@ -142,8 +145,19 @@ platformRoutes.post("/tenants/:id/rewrap", async (context) => {
 platformRoutes.post("/tenants/:id/data-key/rotate", async (context) => {
   if (context.get("platformRole") !== "operator") return denied("operator");
 
+  const request = context.req.raw;
+
+  const options = rotationOptions.safeParse(
+    request.headers.has("content-type") ? await readJson(request, 1024) : {},
+  );
+
+  if (!options.success) return privateJson({ error: "invalid_data_key_rotation" }, 400);
+
   return privateJson(
-    await rotateTenantDataKey(context.env, "operator-http", { id: context.req.param("id") }),
+    await rotateTenantDataKey(context.env, "operator-http", {
+      id: context.req.param("id"),
+      ...options.data,
+    }),
   );
 });
 

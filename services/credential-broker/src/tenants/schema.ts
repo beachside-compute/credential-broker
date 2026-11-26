@@ -1,12 +1,13 @@
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { TenantConfig } from "../config";
 import type { EncryptedCredential } from "../credentials/source";
+import { initialTenantKeyVersion } from "./identity";
 import type { TenantRole } from "./identity";
 
 export const tenant = sqliteTable("tenant", {
   id: text("id").primaryKey(),
   config: text("config", { mode: "json" }).$type<TenantConfig>(),
-  activeDataKey: text("active_data_key").notNull().default("t1"),
+  activeDataKey: text("active_data_key").notNull().default(initialTenantKeyVersion),
   createdAt: integer("created_at").notNull(),
 });
 
