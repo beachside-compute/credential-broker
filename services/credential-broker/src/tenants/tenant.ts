@@ -1,8 +1,9 @@
 import { administrator, authenticationToken, orchestrator } from "../auth";
 import { githubActionsPrincipal } from "../auth/github-oidc";
 import type { Principal } from "../auth";
+import { trustedPrincipal } from "../auth/trusted-issuer";
 import { parseConfig, tenantConfigFor } from "../config";
-import type { BrokerConfig } from "../config";
+import type { BrokerConfig, TrustedIssuer } from "../config";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import type { GrantRegistry } from "../grants/registry";
 import { tokenHash } from "../grants/tokens";
@@ -29,6 +30,7 @@ export interface Tenant {
   administrator(request: Request): Promise<boolean>;
   orchestrator(request: Request): Promise<Principal | undefined>;
   hasIssuerKey(): Promise<boolean>;
+  trustedIssuers(): TrustedIssuer[];
 }
 
 const keyrings = new WeakMap<
@@ -38,6 +40,24 @@ const keyrings = new WeakMap<
 
 export function tenantStore(env: Env, id: string) {
   return env.REGISTRY.getByName(id === defaultTenant ? "grant-registry" : `tenant/${id}`);
+}
+
+function deploymentConfig(env: Env): BrokerConfig {
+  return parseConfig(env.BROKER_CONFIG ?? "{}", Boolean(env.BROKER_PLATFORM_KEY));
+}
+
+function applicableIssuers(env: Env, id: string): TrustedIssuer[] {
+  const entries = deploymentConfig(env).trustedIssuers ?? [];
+
+  return entries.filter(({ tenant }) =>
+    id === defaultTenant ? tenant !== undefined : tenant === undefined,
+  );
+}
+
+function trustedRole(env: Env, token: string, id: string, role: TenantRole) {
+  if (!token.includes(".")) return;
+
+  return trustedPrincipal(token, applicableIssuers(env, id), id, role);
 }
 
 function hostedTenant(env: Env, id: string): Tenant {
@@ -61,7 +81,10 @@ function hostedTenant(env: Env, id: string): Tenant {
     async administrator(request) {
       const token = authenticationToken(request);
 
-      return Boolean(token && (await matchesRole(token, "admin")));
+      return Boolean(
+        token &&
+        ((await matchesRole(token, "admin")) || (await trustedRole(env, token, id, "admin"))),
+      );
     },
     async orchestrator(request) {
       const token = authenticationToken(request);
@@ -70,16 +93,22 @@ function hostedTenant(env: Env, id: string): Tenant {
 
       if (await matchesRole(token, "issuer")) return { owner: "broker-api-key" };
 
-      return githubActionsPrincipal(token, await getConfig());
+      if (!token.includes(".")) return;
+
+      return (
+        (await trustedRole(env, token, id, "issuer")) ??
+        githubActionsPrincipal(token, await getConfig())
+      );
     },
     hasIssuerKey: () => store.hasRoleKey("issuer"),
+    trustedIssuers: () => applicableIssuers(env, id),
   };
 }
 
 function builtInTenant(env: Env): Tenant {
   let store: DurableObjectStub<GrantRegistry> | undefined;
   let config: BrokerConfig | undefined;
-  const getConfig = async () => (config ??= parseConfig(env.BROKER_CONFIG ?? "{}"));
+  const getConfig = async () => (config ??= deploymentConfig(env));
 
   return {
     id: defaultTenant,
@@ -90,13 +119,26 @@ function builtInTenant(env: Env): Tenant {
     async keyring() {
       return rootKeyring(env);
     },
-    administrator: (request) => administrator(request, env.BROKER_ADMIN_KEY),
+    async administrator(request) {
+      if (await administrator(request, env.BROKER_ADMIN_KEY)) return true;
+
+      const token = authenticationToken(request);
+
+      return Boolean(token && (await trustedRole(env, token, defaultTenant, "admin")));
+    },
     async orchestrator(request) {
-      return orchestrator(request, await getConfig(), env.BROKER_ISSUER_KEY);
+      const config = await getConfig();
+      const token = authenticationToken(request);
+
+      return (
+        (token && (await trustedRole(env, token, defaultTenant, "issuer"))) ||
+        orchestrator(request, config, env.BROKER_ISSUER_KEY)
+      );
     },
     async hasIssuerKey() {
       return Boolean(env.BROKER_ISSUER_KEY);
     },
+    trustedIssuers: () => applicableIssuers(env, defaultTenant),
   };
 }
 

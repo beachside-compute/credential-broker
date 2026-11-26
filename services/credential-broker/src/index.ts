@@ -206,7 +206,7 @@ app.get("/v1/status", async (context) => {
   return traced(context, tenant, "status", async () =>
     privateJson({
       apiVersion,
-      role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
+      role: principal.owner.startsWith("github:") ? "github-actions" : "issuer",
       limits,
     }),
   );

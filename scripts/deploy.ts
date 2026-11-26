@@ -115,12 +115,15 @@ async function withDeployConfig<T>(
 }
 
 /** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
-async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
+async function settingSecrets(
+  env: NodeJS.ProcessEnv,
+  platformEnabled = false,
+): Promise<Record<string, string>> {
   const deployment = new Map<string, string>();
   const read = (name: string) => resolveSecret(env[name]!, name, env);
 
   try {
-    const config = parseConfig(env.BROKER_CONFIG ?? "{}");
+    const config = parseConfig(env.BROKER_CONFIG ?? "{}", platformEnabled);
     deployment.set("BROKER_CONFIG", JSON.stringify(config));
 
     for (const name of config.workerSecretBindings) {
@@ -504,18 +507,19 @@ async function deploy() {
   const plaintext = plaintextKeys(file);
 
   if (plaintext.length) console.warn(`${plaintextWarning(plaintext)} Deploys never upload keys.`);
-  const secrets = await settingSecrets(settings);
   const env = wranglerEnvironment(inherited, settings);
   const dryRun = args.includes("--dry-run");
+  const existing = dryRun ? undefined : await workerSecretNames(env);
 
-  if (!dryRun) {
-    const existing = await workerSecretNames(env);
+  if (existing && (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS")))
+    return setupError(
+      "This Worker has no broker keys yet. Create the broker with bun run deploy:setup first",
+    );
 
-    if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
-      return setupError(
-        "This Worker has no broker keys yet. Create the broker with bun run deploy:setup first",
-      );
-  }
+  const secrets = await settingSecrets(
+    settings,
+    dryRun || Boolean(existing?.has("BROKER_PLATFORM_KEY")),
+  );
 
   const { code, url } = await deployWrangler(env, secrets, args, settings.BEACHSIDE_BROKER_URL);
 

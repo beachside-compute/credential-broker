@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
 import type { BrokerConfig } from "../config";
 import type { Principal } from ".";
@@ -16,6 +16,8 @@ export async function githubActionsPrincipal(
   if (!config.githubActions || token.split(".").length !== 3) return;
 
   try {
+    if (decodeJwt(token).iss !== issuer) return;
+
     const { payload } = await jwtVerify(token, githubKeys, {
       issuer,
       audience: config.githubActions.audience,

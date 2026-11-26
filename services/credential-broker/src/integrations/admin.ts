@@ -104,6 +104,7 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
   // Binding names stay private. The workflow trust policy is configuration, not a secret.
   const limits = config.limits ?? {};
   const known = await tenant.store.listIntegrations();
+  const trustedIssuers = tenant.trustedIssuers().map(({ issuer, roles }) => ({ issuer, roles }));
 
   return privateJson({
     githubActions: config.githubActions ?? null,
@@ -116,6 +117,7 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
     unknownLimitIds: Object.keys(limits).filter((id) => !known.some((row) => row.id === id)),
     workerSecretBindings: config.workerSecretBindings.length,
     issuerKey: await tenant.hasIssuerKey(),
+    ...(trustedIssuers.length && { trustedIssuers }),
   });
 });
 

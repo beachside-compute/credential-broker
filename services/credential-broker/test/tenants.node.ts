@@ -6,6 +6,8 @@ import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { convertV4MiniflareOptions, Miniflare, Response as RuntimeResponse } from "miniflare";
 import { z } from "zod";
 import { brokerHosts, isBrokerHost, requestTenant } from "../src/tenants/hosts";
+import { parseConfig } from "../src/config";
+import type { TrustedIssuer } from "../src/config";
 import { createCredentialBrokerAdmin } from "../../../src/admin";
 
 const admin = "default-admin-fixture-0123456789abcdef";
@@ -56,6 +58,23 @@ const github = await generateKeyPair("RS256");
 
 const githubJwk = { ...(await exportJWK(github.publicKey)), kid: "fixture" };
 
+const trustedIssuer = "https://authority.example.net";
+
+const trustedAudience = `https://${domain}`;
+
+const trustedJWKS = `${trustedIssuer}/.well-known/jwks.json`;
+
+const trusted = await generateKeyPair("ES256");
+
+const trustedJwk = { ...(await exportJWK(trusted.publicKey)), kid: "trusted-fixture" };
+
+const policyEntry = {
+  issuer: trustedIssuer,
+  jwksUri: trustedJWKS,
+  audience: trustedAudience,
+  roles: ["admin", "issuer"],
+} satisfies TrustedIssuer;
+
 const rootKeys = JSON.stringify({
   v1: Buffer.alloc(32, 42).toString("base64url"),
   v2: Buffer.alloc(32, 58).toString("base64url"),
@@ -70,7 +89,7 @@ const worker = await build({
   loader: { ".sql": "text" },
 });
 
-function options(enabled = true, root = "v1", registry = true) {
+function options(enabled = true, root = "v1", registry = true, policyEntry?: TrustedIssuer) {
   const alerts: string[] = [];
 
   return {
@@ -94,6 +113,7 @@ function options(enabled = true, root = "v1", registry = true) {
         BROKER_HOST_ALIASES: "default-broker.example.net",
         BROKER_CONFIG: JSON.stringify({
           githubActions: { audience: "default-audience", workflows: [policy] },
+          ...(policyEntry && { trustedIssuers: [policyEntry] }),
         }),
         ...(enabled && { BROKER_PLATFORM_KEY: platform }),
       },
@@ -102,6 +122,8 @@ function options(enabled = true, root = "v1", registry = true) {
 
         if (url.href === `${oidcIssuer}/.well-known/jwks`)
           return RuntimeResponse.json({ keys: [githubJwk] });
+
+        if (url.href === trustedJWKS) return RuntimeResponse.json({ keys: [trustedJwk] });
 
         if (url.hostname === "api.openai.com" || url.hostname === "github.com")
           return RuntimeResponse.json({ auth: request.headers.get("authorization") });
@@ -118,8 +140,8 @@ function options(enabled = true, root = "v1", registry = true) {
   };
 }
 
-function fixture(enabled = true, registry = true) {
-  const { worker, alerts } = options(enabled, "v1", registry);
+function fixture(enabled = true, registry = true, entry?: TrustedIssuer) {
+  const { worker, alerts } = options(enabled, "v1", registry, entry);
   const runtime = new Miniflare(worker);
 
   async function call<Payload>(
@@ -578,4 +600,153 @@ test("host aliases normalize operator input and fail closed for invalid settings
     true,
   );
   assert.equal(isBrokerHost(bindings, `https://${a}`, new URL("https://api.example.net")), false);
+});
+
+interface SignedTokenOptions {
+  role?: "admin" | "issuer";
+  subject?: string;
+  tenant?: string;
+  audience?: string | string[];
+  issuer?: string;
+  expiration?: string;
+  issuedAt?: number;
+  integrations?: string[];
+  algorithm?: "ES256" | "RS256";
+}
+
+async function signed({
+  role = "issuer",
+  subject = "agent-1",
+  tenant = tenantA,
+  audience = trustedAudience,
+  issuer = trustedIssuer,
+  expiration = "5m",
+  issuedAt = Math.floor(Date.now() / 1_000),
+  integrations,
+  algorithm = "ES256",
+}: SignedTokenOptions = {}) {
+  return new SignJWT({ role, tenant, integrations })
+    .setProtectedHeader({ alg: algorithm, kid: "trusted-fixture" })
+    .setIssuer(issuer)
+    .setAudience(audience)
+    .setSubject(subject)
+    .setIssuedAt(issuedAt)
+    .setExpirationTime(expiration)
+    .sign(algorithm === "ES256" ? trusted.privateKey : github.privateKey);
+}
+
+test("trusted issuers act on one hosted subdomain and own only their subject's grants", async () => {
+  const { runtime, call, operate, provision, seed, issue } = fixture(true, true, policyEntry);
+
+  try {
+    const tenant = await provision(tenantA);
+    await provision(tenantB);
+    await seed(a, tenant.adminKey, "model", "trusted-model-fixture");
+    const adminToken = await signed({ role: "admin" });
+    const issuerToken = await signed();
+    const agentTwo = await signed({ subject: "agent-2" });
+    const status = z.object({ role: z.enum(["admin", "issuer"]) });
+
+    assert.equal(
+      status.parse(await (await call(a, "/v1/status", adminToken)).json()).role,
+      "admin",
+    );
+    assert.equal(
+      status.parse(await (await call(a, "/v1/status", issuerToken)).json()).role,
+      "issuer",
+    );
+    await error(
+      await call(a, integrationPath, issuerToken),
+      401,
+      "administrator_authentication_required",
+    );
+    await error(await issue(a, adminToken), 401, "orchestrator_authentication_required");
+
+    const config = z.object({
+      trustedIssuers: z.array(z.strictObject({ issuer: z.string(), roles: z.array(z.string()) })),
+    });
+
+    assert.deepEqual(
+      config.parse(await (await call(a, "/v1/admin/config", adminToken)).json()).trustedIssuers,
+      [{ issuer: trustedIssuer, roles: ["admin", "issuer"] }],
+    );
+
+    const record = grantToken.parse(await (await issue(a, issuerToken)).json());
+    const grantPath = `/v1/grants/${record.id}`;
+    await error(
+      await call(a, grantPath + "/renew", agentTwo, "POST", { ttlSeconds: 60 }),
+      404,
+      "grant_not_found",
+    );
+    assert.equal((await call(a, grantPath, agentTwo, "DELETE")).status, 204);
+    assert.equal((await call(a, gatewayPath, record.token, "POST")).status, 200);
+    assert.equal(
+      (await call(a, grantPath + "/renew", issuerToken, "POST", { ttlSeconds: 60 })).status,
+      200,
+    );
+    assert.equal((await call(a, grantPath, issuerToken, "DELETE")).status, 204);
+    await error(await call(a, gatewayPath, record.token, "POST"), 401, "grant_invalid");
+
+    const narrowed = await issue(a, await signed({ integrations: [] }));
+    assert.equal(narrowed.status, 403);
+    assert.deepEqual(await narrowed.json(), {
+      error: "integration_forbidden",
+      reason: "not_in_policy",
+      integrations: ["model"],
+    });
+
+    for (const bad of [
+      { audience: "https://another-broker.example.org" },
+      { audience: [trustedAudience] },
+      { issuer: "https://untrusted.example.org" },
+      { expiration: "-1s" },
+      { issuedAt: Math.floor(Date.now() / 1_000) - 601 },
+      { algorithm: "RS256" },
+      { subject: "a".repeat(129) },
+      { tenant: tenantB },
+    ] satisfies SignedTokenOptions[]) {
+      await error(await issue(a, await signed(bad)), 401, "orchestrator_authentication_required");
+    }
+
+    await error(await issue(b, issuerToken), 401, "orchestrator_authentication_required");
+    await error(await issue(domain, issuerToken), 401, "orchestrator_authentication_required");
+    await error(
+      await issue(host, await signed({ tenant: unknown })),
+      401,
+      "orchestrator_authentication_required",
+    );
+    assert.equal((await operate(`/${tenantA}`, "PATCH", { status: "suspended" })).status, 200);
+    await error(await issue(a, issuerToken), 401, "orchestrator_authentication_required");
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("a pinned issuer works on the default hostname without a directory", async () => {
+  const entry: TrustedIssuer = { ...policyEntry, roles: ["issuer"], tenant: tenantA };
+  const { runtime, call, seed, issue, operate } = fixture(false, true, entry);
+
+  try {
+    assert.throws(() => parseConfig(JSON.stringify({ trustedIssuers: [policyEntry] })));
+    assert.ok(
+      parseConfig(JSON.stringify({ trustedIssuers: [policyEntry] }), true).trustedIssuers?.length,
+    );
+
+    await seed(domain, admin, "model", "pinned-model-fixture");
+    assert.equal((await issue(domain, await signed())).status, 201);
+    await error(
+      await issue(domain, await signed({ tenant: tenantB })),
+      401,
+      "orchestrator_authentication_required",
+    );
+    await error(
+      await call(domain, integrationPath, await signed({ role: "admin" })),
+      401,
+      "administrator_authentication_required",
+    );
+    await error(await issue(a, await signed()), 401, "orchestrator_authentication_required");
+    await error(await operate(), 404, "unsupported_route");
+  } finally {
+    await runtime.dispose();
+  }
 });
