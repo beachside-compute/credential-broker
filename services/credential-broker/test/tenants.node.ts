@@ -939,3 +939,78 @@ test("an operator audit row remains visible after an outcome write fails", async
     await runtime.dispose();
   }
 });
+
+test("tenant data key rotation resumes and retires the old key only after resealing", async () => {
+  const { runtime, call, operate, provision, seed, issue, storage } = fixture();
+
+  try {
+    const tenant = await provision(tenantA);
+    const other = await provision(tenantB);
+    await seed(a, tenant.adminKey, "model", "rotation-a");
+    await seed(b, other.adminKey, "model", "rotation-b");
+    const grant = grantToken.parse(await (await issue(a, tenant.issuerKey)).json());
+
+    assert.equal(
+      (
+        await call(a, "/v1/admin/alerts", tenant.adminKey, "POST", {
+          id: "alerts",
+          kind: "webhook",
+          url: "https://alerts.example.net/rotation",
+        })
+      ).status,
+      201,
+    );
+
+    const store = await storage(tenantA);
+    const [destination] = await store.exec("SELECT config FROM alert_destinations");
+    const [credential] = await store.exec("SELECT credential FROM integrations WHERE id = 'model'");
+    const rotate = `/${tenantA}/data-key/rotate`;
+
+    assert.equal((await call(a, gatewayPath, grant.token, "POST")).status, 200);
+    await error(
+      await call(domain, platformPath + rotate, platform, "POST"),
+      403,
+      "platform_operator_required",
+    );
+
+    await store.exec(
+      "UPDATE alert_destinations SET config = json_set(config, '$.ciphertext', 'corrupt')",
+    );
+    await error(await operate(rotate, "POST"), 409, "tenant_ciphertext_unavailable");
+    assert.deepEqual(await store.exec("SELECT active_data_key AS version FROM tenant"), [
+      { version: "t2" },
+    ]);
+    assert.deepEqual(await store.exec("SELECT version FROM data_keys ORDER BY version"), [
+      { version: "t1" },
+      { version: "t2" },
+    ]);
+
+    await seed(a, tenant.adminKey, "added", "rotation-new-write");
+    assert.deepEqual(
+      await store.exec(
+        "SELECT json_extract(credential, '$.keyVersion') AS version FROM integrations WHERE id = 'added'",
+      ),
+      [{ version: "t2" }],
+    );
+    await store.exec("UPDATE alert_destinations SET config = ?", destination.config);
+
+    const retry = await operate(rotate, "POST");
+    assert.equal(retry.status, 200);
+    assert.deepEqual(await retry.json(), { id: tenantA, keyVersion: "t2" });
+    assert.deepEqual(await store.exec("SELECT version FROM data_keys"), [{ version: "t2" }]);
+    const [updated] = await store.exec("SELECT credential FROM integrations WHERE id = 'model'");
+    assert.notEqual(updated.credential, credential.credential);
+
+    const delivery = await call(a, "/v1/admin/alerts/alerts/test", tenant.adminKey, "POST");
+    assert.equal(delivery.status, 200);
+    assert.equal(z.object({ delivered: z.boolean() }).parse(await delivery.json()).delivered, true);
+    assert.deepEqual(await (await call(a, gatewayPath, grant.token, "POST")).json(), {
+      auth: "Bearer rotation-a",
+    });
+    assert.deepEqual(await (await storage(tenantB)).exec("SELECT version FROM data_keys"), [
+      { version: "t1" },
+    ]);
+  } finally {
+    await runtime.dispose();
+  }
+});

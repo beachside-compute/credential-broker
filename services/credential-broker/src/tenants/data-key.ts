@@ -4,7 +4,7 @@ import type { EncryptedCredential } from "../credentials/source";
 import type { Env } from "../http";
 import { assertSeparateRoleKeys } from "./role-keys";
 
-export function rootKeyring(env: Env): EncryptionKeyring {
+export function rootKeyring(env: Env): EncryptionKeyring<string> {
   const keyring = encryptionKeyring(env);
   assertSeparateRoleKeys(env, keyring.keys.values());
 
@@ -20,16 +20,23 @@ export function newDataKey(): string {
     .replace(/=+$/, "");
 }
 
-export function wrapDataKey(key: string, id: string, root: EncryptionKeyring) {
-  return sealValue(key, ["beachside-tenant-key/v1", id], root);
+function dataKeyContext(id: string, version: string) {
+  return version === "t1"
+    ? ["beachside-tenant-key/v1", id]
+    : ["beachside-tenant-key/v2", id, version];
+}
+
+export function wrapDataKey(key: string, id: string, root: EncryptionKeyring, version = "t1") {
+  return sealValue(key, dataKeyContext(id, version), root);
 }
 
 export async function unwrapDataKey(
   reference: EncryptedCredential,
   id: string,
   root: EncryptionKeyring,
+  version = "t1",
 ) {
-  const value = await openValue(reference, ["beachside-tenant-key/v1", id], root, 43);
+  const value = await openValue(reference, dataKeyContext(id, version), root, 43);
 
   if (!value || !/^[A-Za-z0-9_-]{43}$/.test(value))
     throw new Error("Tenant encryption key unavailable");

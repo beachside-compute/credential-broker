@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { and, count, desc, eq, gt, inArray, lte, min, notInArray, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lte, min, ne, notInArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
@@ -38,6 +38,8 @@ export interface TenantProvision {
 }
 
 export const tenantDataKeyVersion = "t1";
+
+const rotationBatchSize = 8;
 
 const minuteMs = 60_000;
 
@@ -179,18 +181,139 @@ export class GrantRegistry extends DurableObject {
   }
 
   dataKeys() {
-    return { active: tenantDataKeyVersion, keys: this.db.select().from(dataKeys).all() };
+    return {
+      active: this.activeDataKey() ?? tenantDataKeyVersion,
+      keys: this.db.select().from(dataKeys).orderBy(dataKeys.version).all(),
+    };
   }
 
-  rewrapDataKeys(previous: EncryptedCredential, wrapped: EncryptedCredential): boolean {
+  rewrapDataKeys(
+    version: string,
+    previous: EncryptedCredential,
+    wrapped: EncryptedCredential,
+  ): boolean {
     return Boolean(
       this.db
         .update(dataKeys)
         .set({ wrapped })
-        .where(and(eq(dataKeys.version, tenantDataKeyVersion), eq(dataKeys.wrapped, previous)))
+        .where(and(eq(dataKeys.version, version), envelopeMatches(dataKeys.wrapped, previous)))
         .returning({ version: dataKeys.version })
         .get(),
     );
+  }
+
+  beginDataKeyRotation(expected: string, version: string, wrapped: EncryptedCredential): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      if (
+        this.activeDataKey() !== expected ||
+        this.db.select({ total: count() }).from(dataKeys).get()!.total !== 1
+      )
+        return false;
+
+      this.db.insert(dataKeys).values({ version, wrapped, createdAt: Date.now() }).run();
+      this.db.update(tenant).set({ activeDataKey: version }).run();
+
+      return true;
+    });
+  }
+
+  dataKeyRotationBatch(active: string) {
+    if (this.activeDataKey() !== active) return;
+
+    const credentials = this.db
+      .select()
+      .from(integrations)
+      .where(needsRotation(integrations.credential, active))
+      .limit(rotationBatchSize)
+      .all();
+
+    const destinations = this.db
+      .select({
+        identity: alertDestinations.identity,
+        id: alertDestinations.id,
+        kind: alertDestinations.kind,
+        config: alertDestinations.config,
+      })
+      .from(alertDestinations)
+      .where(needsRotation(alertDestinations.config, active))
+      .limit(rotationBatchSize)
+      .all();
+
+    return { credentials, destinations };
+  }
+
+  changeCredentialEnvelope(
+    identity: string,
+    previous: EncryptedCredential,
+    credential: EncryptedCredential,
+  ): void {
+    if (this.activeDataKey() !== credential.keyVersion) return;
+
+    this.db
+      .update(integrations)
+      .set({ credential })
+      .where(
+        and(
+          eq(integrations.identity, identity),
+          envelopeMatches(integrations.credential, previous),
+        ),
+      )
+      .run();
+  }
+
+  changeDestinationEnvelope(
+    identity: string,
+    previous: EncryptedCredential,
+    config: EncryptedCredential,
+  ): void {
+    if (this.activeDataKey() !== config.keyVersion) return;
+
+    this.db
+      .update(alertDestinations)
+      .set({ config })
+      .where(
+        and(
+          eq(alertDestinations.identity, identity),
+          envelopeMatches(alertDestinations.config, previous),
+        ),
+      )
+      .run();
+  }
+
+  finishDataKeyRotation(active: string): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      if (this.activeDataKey() !== active) return false;
+
+      const pending =
+        this.db
+          .select({ id: integrations.id })
+          .from(integrations)
+          .where(needsRotation(integrations.credential, active))
+          .get() ??
+        this.db
+          .select({ id: alertDestinations.id })
+          .from(alertDestinations)
+          .where(needsRotation(alertDestinations.config, active))
+          .get();
+
+      if (pending) return false;
+
+      this.db.delete(dataKeys).where(ne(dataKeys.version, active)).run();
+
+      return true;
+    });
+  }
+
+  private activeDataKey(): string | undefined {
+    return this.db.select({ active: tenant.activeDataKey }).from(tenant).get()?.active;
+  }
+
+  private assertCurrentEncryptionKey(reference: CredentialReference): void {
+    if (reference.source !== "encrypted-store") return;
+
+    const active = this.activeDataKey();
+
+    if (active && active !== reference.keyVersion) throw new Error("Tenant encryption key changed");
   }
 
   storedConfig(): TenantConfig {
@@ -229,6 +352,7 @@ export class GrantRegistry extends DurableObject {
 
   createIntegration(integration: StoredIntegration): IntegrationCreation {
     this.assertProvisioned();
+    this.assertCurrentEncryptionKey(integration.credential);
 
     return this.ctx.storage.transactionSync(() => {
       if (this.findIntegration(integration.id)) return "exists";
@@ -264,6 +388,8 @@ export class GrantRegistry extends DurableObject {
     revision: IntegrationRevision,
     credential: CredentialReference,
   ): IntegrationMetadata | undefined {
+    this.assertCurrentEncryptionKey(credential);
+
     const integration = this.db
       .update(integrations)
       .set({
@@ -707,6 +833,7 @@ export class GrantRegistry extends DurableObject {
 
   createDestination(record: DestinationRecord): "exists" | "limit" | DestinationSummary {
     this.assertProvisioned();
+    this.assertCurrentEncryptionKey(record.config);
 
     return this.ctx.storage.transactionSync(() => {
       const existing = this.db
@@ -919,6 +1046,21 @@ export class GrantRegistry extends DurableObject {
 
     if (current == null || at < current) await this.ctx.storage.setAlarm(at);
   }
+}
+
+type EnvelopeColumn =
+  | typeof integrations.credential
+  | typeof alertDestinations.config
+  | typeof dataKeys.wrapped;
+
+function needsRotation(column: EnvelopeColumn, active: string) {
+  return sql`json_extract(${column}, '$.source') = 'encrypted-store' AND json_extract(${column}, '$.keyVersion') IS NOT ${active}`;
+}
+
+function envelopeMatches(column: EnvelopeColumn, expected: EncryptedCredential) {
+  return sql`json_extract(${column}, '$.keyVersion') = ${expected.keyVersion}
+    AND json_extract(${column}, '$.nonce') = ${expected.nonce}
+    AND json_extract(${column}, '$.ciphertext') = ${expected.ciphertext}`;
 }
 
 function destinationSummary(row: typeof alertDestinations.$inferSelect): DestinationSummary {

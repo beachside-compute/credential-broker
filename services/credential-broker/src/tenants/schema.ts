@@ -6,6 +6,7 @@ import type { TenantRole } from "./identity";
 export const tenant = sqliteTable("tenant", {
   id: text("id").primaryKey(),
   config: text("config", { mode: "json" }).$type<TenantConfig>(),
+  activeDataKey: text("active_data_key").notNull().default("t1"),
   createdAt: integer("created_at").notNull(),
 });
 

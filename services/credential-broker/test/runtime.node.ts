@@ -1168,7 +1168,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 7 },
+        { count: 8 },
       ]);
 
       const path = "/gateway/openai/v1/models";

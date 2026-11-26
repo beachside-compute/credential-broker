@@ -180,19 +180,19 @@ export async function rewrapTenantKeys(
   await auditOperation(env, actor, id, "rewrap", async () => {
     const store = await operableTenant(env, id);
     const { active, keys } = await store.dataKeys();
-    const previous = keys.find(({ version }) => version === active)?.wrapped;
 
-    if (!previous) throw new PlatformError(409, "tenant_key_changed");
-
+    if (!keys.some(({ version }) => version === active)) throw new PlatformError(409, "tenant_key_changed");
     const root = rootKeyring(env);
 
-    if (previous.keyVersion === root.active) return;
+    for (const { version, wrapped: previous } of keys) {
+      if (previous.keyVersion === root.active) continue;
 
-    const key = await unwrapDataKey(previous, id, root);
-    const wrapped = await wrapDataKey(key, id, root);
+      const key = await unwrapDataKey(previous, id, root, version);
+      const wrapped = await wrapDataKey(key, id, root, version);
 
-    if (!(await store.rewrapDataKeys(previous, wrapped)))
-      throw new PlatformError(409, "tenant_key_changed");
+      if (!(await store.rewrapDataKeys(version, previous, wrapped)))
+        throw new PlatformError(409, "tenant_key_changed");
+    }
 
     invalidateTenantKeyring(env, id);
   });

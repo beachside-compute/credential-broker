@@ -109,6 +109,37 @@ export async function sealDestination(
   return sealValue(json, sealContext(destination), keyring);
 }
 
+type SealedDestination = Pick<AlertDelivery, "identity" | "id" | "kind" | "config">;
+
+const sealedDestinationConfig = z.union([
+  z.strictObject({ to: z.email().max(254) }),
+  z.strictObject({
+    url: destinationUrl,
+    headers: z.record(headerName, headerValue),
+    signingSecret: z.string().startsWith("whsec_").optional(),
+  }),
+]);
+
+async function destinationPlaintext(destination: SealedDestination, keyring: EncryptionKeyring) {
+  return openValue(
+    destination.config,
+    sealContext(destination),
+    keyring,
+    maxDestinationConfigBytes,
+  );
+}
+
+export async function resealDestination(
+  destination: SealedDestination,
+  keyring: EncryptionKeyring,
+) {
+  const json = await destinationPlaintext(destination, keyring);
+
+  if (json === undefined) return;
+
+  return sealValue(json, sealContext(destination), keyring);
+}
+
 /** A Standard Webhooks signing secret. */
 export function newSigningSecret(): string {
   return `whsec_${base64(crypto.getRandomValues(new Uint8Array(32)))}`;
@@ -174,23 +205,22 @@ export function testEvent(host: string): AlertEvent {
 
 /** Send one alert. Returns the HTTP status (202 for accepted email), or 0 on failure. Never retries. */
 export async function deliver(
-  destination: Pick<AlertDelivery, "identity" | "id" | "kind" | "config">,
+  destination: SealedDestination,
   event: AlertEvent,
   keyring: EncryptionKeyring,
   mail?: Mailer,
   allowsDestination?: (url: URL) => boolean,
 ): Promise<number> {
   try {
-    const json = await openValue(
-      destination.config,
-      sealContext(destination),
-      keyring,
-      maxDestinationConfigBytes,
-    );
+    const json = await destinationPlaintext(destination, keyring);
 
     if (json === undefined) return 0;
 
-    const config: DestinationConfig = JSON.parse(json);
+    const parsed = sealedDestinationConfig.safeParse(JSON.parse(json));
+
+    if (!parsed.success || "to" in parsed.data !== (destination.kind === "email")) return 0;
+
+    const config = parsed.data;
 
     if ("to" in config) {
       if (!mail) return 0;
@@ -205,7 +235,7 @@ export async function deliver(
       return 202;
     }
 
-    if (allowsDestination && !allowsDestination(new URL(config.url))) return 0;
+    if (allowsDestination && !allowsDestination(config.url)) return 0;
 
     const body = JSON.stringify(destination.kind === "slack" ? slackMessage(event) : event);
 

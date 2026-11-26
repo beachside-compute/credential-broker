@@ -19,12 +19,12 @@ export interface EncryptionBindings {
   BROKER_ENCRYPTION_KEY_VERSION?: string;
 }
 
-export interface EncryptionKeyring {
+export interface EncryptionKeyring<Key = string | CryptoKey> {
   active: string;
-  keys: ReadonlyMap<string, string>;
+  keys: ReadonlyMap<string, Key>;
 }
 
-export function encryptionKeyring(bindings: EncryptionBindings): EncryptionKeyring {
+export function encryptionKeyring(bindings: EncryptionBindings): EncryptionKeyring<string> {
   const { BROKER_ENCRYPTION_KEYS, BROKER_ENCRYPTION_KEY_VERSION } = bindings;
 
   try {
@@ -55,6 +55,30 @@ export async function sealCredential(
   keyring: EncryptionKeyring,
 ): Promise<EncryptedCredential> {
   return seal(value, aad(integration, keyring.active), keyring);
+}
+
+export async function resealCredential(
+  reference: EncryptedCredential,
+  integration: IntegrationRevision,
+  keyring: EncryptionKeyring,
+): Promise<EncryptedCredential | undefined> {
+  const value = await open(
+    reference,
+    aad(integration, reference.keyVersion),
+    keyring,
+    integration.kind === "http" ? 67_000 : 4096,
+  );
+
+  if (value === undefined) return;
+
+  return seal(value, aad(integration, keyring.active), keyring);
+}
+
+export function importDataKey(encoded: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", decode(encoded), { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
 }
 
 export function sealEndpointValues(
@@ -204,6 +228,8 @@ async function importKey(
   const encoded = keyring.keys.get(version);
 
   if (!encoded) throw new Error("Encryption key unavailable");
+
+  if (encoded instanceof CryptoKey) return encoded;
 
   return crypto.subtle.importKey("raw", decode(encoded), { name: "AES-GCM" }, false, [usage]);
 }

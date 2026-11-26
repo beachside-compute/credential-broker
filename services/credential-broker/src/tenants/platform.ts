@@ -19,6 +19,7 @@ import {
   setTenantStatus,
   stateInput,
 } from "./platform-operations";
+import { rotateTenantDataKey } from "./rotate-data-key";
 import { resolveTenant } from "./resolve";
 
 type PlatformWorker = Worker & { Variables: { platformRole: "control" | "operator" } };
@@ -135,6 +136,14 @@ platformRoutes.post("/tenants/:id/rewrap", async (context) => {
   await rewrapTenantKeys(context.env, "operator-http", { id: context.req.param("id") });
 
   return privateNoContent();
+});
+
+platformRoutes.post("/tenants/:id/data-key/rotate", async (context) => {
+  if (context.get("platformRole") !== "operator") return denied("operator");
+
+  return privateJson(
+    await rotateTenantDataKey(context.env, "operator-http", { id: context.req.param("id") }),
+  );
 });
 
 platformRoutes.delete("/tenants/:id", async (context) => {

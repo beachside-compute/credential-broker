@@ -4,6 +4,7 @@ import type { Principal } from "../auth";
 import { trustedPrincipal } from "../auth/trusted-issuer";
 import { parseConfig, tenantConfigFor } from "../config";
 import type { BrokerConfig, TrustedIssuer } from "../config";
+import { importDataKey } from "../credentials/sources/encrypted-store";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import type { GrantRegistry } from "../grants/registry";
 import { tokenHash } from "../grants/tokens";
@@ -37,7 +38,7 @@ export interface Tenant {
 
 const keyrings = new WeakMap<
   TenantBindings["REGISTRY"],
-  Map<string, { expires: number; keyring: EncryptionKeyring }>
+  Map<string, { expires: number; fingerprint: string; keyring: EncryptionKeyring<CryptoKey> }>
 >();
 
 export function tenantStore(env: Env, id: string) {
@@ -173,18 +174,31 @@ async function hostedKeyring(
     keyrings.set(env.REGISTRY, cache);
   }
 
-  const cached = cache.get(id);
   const now = Date.now();
-
-  if (cached && cached.expires > now) return cached.keyring;
 
   for (const [tenant, entry] of cache) if (entry.expires <= now) cache.delete(tenant);
 
   const { active, keys } = await store.dataKeys();
 
+  const fingerprint = JSON.stringify([
+    active,
+    keys.map(({ version, wrapped }) => [
+      version,
+      wrapped.keyVersion,
+      wrapped.nonce,
+      wrapped.ciphertext,
+    ]),
+  ]);
+
+  const cached = cache.get(id);
+
+  if (cached?.fingerprint === fingerprint) return cached.keyring;
+  cache.delete(id);
+
   const unwrapped = await Promise.allSettled(
     keys.map(
-      async ({ version, wrapped }) => [version, await unwrapDataKey(wrapped, id, root)] as const,
+      async ({ version, wrapped }) =>
+        [version, await importDataKey(await unwrapDataKey(wrapped, id, root, version))] as const,
     ),
   );
 
@@ -198,7 +212,7 @@ async function hostedKeyring(
   if (!keyring.keys.has(active)) throw new Error("Tenant encryption key unavailable");
 
   if (cache.size >= 256) cache.delete(cache.keys().next().value!);
-  cache.set(id, { expires: now + 300_000, keyring });
+  cache.set(id, { expires: now + 300_000, fingerprint, keyring });
 
   return keyring;
 }
