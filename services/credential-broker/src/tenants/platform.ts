@@ -11,6 +11,7 @@ import {
   eraseTenant,
   inspectTenant,
   listTenants,
+  pageInput,
   PlatformError,
   provisionTenant,
   rewrapTenantKeys,
@@ -24,23 +25,24 @@ type PlatformWorker = Worker & { Variables: { platformRole: "control" | "operato
 
 const patchInput = stateInput.omit({ id: true });
 
-const listInput = z.strictObject({
-  after: tenantId.optional(),
+const listInput = pageInput.extend({
   limit: z
     .string()
     .regex(/^[1-9][0-9]{0,2}$/)
     .transform(Number)
-    .pipe(z.number().max(100))
+    .pipe(pageInput.shape.limit.unwrap())
     .optional(),
 });
 
 export const platformRoutes = new Hono<PlatformWorker>();
 
-platformRoutes.onError((error) =>
-  error instanceof PlatformError
-    ? privateJson({ error: error.code }, error.status)
-    : privateJson({ error: "broker_unavailable" }, 503),
-);
+platformRoutes.onError((error) => {
+  if (error instanceof PlatformError) return privateJson({ error: error.code }, error.status);
+
+  console.error(JSON.stringify({ event: "platform_operation_failed" }));
+
+  return privateJson({ error: "broker_unavailable" }, 503);
+});
 
 platformRoutes.use("*", async (context, next) => {
   const { env } = context;

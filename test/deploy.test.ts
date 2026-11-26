@@ -67,6 +67,7 @@ function provisionStub(root: string) {
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
       if (args[0] === "put") {
+        if (process.env.FAILED_SECRET_PUT === args[1]) process.exit(3);
         const key = readFileSync(0, "utf8");
         appendFileSync("calls.jsonl", JSON.stringify({
           command, name: args[1], validKey: /^[A-Za-z0-9_-]{43}$/.test(key),
@@ -224,6 +225,28 @@ test("HTTP platform setup uploads independent keys only over standard input", ()
     expect(operatorCall).toEqual({ ...setupCall, name: "BROKER_PLATFORM_OPERATOR_KEY" });
     expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_KEY");
     expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_OPERATOR_KEY");
+  }));
+
+test("platform key setup resumes a partial upload without replacing the first key", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    const setup = [...command, "--setup-only", "--platform-key-only", "--print-keys"];
+
+    const initial = spawn(setup, {
+      WORKER_SECRETS: deployed,
+      FAILED_SECRET_PUT: "BROKER_PLATFORM_OPERATOR_KEY",
+    });
+
+    expect(initial.code).toBe(3);
+    expect(initial.stdout).toMatch(/BROKER_PLATFORM_KEY=[A-Za-z0-9_-]{43}/);
+    expect(initial.stderr).toContain("BROKER_PLATFORM_OPERATOR_KEY");
+
+    const retry = spawn(setup, { WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY" });
+    expect(retry.code).toBe(0);
+    expect(calls(service).map(({ name }) => name)).toEqual([
+      "BROKER_PLATFORM_KEY",
+      "BROKER_PLATFORM_OPERATOR_KEY",
+    ]);
   }));
 
 test("setup and dry run agree on whether unpinned trusted issuers are enabled", () =>

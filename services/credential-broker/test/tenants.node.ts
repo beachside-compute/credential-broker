@@ -164,7 +164,9 @@ function options(
 
   return {
     alerts,
-    worker: convertV4MiniflareOptions(rpc ? { workers: [broker, client] } : broker),
+    worker: convertV4MiniflareOptions(
+      rpc ? { unsafeInspectDurableObjects: true, workers: [broker, client] } : broker,
+    ),
   };
 }
 

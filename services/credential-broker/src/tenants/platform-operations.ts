@@ -118,7 +118,8 @@ export async function setTenantStatus(
   actor: PlatformActor,
   request: z.input<typeof stateInput>,
 ) {
-  const { id, status } = input(stateInput, request, "invalid_tenant_status");
+  const { id } = input(idInput, { id: request?.id }, "tenant_not_found", 404);
+  const { status } = input(stateInput, request, "invalid_tenant_status");
 
   return auditOperation(
     env,
@@ -141,7 +142,8 @@ export async function rotateTenantRoleKey(
   actor: PlatformActor,
   request: z.input<typeof roleInput>,
 ) {
-  const { id, role } = input(roleInput, request, "invalid_tenant_role");
+  const { id } = input(idInput, { id: request?.id }, "tenant_not_found", 404);
+  const { role } = input(roleInput, request, "invalid_tenant_role");
 
   return auditOperation(
     env,
