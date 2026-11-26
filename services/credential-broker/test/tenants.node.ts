@@ -99,6 +99,7 @@ function options(
   registry = true,
   policyEntry?: TrustedIssuer,
   rpc = false,
+  routing = enabled,
 ) {
   const alerts: string[] = [];
 
@@ -117,7 +118,7 @@ function options(
       BROKER_ISSUER_KEY: issuer,
       BROKER_ENCRYPTION_KEYS: rootKeys,
       BROKER_ENCRYPTION_KEY_VERSION: root,
-      ...(enabled && { BROKER_TENANT_DOMAIN: domain }),
+      ...(routing && { BROKER_TENANT_DOMAIN: domain }),
       BROKER_HOST_ALIASES: "default-broker.example.net",
       BROKER_CONFIG: JSON.stringify({
         githubActions: { audience: "default-audience", workflows: [policy] },
@@ -167,8 +168,14 @@ function options(
   };
 }
 
-function fixture(enabled = true, registry = true, entry?: TrustedIssuer, rpc = false) {
-  const { worker, alerts } = options(enabled, "v1", registry, entry, rpc);
+function fixture(
+  enabled = true,
+  registry = true,
+  entry?: TrustedIssuer,
+  rpc = false,
+  routing = enabled,
+) {
+  const { worker, alerts } = options(enabled, "v1", registry, entry, rpc, routing);
   const runtime = new Miniflare(worker);
 
   async function call<Payload>(
@@ -834,12 +841,19 @@ test("private platform bindings work with public platform HTTP off", async () =>
     await OPERATOR.erase({ id: tenantA });
 
     const audit = await OPERATOR.auditLog();
+    const page = await OPERATOR.auditLog({ limit: 1, tenant: tenantA });
+    assert.equal(page.records[0].operation, "erase");
+    assert.equal(
+      (await OPERATOR.auditLog({ before: page.next!, limit: 1 })).records[0].operation,
+      "rotate_admin",
+    );
     assert.deepEqual(
-      audit.map(({ actor, operation, outcome }) => ({ actor, operation, outcome })),
+      audit.records.map(({ actor, operation, outcome }) => ({ actor, operation, outcome })),
       [
         { actor: "operator-binding", operation: "erase", outcome: "ok" },
         { actor: "operator-binding", operation: "rotate_admin", outcome: "ok" },
         { actor: "operator-binding", operation: "suspend", outcome: "ok" },
+        { actor: "control-binding", operation: "provision", outcome: "ok" },
       ],
     );
   } finally {
@@ -866,6 +880,59 @@ test("opt-in platform HTTP separates the routine and operator bearer credentials
       (await call(domain, `${platformPath}/${tenantA}`, platformOperator, "DELETE")).status,
       204,
     );
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("platform provisioning requires a hostname suffix through HTTP and RPC", async () => {
+  const http = fixture(true, true, undefined, false, false);
+  const rpc = fixture(true, true, undefined, true, false);
+
+  try {
+    await error(await http.operate("", "POST", { id: tenantA }), 503, "tenant_domain_unconfigured");
+
+    const { CONTROL } = await rpc.runtime.getBindings<{
+      CONTROL: Pick<PlatformControl, "provision" | "list">;
+    }>("platform-client");
+
+    await assert.rejects(
+      async () => CONTROL.provision({ id: tenantA }),
+      /tenant_domain_unconfigured/,
+    );
+    assert.deepEqual((await CONTROL.list()).tenants, []);
+  } finally {
+    await Promise.all([http.runtime.dispose(), rpc.runtime.dispose()]);
+  }
+});
+
+test("an operator audit row remains visible after an outcome write fails", async () => {
+  const { runtime } = fixture(true, true, undefined, true);
+
+  try {
+    const { CONTROL, OPERATOR } = await runtime.getBindings<{
+      CONTROL: Pick<PlatformControl, "provision">;
+      OPERATOR: Pick<PlatformOperator, "rotateRoleKey" | "auditLog">;
+    }>("platform-client");
+
+    await CONTROL.provision({ id: tenantA });
+
+    const directory = await runtime.unsafeGetDurableObjectStorage("broker", "TenantDirectory", {
+      name: "tenant-directory",
+    });
+
+    await directory.exec(
+      "CREATE TRIGGER fixture_audit_failure BEFORE UPDATE OF outcome ON platform_audit BEGIN SELECT RAISE(FAIL, 'fixture fault'); END",
+    );
+    const result = await OPERATOR.rotateRoleKey({ id: tenantA, role: "issuer" });
+    assert.equal(result.role, "issuer");
+    await directory.exec(
+      "UPDATE platform_audit SET started_at = 0 WHERE operation = 'rotate_issuer'",
+    );
+
+    const [{ outcome, completion }] = (await OPERATOR.auditLog({ limit: 1 })).records;
+    assert.equal(outcome, null);
+    assert.equal(completion, "unconfirmed");
   } finally {
     await runtime.dispose();
   }

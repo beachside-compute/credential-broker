@@ -1,49 +1,54 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import type { z } from "zod";
 import type { Env } from "../http";
 import {
+  auditInput,
   eraseTenant,
+  idInput,
   inspectTenant,
   listTenants,
+  pageInput,
+  platformAuditLog,
   provisionTenant,
   rewrapTenantKeys,
   rotateTenantRoleKey,
+  roleInput,
+  stateInput,
   setTenantStatus,
 } from "./platform-operations";
-import { tenantDirectory } from "./resolve";
-import type { TenantRole } from "./identity";
 
 export class PlatformControl extends WorkerEntrypoint<Env> {
-  provision(request: { id: string }) {
-    return provisionTenant(this.env, request);
+  provision(request: z.input<typeof idInput>) {
+    return provisionTenant(this.env, "control-binding", request);
   }
 
-  list(request: { after?: string; limit?: number } = {}) {
+  list(request: z.input<typeof pageInput> = {}) {
     return listTenants(this.env, request);
   }
 
-  inspect(request: { id: string }) {
+  inspect(request: z.input<typeof idInput>) {
     return inspectTenant(this.env, request);
   }
 }
 
 export class PlatformOperator extends WorkerEntrypoint<Env> {
-  setStatus(request: { id: string; status: "active" | "suspended" }) {
+  setStatus(request: z.input<typeof stateInput>) {
     return setTenantStatus(this.env, "operator-binding", request);
   }
 
-  rotateRoleKey(request: { id: string; role: TenantRole }) {
+  rotateRoleKey(request: z.input<typeof roleInput>) {
     return rotateTenantRoleKey(this.env, "operator-binding", request);
   }
 
-  rewrap(request: { id: string }) {
+  rewrap(request: z.input<typeof idInput>) {
     return rewrapTenantKeys(this.env, "operator-binding", request);
   }
 
-  erase(request: { id: string }) {
+  erase(request: z.input<typeof idInput>) {
     return eraseTenant(this.env, "operator-binding", request);
   }
 
-  auditLog() {
-    return tenantDirectory(this.env).auditLog();
+  auditLog(request: z.input<typeof auditInput> = {}) {
+    return platformAuditLog(this.env, request);
   }
 }

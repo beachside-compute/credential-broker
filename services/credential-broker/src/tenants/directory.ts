@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { asc, desc, eq, gt } from "drizzle-orm";
+import { and, asc, desc, eq, gt, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle-directory/migrations";
@@ -123,8 +123,19 @@ export class TenantDirectory extends DurableObject<Env> {
       .run();
   }
 
-  auditLog() {
-    return this.db.select().from(platformAudit).orderBy(desc(platformAudit.id)).limit(100).all();
+  auditLog(before: number | undefined, limit: number, tenant?: string) {
+    return this.db
+      .select()
+      .from(platformAudit)
+      .where(
+        and(
+          before === undefined ? undefined : lt(platformAudit.id, before),
+          tenant === undefined ? undefined : eq(platformAudit.tenant, tenant),
+        ),
+      )
+      .orderBy(desc(platformAudit.id))
+      .limit(limit)
+      .all();
   }
 
   private operable(row: TenantRow): boolean {

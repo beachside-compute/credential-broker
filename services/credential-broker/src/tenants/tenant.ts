@@ -19,6 +19,7 @@ import type { RoleBindings } from "./role-keys";
 
 export interface TenantBindings extends RoleBindings, TenantHostBindings {
   BROKER_CONFIG?: string;
+  BROKER_PLATFORM_HTTP_ENABLED?: string;
   REGISTRY: DurableObjectNamespace<GrantRegistry>;
   DIRECTORY: DurableObjectNamespace<TenantDirectory>;
 }

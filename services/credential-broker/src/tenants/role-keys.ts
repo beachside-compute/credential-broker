@@ -5,7 +5,6 @@ export interface RoleBindings {
   BROKER_ISSUER_KEY?: string;
   BROKER_PLATFORM_KEY?: string;
   BROKER_PLATFORM_OPERATOR_KEY?: string;
-  BROKER_PLATFORM_HTTP_ENABLED?: string;
 }
 
 export function assertSeparateRoleKeys(

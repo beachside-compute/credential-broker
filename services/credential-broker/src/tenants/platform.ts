@@ -16,12 +16,13 @@ import {
   rewrapTenantKeys,
   rotateTenantRoleKey,
   setTenantStatus,
+  stateInput,
 } from "./platform-operations";
 import { resolveTenant } from "./resolve";
 
 type PlatformWorker = Worker & { Variables: { platformRole: "control" | "operator" } };
 
-const patchInput = z.strictObject({ status: z.enum(["active", "suspended"]) });
+const patchInput = stateInput.omit({ id: true });
 
 const listInput = z.strictObject({
   after: tenantId.optional(),
@@ -75,7 +76,7 @@ platformRoutes.post("/tenants", async (context) => {
   if (context.get("platformRole") !== "control") return denied("control");
 
   return privateJson(
-    await provisionTenant(context.env, await readJson(context.req.raw, 1024)),
+    await provisionTenant(context.env, "control-http", await readJson(context.req.raw, 1024)),
     201,
   );
 });

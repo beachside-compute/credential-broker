@@ -122,7 +122,7 @@ Set a hostname suffix under a Cloudflare zone you control. Use a proxied wildcar
 }
 ```
 
-The hosted control plane uses private Service Bindings to the same broker Worker. Bind the SaaS app to the `PlatformControl` entrypoint for `provision`, `list`, and `inspect`. Bind a separate trusted operator Worker to `PlatformOperator` for `setStatus`, `rotateRoleKey`, `rewrap`, `erase`, and `auditLog`. A platform binding grants the calling Worker all operations exported by that entrypoint. The operator audit log records tenant ID, operation, channel, timestamps, and outcome. The authenticated operator application can keep a separate audit trail for its individual human callers.
+The hosted control plane uses private Service Bindings to the same broker Worker. Bind the SaaS app to the `PlatformControl` entrypoint for `provision`, `list`, and `inspect`. Bind a separate trusted operator Worker to `PlatformOperator` for `setStatus`, `rotateRoleKey`, `rewrap`, `erase`, and `auditLog`. A platform binding grants the calling Worker all operations exported by that entrypoint. Provisioning requires a configured tenant domain. The audit log records provisioning and sensitive operations with tenant ID, operation, channel, timestamps, and outcome. Use `auditLog({ before, limit, tenant })` to page through retained records. A row marked `unconfirmed` has lacked an outcome for at least five minutes. Inspect the tenant before retrying that operation. Expected RPC refusals carry the same error code as HTTP in the exception message. The authenticated operator application can keep a separate audit trail for its individual human callers.
 
 ```jsonc
 {

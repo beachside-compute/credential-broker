@@ -11,9 +11,12 @@ export const tenants = sqliteTable("tenants", {
 export const platformAudit = sqliteTable("platform_audit", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   tenant: text("tenant").notNull(),
-  actor: text("actor", { enum: ["operator-http", "operator-binding"] }).notNull(),
+  actor: text("actor", {
+    enum: ["operator-http", "operator-binding", "control-http", "control-binding"],
+  }).notNull(),
   operation: text("operation", {
     enum: [
+      "provision",
       "suspend",
       "reactivate",
       "rotate_admin",

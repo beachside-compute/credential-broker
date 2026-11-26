@@ -15,6 +15,7 @@ export const wranglerHostConfig = z.object({
     .object({
       BROKER_TENANT_DOMAIN: z.string().optional(),
       BROKER_HOST_ALIASES: z.string().optional(),
+      BROKER_PLATFORM_HTTP_ENABLED: z.enum(["true", "false"]).optional(),
     })
     .optional(),
 });

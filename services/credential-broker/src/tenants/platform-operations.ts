@@ -3,35 +3,47 @@ import { tokenHash } from "../grants/tokens";
 import type { Env } from "../http";
 import { newDataKey, rootKeyring, unwrapDataKey, wrapDataKey } from "./data-key";
 import type { PlatformAction, PlatformActor, tenants } from "./directory-schema";
+import { brokerHosts } from "./hosts";
 import { tenantId, tenantRole } from "./identity";
 import { invalidateActive, tenantDirectory } from "./resolve";
 import { newRoleKey } from "./role-keys";
 import { invalidateTenantKeyring, tenantStore } from "./tenant";
 
-const idInput = z.strictObject({ id: tenantId });
+export const idInput = z.strictObject({ id: tenantId });
 
-const pageInput = z.strictObject({
+export const pageInput = z.strictObject({
   after: tenantId.optional(),
   limit: z.int().min(1).max(100).optional(),
 });
 
-const stateInput = idInput.extend({ status: z.enum(["active", "suspended"]) });
+export const stateInput = idInput.extend({ status: z.enum(["active", "suspended"]) });
 
-const roleInput = idInput.extend({ role: tenantRole });
+export const roleInput = idInput.extend({ role: tenantRole });
+
+export const auditInput = z.strictObject({
+  before: z.int().positive().optional(),
+  limit: z.int().min(1).max(100).optional(),
+  tenant: tenantId.optional(),
+});
 
 export class PlatformError extends Error {
   constructor(
-    readonly status: 400 | 404 | 409,
+    readonly status: 400 | 404 | 409 | 503,
     readonly code: string,
   ) {
     super(code);
   }
 }
 
-function input<S extends z.ZodType, Value>(schema: S, value: Value, code: string): z.output<S> {
+function input<S extends z.ZodType, Value>(
+  schema: S,
+  value: Value,
+  code: string,
+  status: 400 | 404 = 400,
+): z.output<S> {
   const parsed = schema.safeParse(value);
 
-  if (!parsed.success) throw new PlatformError(code === "tenant_not_found" ? 404 : 400, code);
+  if (!parsed.success) throw new PlatformError(status, code);
 
   return parsed.data;
 }
@@ -50,24 +62,33 @@ function tenantView(row: typeof tenants.$inferSelect) {
   };
 }
 
-export async function provisionTenant(env: Env, request: z.input<typeof idInput>) {
+export async function provisionTenant(
+  env: Env,
+  actor: PlatformActor,
+  request: z.input<typeof idInput>,
+) {
   const { id } = input(idInput, request, "invalid_tenant");
-  const adminKey = newRoleKey("admin");
-  const issuerKey = newRoleKey("issuer");
 
-  const [adminHash, issuerHash, dataKey] = await Promise.all([
-    tokenHash(adminKey),
-    tokenHash(issuerKey),
-    wrapDataKey(newDataKey(), id, rootKeyring(env)),
-  ]);
+  if (!brokerHosts(env).domain) throw new PlatformError(503, "tenant_domain_unconfigured");
 
-  if (!(await tenantDirectory(env).provision({ id, adminHash, issuerHash, dataKey })))
-    throw new PlatformError(409, "tenant_exists");
+  return auditOperation(env, actor, id, "provision", async () => {
+    const adminKey = newRoleKey("admin");
+    const issuerKey = newRoleKey("issuer");
 
-  invalidateActive(env, id);
-  invalidateTenantKeyring(env, id);
+    const [adminHash, issuerHash, dataKey] = await Promise.all([
+      tokenHash(adminKey),
+      tokenHash(issuerKey),
+      wrapDataKey(newDataKey(), id, rootKeyring(env)),
+    ]);
 
-  return { id, adminKey, issuerKey };
+    if (!(await tenantDirectory(env).provision({ id, adminHash, issuerHash, dataKey })))
+      throw new PlatformError(409, "tenant_exists");
+
+    invalidateActive(env, id);
+    invalidateTenantKeyring(env, id);
+
+    return { id, adminKey, issuerKey };
+  });
 }
 
 export async function listTenants(env: Env, request: z.input<typeof pageInput> = {}) {
@@ -79,7 +100,7 @@ export async function listTenants(env: Env, request: z.input<typeof pageInput> =
 }
 
 export async function inspectTenant(env: Env, request: z.input<typeof idInput>) {
-  const { id } = input(idInput, request, "tenant_not_found");
+  const { id } = input(idInput, request, "tenant_not_found", 404);
   const row = await tenantDirectory(env).lookup(id);
 
   if (!row) return tenantNotFound();
@@ -152,14 +173,14 @@ export async function rewrapTenantKeys(
   actor: PlatformActor,
   request: z.input<typeof idInput>,
 ) {
-  const { id } = input(idInput, request, "tenant_not_found");
+  const { id } = input(idInput, request, "tenant_not_found", 404);
 
   await auditOperation(env, actor, id, "rewrap", async () => {
     const store = await operableTenant(env, id);
     const { active, keys } = await store.dataKeys();
     const previous = keys.find(({ version }) => version === active)?.wrapped;
 
-    if (!previous) return tenantNotFound();
+    if (!previous) throw new PlatformError(409, "tenant_key_changed");
 
     const root = rootKeyring(env);
 
@@ -180,7 +201,7 @@ export async function eraseTenant(
   actor: PlatformActor,
   request: z.input<typeof idInput>,
 ) {
-  const { id } = input(idInput, request, "tenant_not_found");
+  const { id } = input(idInput, request, "tenant_not_found", 404);
 
   await auditOperation(env, actor, id, "erase", async () => {
     const erased = await tenantDirectory(env).erase(id);
@@ -189,6 +210,33 @@ export async function eraseTenant(
 
     if (!erased) return tenantNotFound();
   });
+}
+
+export async function platformAuditLog(env: Env, request: z.input<typeof auditInput> = {}) {
+  const { before, limit = 50, tenant } = input(auditInput, request, "invalid_audit_query");
+  const rows = await tenantDirectory(env).auditLog(before, limit + 1, tenant);
+  const page = rows.slice(0, limit);
+  const cutoff = Date.now() - 5 * 60_000;
+
+  return {
+    records: page.map((row) => ({
+      ...row,
+      completion: row.outcome ? "recorded" : row.startedAt < cutoff ? "unconfirmed" : "pending",
+    })),
+    next: rows[limit] ? page.at(-1)!.id : null,
+  };
+}
+
+async function finishAudit(env: Env, id: number, result: "ok" | "failed") {
+  try {
+    await tenantDirectory(env).finishAudit(id, result);
+  } catch {
+    try {
+      await tenantDirectory(env).finishAudit(id, result);
+    } catch {
+      console.error(JSON.stringify({ event: "platform_audit_completion_failed", auditId: id }));
+    }
+  }
 }
 
 export async function auditOperation<T>(
@@ -208,6 +256,6 @@ export async function auditOperation<T>(
 
     return value;
   } finally {
-    await directory.finishAudit(id, result).catch(() => {});
+    await finishAudit(env, id, result);
   }
 }

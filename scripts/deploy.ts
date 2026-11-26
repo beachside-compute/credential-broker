@@ -85,7 +85,7 @@ async function withDeployConfig<T>(
     brokerHosts(wranglerHostConfig.parse(config).vars ?? {});
   } catch {
     return setupError(
-      "Invalid BROKER_TENANT_DOMAIN or BROKER_HOST_ALIASES in wrangler.local.jsonc",
+      "Invalid BROKER_TENANT_DOMAIN, BROKER_HOST_ALIASES, or BROKER_PLATFORM_HTTP_ENABLED",
     );
   }
 
@@ -472,14 +472,22 @@ async function setupPlatformKey(
     return setupError("The Worker already has both platform keys. Setup never replaces role keys");
 
   return withDeployConfig(undefined, async (config) => {
-    for (const name of names) {
+    for (const [index, name] of names.entries()) {
       const key = randomKey();
 
       const { code } = await runCommand(env, ["wrangler", "secret", "put", name, ...config], {
         stdin: new Blob([key]),
       });
 
-      if (code !== 0) return code;
+      if (code !== 0) {
+        const remaining = names.slice(index).join(", ");
+        console.error(
+          `Platform key setup stopped. Retry to check the Worker and create missing keys: ${remaining}`,
+        );
+
+        return code;
+      }
+
       console.info(`Save this key in your password manager now. It cannot be read back.
 
   ${name}=${key}`);
