@@ -64,9 +64,11 @@
     "@clack/prompts": "1.9.0"
   },
   "devDependencies": {
+    "@beachside/freestyle": "0.22.0",
     "@changesets/cli": "3.0.0",
     "@oxlint/plugins": "1.94.0",
     "@types/bun": "1.4.2",
+    "beachside": "0.22.0",
     "oxfmt": "0.79.0",
     "oxlint": "1.94.0",
     "typescript": "5.9.3"
