@@ -1,0 +1,59 @@
+# Reviews a pull request when it is opened ready for review or marked ready later: Pi runs in a Freestyle sandbox and
+# posts one review (a summary plus inline comments) with `gh`. GitHub and model access come from a credential-broker grant
+# issued with this job's OIDC token, so the repository holds no GitHub or model keys.
+# Setup and the broker policy are in scripts/pr-review/README.md.
+name: PR review
+on:
+  pull_request_target:
+    # `opened` covers pull requests that never were drafts; drafts are skipped below.
+    types: [opened, ready_for_review]
+permissions:
+  contents: read
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  review:
+    # Only when enabled, never on drafts, never on forks, and only for the repository's own people.
+    if: >-
+      vars.PR_REVIEW_ENABLED == 'true' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # The default branch only. Pull request code is cloned inside the sandbox, never here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - name: Find the prepared review image
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .pr-review/image-id
+          key: pr-review-image-${{ github.run_id }}
+          restore-keys: pr-review-image-
+      - name: Review
+        run: bun scripts/pr-review/review.ts
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REVIEW_IMAGE_FILE: .pr-review/image-id
+          REVIEW_GATEWAY: ${{ vars.PR_REVIEW_GATEWAY }}
+          REVIEW_MODEL: ${{ vars.PR_REVIEW_MODEL }}
+          PR_REVIEW_DEBUG: ${{ vars.PR_REVIEW_DEBUG }}
+          BEACHSIDE_BROKER_URL: ${{ vars.BEACHSIDE_BROKER_URL }}
+          BEACHSIDE_BROKER_AUDIENCE: ${{ vars.BEACHSIDE_BROKER_AUDIENCE }}
+          FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
