@@ -4,12 +4,11 @@ import type { Principal } from "../auth";
 import { trustedPrincipal } from "../auth/trusted-issuer";
 import { parseConfig, tenantConfigFor } from "../config";
 import type { BrokerConfig, TrustedIssuer } from "../config";
-import { importDataKey } from "../credentials/sources/encrypted-store";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import type { GrantRegistry, TenantKeyState } from "../grants/registry";
 import { tokenHash } from "../grants/tokens";
 import type { Env } from "../http";
-import { rootKeyring, unwrapDataKey } from "./data-key";
+import { localKeyService, rootKeyring } from "./data-key";
 import type { TenantDirectory } from "./directory";
 import { brokerHosts } from "./hosts";
 import type { TenantHostBindings } from "./hosts";
@@ -170,7 +169,7 @@ async function hostedKeyring(
   id: string,
   { active, keys }: TenantKeyState,
 ): Promise<EncryptionKeyring> {
-  const root = rootKeyring(env);
+  const keyService = localKeyService(env);
   let cache = keyrings.get(env.REGISTRY);
 
   if (!cache) {
@@ -200,7 +199,7 @@ async function hostedKeyring(
   const unwrapped = await Promise.allSettled(
     keys.map(
       async ({ version, wrapped }) =>
-        [version, await importDataKey(await unwrapDataKey(wrapped, id, root, version))] as const,
+        [version, await keyService.unwrapDataKey(wrapped, { tenant: id, version })] as const,
     ),
   );
 

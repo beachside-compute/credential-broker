@@ -9,9 +9,8 @@ import type { V4WorkerOptions } from "miniflare";
 import type { PlatformControl, PlatformOperator } from "../src/tenants/platform-rpc";
 import { brokerHosts, isBrokerHost, requestTenant } from "../src/tenants/hosts";
 import { resealDestination, tripRequest } from "../src/canaries/alerts";
-import { encryptionKeyring } from "../src/credentials/sources/encrypted-store";
 import type { GrantRegistry } from "../src/grants/registry";
-import { unwrapDataKey } from "../src/tenants/data-key";
+import { localKeyService } from "../src/tenants/data-key";
 import { parseConfig } from "../src/config";
 import type { TrustedIssuer } from "../src/config";
 import { createCredentialBrokerAdmin } from "../../../src/admin";
@@ -1096,8 +1095,11 @@ test("a claimed canary delivery keeps the key snapshot across retirement", async
 
     const oldKey = trip.keyState.keys.find(({ version }) => version === delivery.config.keyVersion);
     assert.ok(oldKey);
-    const root = encryptionKeyring({ BROKER_ENCRYPTION_KEYS: rootKeys });
-    const key = await unwrapDataKey(oldKey.wrapped, tenantA, root, oldKey.version);
+
+    const key = await localKeyService({ BROKER_ENCRYPTION_KEYS: rootKeys }).unwrapDataKey(
+      oldKey.wrapped,
+      { tenant: tenantA, version: oldKey.version },
+    );
 
     const recovered = await resealDestination(delivery, {
       active: oldKey.version,
