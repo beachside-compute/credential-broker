@@ -3,7 +3,7 @@ import { resealDestination } from "../canaries/alerts";
 import { integrationId } from "../config";
 import { resealCredential } from "../credentials/sources/encrypted-store";
 import type { Env } from "../http";
-import { newDataKey, rootKeyring, wrapDataKey } from "./data-key";
+import { localKeyService } from "./data-key";
 import type { PlatformActor } from "./directory-schema";
 import { defaultTenant, tenantId } from "./identity";
 import { auditOperation, operableTenant, PlatformError } from "./platform-operations";
@@ -73,7 +73,7 @@ export async function rotateTenantDataKey(
       if (!next) throw keyChanged();
 
       active = next;
-      const wrapped = await wrapDataKey(newDataKey(), id, rootKeyring(env), active);
+      const wrapped = await localKeyService(env).generateDataKey({ tenant: id, version: active });
 
       if (!(await store.beginDataKeyRotation(state.active, active, wrapped))) throw keyChanged();
     }

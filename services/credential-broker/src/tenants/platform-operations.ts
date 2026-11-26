@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { tokenHash } from "../grants/tokens";
 import type { Env } from "../http";
-import { newDataKey, rootKeyring, unwrapDataKey, wrapDataKey } from "./data-key";
+import { localKeyService } from "./data-key";
 import type { PlatformAction, PlatformActor, tenants } from "./directory-schema";
 import { brokerHosts } from "./hosts";
 import { initialTenantKeyVersion, tenantId, tenantRole } from "./identity";
@@ -84,7 +84,7 @@ export async function provisionTenant(
     const [adminHash, issuerHash, dataKey] = await Promise.all([
       tokenHash(adminKey),
       tokenHash(issuerKey),
-      wrapDataKey(newDataKey(), id, rootKeyring(env), initialTenantKeyVersion),
+      localKeyService(env).generateDataKey({ tenant: id, version: initialTenantKeyVersion }),
     ]);
 
     if (!(await tenantDirectory(env).provision({ id, adminHash, issuerHash, dataKey })))
@@ -189,15 +189,12 @@ export async function rewrapTenantKeys(
 
     if (!keys.some(({ version }) => version === active))
       throw new PlatformError(409, "tenant_key_changed");
-    const root = rootKeyring(env);
+    const keyService = localKeyService(env);
 
     for (const { version, wrapped: previous } of keys) {
-      if (previous.keyVersion === root.active) continue;
+      const wrapped = await keyService.rewrapDataKey(previous, { tenant: id, version });
 
-      const key = await unwrapDataKey(previous, id, root, version);
-      const wrapped = await wrapDataKey(key, id, root, version);
-
-      if (!(await store.rewrapDataKeys(version, previous, wrapped)))
+      if (wrapped && !(await store.rewrapDataKeys(version, previous, wrapped)))
         throw new PlatformError(409, "tenant_key_changed");
     }
 
