@@ -1,12 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { and, count, desc, eq, gt, inArray, lte, min, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lte, min, ne, notInArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
 import type { Principal } from "../auth";
-import { requestLimit } from "../config";
-import type { RequestLimits } from "../config";
-import type { CredentialReference } from "../credentials/source";
+import { requestLimit, tenantConfigFor } from "../config";
+import type { RequestLimits, TenantConfig } from "../config";
+import type { CredentialReference, EncryptedCredential } from "../credentials/source";
 import { integrations, issuerIntegrations } from "../integrations/schema";
 import { maxIntegrations } from "../integrations/types";
 import type {
@@ -26,6 +26,19 @@ import type {
   Trip,
   TripRequest,
 } from "../canaries/types";
+
+import { dataKeys, roleKeys, tenant } from "../tenants/schema";
+import { initialTenantKeyVersion } from "../tenants/identity";
+import type { TenantRole } from "../tenants/identity";
+
+export interface TenantProvision {
+  id: string;
+  dataKey: EncryptedCredential;
+  adminHash: string;
+  issuerHash: string;
+}
+
+const rotationBatchSize = 8;
 
 const minuteMs = 60_000;
 
@@ -94,12 +107,18 @@ export interface DestinationRecord {
 
 type IntegrationCreation = "exists" | "limit" | IntegrationMetadata;
 
+export interface TenantKeyState {
+  active: string;
+  keys: { version: string; wrapped: EncryptedCredential }[];
+}
+
 export type Authorization =
   | {
       status: "allowed";
       leaseId: string;
       traceparent: string | null;
       integration: StoredIntegration;
+      keyState: TenantKeyState | null;
     }
   | { status: "invalid"; trip?: Trip }
   | { status: "forbidden" | "busy" };
@@ -115,6 +134,250 @@ export class GrantRegistry extends DurableObject {
     });
   }
 
+  provision({ id, dataKey, adminHash, issuerHash }: TenantProvision): void {
+    this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      this.db.delete(tenant).run();
+      this.db.delete(roleKeys).run();
+      this.db.delete(dataKeys).run();
+      this.db
+        .insert(tenant)
+        .values({ id, createdAt: now, activeDataKey: initialTenantKeyVersion })
+        .run();
+      this.db
+        .insert(roleKeys)
+        .values([
+          { role: "admin", hash: adminHash, createdAt: now },
+          { role: "issuer", hash: issuerHash, createdAt: now },
+        ])
+        .run();
+      this.db
+        .insert(dataKeys)
+        .values({
+          version: initialTenantKeyVersion,
+          wrapped: dataKey,
+          createdAt: now,
+        })
+        .run();
+    });
+  }
+
+  role(hash: string): TenantRole | undefined {
+    return this.db
+      .select({ role: roleKeys.role })
+      .from(roleKeys)
+      .where(eq(roleKeys.hash, hash))
+      .get()?.role;
+  }
+
+  hasRoleKey(role: TenantRole): boolean {
+    return Boolean(
+      this.db.select({ role: roleKeys.role }).from(roleKeys).where(eq(roleKeys.role, role)).get(),
+    );
+  }
+
+  setRoleKey(role: TenantRole, hash: string): void {
+    const values = { hash, createdAt: Date.now() };
+    this.db
+      .insert(roleKeys)
+      .values({ role, ...values })
+      .onConflictDoUpdate({
+        target: roleKeys.role,
+        set: values,
+      })
+      .run();
+  }
+
+  dataKeys(): TenantKeyState {
+    return this.readDataKeys(this.activeDataKey() ?? initialTenantKeyVersion);
+  }
+
+  private readDataKeys(active: string): TenantKeyState {
+    return {
+      active,
+      keys: this.db
+        .select({ version: dataKeys.version, wrapped: dataKeys.wrapped })
+        .from(dataKeys)
+        .orderBy(dataKeys.version)
+        .all(),
+    };
+  }
+
+  private alertKeyState(): TenantKeyState | null {
+    const active = this.activeDataKey();
+
+    return active ? this.readDataKeys(active) : null;
+  }
+
+  rewrapDataKeys(
+    version: string,
+    previous: EncryptedCredential,
+    wrapped: EncryptedCredential,
+  ): boolean {
+    return Boolean(
+      this.db
+        .update(dataKeys)
+        .set({ wrapped })
+        .where(and(eq(dataKeys.version, version), envelopeMatches(dataKeys.wrapped, previous)))
+        .returning({ version: dataKeys.version })
+        .get(),
+    );
+  }
+
+  beginDataKeyRotation(expected: string, version: string, wrapped: EncryptedCredential): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      if (
+        this.activeDataKey() !== expected ||
+        this.db.select({ total: count() }).from(dataKeys).get()!.total !== 1
+      )
+        return false;
+
+      this.db.insert(dataKeys).values({ version, wrapped, createdAt: Date.now() }).run();
+      this.db.update(tenant).set({ activeDataKey: version }).run();
+
+      return true;
+    });
+  }
+
+  dataKeyRotationBatch(active: string) {
+    if (this.activeDataKey() !== active) return;
+
+    const credentials = this.db
+      .select()
+      .from(integrations)
+      .where(needsRotation(integrations.credential, active))
+      .orderBy(integrations.identity)
+      .limit(rotationBatchSize)
+      .all();
+
+    const destinations = this.db
+      .select({
+        identity: alertDestinations.identity,
+        id: alertDestinations.id,
+        kind: alertDestinations.kind,
+        config: alertDestinations.config,
+      })
+      .from(alertDestinations)
+      .where(needsRotation(alertDestinations.config, active))
+      .orderBy(alertDestinations.identity)
+      .limit(rotationBatchSize)
+      .all();
+
+    return { credentials, destinations };
+  }
+
+  changeCredentialEnvelope(
+    identity: string,
+    previous: EncryptedCredential,
+    credential: EncryptedCredential,
+  ): boolean {
+    if (this.activeDataKey() !== credential.keyVersion) return false;
+
+    return Boolean(
+      this.db
+        .update(integrations)
+        .set({ credential })
+        .where(
+          and(
+            eq(integrations.identity, identity),
+            envelopeMatches(integrations.credential, previous),
+          ),
+        )
+        .returning({ identity: integrations.identity })
+        .get(),
+    );
+  }
+
+  changeDestinationEnvelope(
+    identity: string,
+    previous: EncryptedCredential,
+    config: EncryptedCredential,
+  ): boolean {
+    if (this.activeDataKey() !== config.keyVersion) return false;
+
+    return Boolean(
+      this.db
+        .update(alertDestinations)
+        .set({ config })
+        .where(
+          and(
+            eq(alertDestinations.identity, identity),
+            envelopeMatches(alertDestinations.config, previous),
+          ),
+        )
+        .returning({ identity: alertDestinations.identity })
+        .get(),
+    );
+  }
+
+  finishDataKeyRotation(active: string): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      if (this.activeDataKey() !== active) return false;
+
+      const pending =
+        this.db
+          .select({ id: integrations.id })
+          .from(integrations)
+          .where(needsRotation(integrations.credential, active))
+          .get() ??
+        this.db
+          .select({ id: alertDestinations.id })
+          .from(alertDestinations)
+          .where(needsRotation(alertDestinations.config, active))
+          .get();
+
+      if (
+        pending ||
+        !this.db
+          .select({ version: dataKeys.version })
+          .from(dataKeys)
+          .where(eq(dataKeys.version, active))
+          .get()
+      )
+        return false;
+
+      this.db.delete(dataKeys).where(ne(dataKeys.version, active)).run();
+
+      return true;
+    });
+  }
+
+  private activeDataKey(): string | undefined {
+    return this.db.select({ active: tenant.activeDataKey }).from(tenant).get()?.active;
+  }
+
+  private assertCurrentEncryptionKey(reference: CredentialReference): void {
+    if (reference.source !== "encrypted-store") return;
+
+    const active = this.activeDataKey();
+
+    if (active && active !== reference.keyVersion) throw new Error("tenant_key_changed");
+  }
+
+  storedConfig(): TenantConfig {
+    return this.db.select({ config: tenant.config }).from(tenant).get()?.config ?? {};
+  }
+
+  setStoredConfig(config: TenantConfig): void {
+    this.db.update(tenant).set({ config }).run();
+  }
+
+  async destroy(): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      await migrate(this.db, migrations);
+    });
+  }
+
+  private assertProvisioned(): void {
+    if (
+      this.ctx.id.name?.startsWith("tenant/") &&
+      !this.db.select({ id: tenant.id }).from(tenant).get()
+    )
+      throw new Error("Broker registry unavailable");
+  }
+
   listIntegrations(): IntegrationMetadata[] {
     return this.db.select().from(integrations).orderBy(integrations.id).all().map(metadata);
   }
@@ -126,6 +389,9 @@ export class GrantRegistry extends DurableObject {
   }
 
   createIntegration(integration: StoredIntegration): IntegrationCreation {
+    this.assertProvisioned();
+    this.assertCurrentEncryptionKey(integration.credential);
+
     return this.ctx.storage.transactionSync(() => {
       if (this.findIntegration(integration.id)) return "exists";
 
@@ -160,6 +426,8 @@ export class GrantRegistry extends DurableObject {
     revision: IntegrationRevision,
     credential: CredentialReference,
   ): IntegrationMetadata | undefined {
+    this.assertCurrentEncryptionKey(credential);
+
     const integration = this.db
       .update(integrations)
       .set({
@@ -334,8 +602,8 @@ export class GrantRegistry extends DurableObject {
     return result;
   }
 
-  /** Active grants, newest first. Pass an owner to see only that issuer's grants. */
-  listGrants(owner?: string): GrantSummary[] {
+  /** Active grants, newest first. Pass a principal to limit results to the issuer and its policy. */
+  listGrants(principal?: Principal): GrantSummary[] {
     const now = Date.now();
 
     const names = new Map(
@@ -349,11 +617,7 @@ export class GrantRegistry extends DurableObject {
     return this.db
       .select()
       .from(grants)
-      .where(
-        owner === undefined
-          ? gt(grants.expiresAt, now)
-          : and(eq(grants.owner, owner), gt(grants.expiresAt, now)),
-      )
+      .where(and(gt(grants.expiresAt, now), principal && this.grantScope(principal)))
       .orderBy(desc(grants.createdAt), grants.id)
       .all()
       .map((grant) => summary(grant, names));
@@ -362,7 +626,7 @@ export class GrantRegistry extends DurableObject {
   /** Move an active grant's expiry to `expiresAt`, keeping its scope and token. */
   async renew(
     id: string,
-    owner: string,
+    principal: Principal,
     expiresAt: number,
     request: TripRequest,
   ): Promise<Renewal> {
@@ -371,7 +635,7 @@ export class GrantRegistry extends DurableObject {
     const renewed = this.db
       .update(grants)
       .set({ expiresAt })
-      .where(and(eq(grants.id, id), eq(grants.owner, owner), gt(grants.expiresAt, now)))
+      .where(and(eq(grants.id, id), this.grantScope(principal), gt(grants.expiresAt, now)))
       .returning()
       .get();
 
@@ -445,10 +709,10 @@ export class GrantRegistry extends DurableObject {
   }
 
   /** Revoke a grant. Naming a canary instead trips it. */
-  revoke(id: string, owner: string, request: TripRequest): Trip | undefined {
+  revoke(id: string, principal: Principal, request: TripRequest): Trip | undefined {
     const revoked = this.db
       .delete(grants)
-      .where(and(eq(grants.id, id), eq(grants.owner, owner)))
+      .where(and(eq(grants.id, id), this.grantScope(principal)))
       .returning({ id: grants.id })
       .get();
 
@@ -526,6 +790,7 @@ export class GrantRegistry extends DurableObject {
           ),
         },
         deliveries,
+        keyState: deliveries.length ? this.alertKeyState() : null,
       };
     });
   }
@@ -606,6 +871,9 @@ export class GrantRegistry extends DurableObject {
   }
 
   createDestination(record: DestinationRecord): "exists" | "limit" | DestinationSummary {
+    this.assertProvisioned();
+    this.assertCurrentEncryptionKey(record.config);
+
     return this.ctx.storage.transactionSync(() => {
       const existing = this.db
         .select({ id: alertDestinations.id })
@@ -639,8 +907,8 @@ export class GrantRegistry extends DurableObject {
   }
 
   /** A destination's sealed configuration, for a test delivery. */
-  destination(id: string): Omit<AlertDelivery, "trips" | "labels"> | undefined {
-    return this.db
+  destination(id: string) {
+    const destination = this.db
       .select({
         identity: alertDestinations.identity,
         id: alertDestinations.id,
@@ -650,6 +918,8 @@ export class GrantRegistry extends DurableObject {
       .from(alertDestinations)
       .where(eq(alertDestinations.id, id))
       .get();
+
+    return destination && { ...destination, keyState: this.alertKeyState() };
   }
 
   deleteDestination(id: string): void {
@@ -668,7 +938,7 @@ export class GrantRegistry extends DurableObject {
     hash: string,
     selector: IntegrationSelector,
     usesApiKeyHeader: boolean,
-    limits: RequestLimits,
+    deploymentLimits: RequestLimits | undefined,
     request: TripRequest,
   ): Authorization {
     const now = Date.now();
@@ -708,7 +978,16 @@ export class GrantRegistry extends DurableObject {
       if (usesApiKeyHeader && integration.kind !== "anthropic" && integration.kind !== "http")
         return { status: "invalid" };
 
-      const { requestsPerMinute, concurrentRequests } = requestLimit(integration, limits);
+      const hosted =
+        deploymentLimits === undefined ? this.db.select().from(tenant).get() : undefined;
+
+      if (deploymentLimits === undefined && !hosted) return { status: "invalid" };
+
+      const limits = hosted
+        ? tenantConfigFor(hosted.id).parse(hosted.config ?? {}).limits
+        : deploymentLimits;
+
+      const { requestsPerMinute, concurrentRequests } = requestLimit(integration, limits ?? {});
 
       const scope = { grantId: grant.id, identity: integration.identity };
       const window = Math.floor(now / minuteMs);
@@ -752,7 +1031,12 @@ export class GrantRegistry extends DurableObject {
         .values({ id: leaseId, ...scope, expiresAt: now + leaseTtlMs })
         .run();
 
-      return { status: "allowed", leaseId, traceparent: grant.traceparent, integration };
+      const keyState =
+        hosted && integration.credential.source === "encrypted-store"
+          ? this.readDataKeys(hosted.activeDataKey)
+          : null;
+
+      return { status: "allowed", leaseId, traceparent: grant.traceparent, integration, keyState };
     });
   }
 
@@ -781,6 +1065,24 @@ export class GrantRegistry extends DurableObject {
     if (next?.expire != null) await this.scheduleCleanup(Math.min(next.expire, now + leaseTtlMs));
   }
 
+  private grantScope(principal: Principal) {
+    const owner = eq(grants.owner, principal.owner);
+
+    if (principal.integrations === undefined) return owner;
+
+    const allowed = this.db
+      .select({ identity: integrations.identity })
+      .from(integrations)
+      .where(inArray(integrations.id, principal.integrations));
+
+    const outsidePolicy = notInArray(sql`value`, allowed);
+
+    return and(
+      owner,
+      sql`NOT EXISTS (SELECT 1 FROM json_each(${grants.permissions}) WHERE ${outsidePolicy})`,
+    );
+  }
+
   private findIntegration(id: string) {
     return this.db.select().from(integrations).where(eq(integrations.id, id)).get();
   }
@@ -799,6 +1101,21 @@ export class GrantRegistry extends DurableObject {
 
     if (current == null || at < current) await this.ctx.storage.setAlarm(at);
   }
+}
+
+type EnvelopeColumn =
+  | typeof integrations.credential
+  | typeof alertDestinations.config
+  | typeof dataKeys.wrapped;
+
+function needsRotation(column: EnvelopeColumn, active: string) {
+  return sql`json_extract(${column}, '$.source') = 'encrypted-store' AND json_extract(${column}, '$.keyVersion') IS NOT ${active}`;
+}
+
+function envelopeMatches(column: EnvelopeColumn, expected: EncryptedCredential) {
+  return sql`json_extract(${column}, '$.keyVersion') = ${expected.keyVersion}
+    AND json_extract(${column}, '$.nonce') = ${expected.nonce}
+    AND json_extract(${column}, '$.ciphertext') = ${expected.ciphertext}`;
 }
 
 function destinationSummary(row: typeof alertDestinations.$inferSelect): DestinationSummary {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { IntegrationKind } from "./integrations/types";
+import { tenantId, tenantRole } from "./tenants/identity";
 
 export const integrationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
@@ -73,12 +74,11 @@ export function requestLimit(
   };
 }
 
-const configuration = z.strictObject({
+const tenantConfiguration = z.strictObject({
   limits: z
     .record(integrationId, limitOverride)
     .refine((limits) => Object.keys(limits).length <= 100)
     .optional(),
-  workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),
   githubActions: z
     .strictObject({
       audience: z.string().min(1).max(256),
@@ -87,18 +87,68 @@ const configuration = z.strictObject({
     .optional(),
 });
 
+export type TenantConfig = z.infer<typeof tenantConfiguration>;
+
+export function tenantConfigFor(id: string) {
+  return tenantConfiguration.refine(
+    (config) => !config.githubActions || config.githubActions.audience === `beachside-broker:${id}`,
+  );
+}
+
+const httpsURL = z
+  .url({ protocol: /^https$/ })
+  .max(2048)
+  .refine((value) => {
+    const url = URL.parse(value);
+
+    return Boolean(url && !url.username && !url.password && !url.hash);
+  });
+
+const trustedIssuer = z.strictObject({
+  issuer: httpsURL,
+  jwksUri: httpsURL,
+  audience: z.string().min(1).max(256),
+  roles: z
+    .array(tenantRole)
+    .min(1)
+    .max(2)
+    .refine((roles) => new Set(roles).size === roles.length)
+    .default(["issuer"]),
+  tenant: tenantId.optional(),
+});
+
+export type TrustedIssuer = z.infer<typeof trustedIssuer>;
+
+const configuration = tenantConfiguration.extend({
+  workerSecretBindings: z.array(workerSecretBinding).max(100).default([]),
+  trustedIssuers: z
+    .array(trustedIssuer)
+    .max(4)
+    .refine((entries) => new Set(entries.map((entry) => entry.issuer)).size === entries.length)
+    .optional(),
+});
+
 export type BrokerConfig = z.infer<typeof configuration>;
 
-let cachedConfig: { raw: string; config: BrokerConfig } | undefined;
+let cachedConfig: { raw: string; hosted: boolean; config: BrokerConfig } | undefined;
 
-export function parseConfig(raw: string): BrokerConfig {
-  if (cachedConfig?.raw === raw) return cachedConfig.config;
+export class HostedIssuerConfigurationError extends Error {
+  constructor() {
+    super("Unpinned trusted issuers require BROKER_TENANT_DOMAIN");
+  }
+}
+
+export function parseConfig(raw: string, hosted = false): BrokerConfig {
+  if (cachedConfig?.raw === raw && cachedConfig.hosted === hosted) return cachedConfig.config;
 
   const result = configuration.safeParse(JSON.parse(raw));
 
   if (!result.success) throw new Error("Invalid broker configuration");
 
-  cachedConfig = { raw, config: result.data };
+  if (!hosted && result.data.trustedIssuers?.some(({ tenant }) => !tenant))
+    throw new HostedIssuerConfigurationError();
+
+  cachedConfig = { raw, hosted, config: result.data };
 
   return result.data;
 }

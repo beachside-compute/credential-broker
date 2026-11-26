@@ -26,27 +26,26 @@ const headerName = z
 
 const headerValue = z.string().regex(/^[\x20-\x7e]{1,4096}$/);
 
-const destinationUrl = z
-  .string()
-  .max(2048)
-  .transform((value, ctx) => {
-    const url = URL.parse(value);
+const storedDestinationUrl = z.string().transform((value, ctx) => {
+  const url = URL.parse(value);
 
-    if (
-      !url ||
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      url.hash ||
-      /^[0-9.]+$|^\[/.test(url.hostname)
-    ) {
-      ctx.addIssue({ code: "custom", message: "invalid destination URL" });
+  if (
+    !url ||
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    /^[0-9.]+$|^\[/.test(url.hostname)
+  ) {
+    ctx.addIssue({ code: "custom", message: "invalid destination URL" });
 
-      return z.NEVER;
-    }
+    return z.NEVER;
+  }
 
-    return url;
-  });
+  return url;
+});
+
+const destinationUrl = z.string().max(2048).pipe(storedDestinationUrl);
 
 const destinationId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 
@@ -76,9 +75,7 @@ export const destinationInput = z.union([urlDestination, emailDestination]);
 /** The sealed configuration's plaintext limit, enforced when it is created and opened. */
 export const maxDestinationConfigBytes = 16_384;
 
-type DestinationConfig =
-  | { url: string; headers: Record<string, string>; signingSecret?: string }
-  | { to: string };
+type DestinationConfig = z.input<typeof sealedDestinationConfig>;
 
 /** Email alerts go through the deployment's send_email binding from its configured sender. */
 export interface Mailer {
@@ -104,7 +101,44 @@ export async function sealDestination(
 ): Promise<EncryptedCredential | undefined> {
   const json = JSON.stringify(config);
 
-  if (encoder.encode(json).byteLength > maxDestinationConfigBytes) return;
+  if (
+    encoder.encode(json).byteLength > maxDestinationConfigBytes ||
+    !sealedDestinationConfig.safeParse(config).success
+  )
+    return;
+
+  return sealValue(json, sealContext(destination), keyring);
+}
+
+type SealedDestination = Pick<AlertDelivery, "identity" | "id" | "kind" | "config">;
+
+const sealedDestinationConfig = z.union([
+  z.strictObject({ to: z.email().max(254) }),
+  z.strictObject({
+    url: storedDestinationUrl,
+    headers: z
+      .record(headerName, headerValue)
+      .refine((headers) => Object.keys(headers).length <= 10),
+    signingSecret: z.string().startsWith("whsec_").optional(),
+  }),
+]);
+
+async function destinationPlaintext(destination: SealedDestination, keyring: EncryptionKeyring) {
+  return openValue(
+    destination.config,
+    sealContext(destination),
+    keyring,
+    maxDestinationConfigBytes,
+  );
+}
+
+export async function resealDestination(
+  destination: SealedDestination,
+  keyring: EncryptionKeyring,
+) {
+  const json = await destinationPlaintext(destination, keyring);
+
+  if (json === undefined) return;
 
   return sealValue(json, sealContext(destination), keyring);
 }
@@ -174,22 +208,22 @@ export function testEvent(host: string): AlertEvent {
 
 /** Send one alert. Returns the HTTP status (202 for accepted email), or 0 on failure. Never retries. */
 export async function deliver(
-  destination: Pick<AlertDelivery, "identity" | "id" | "kind" | "config">,
+  destination: SealedDestination,
   event: AlertEvent,
   keyring: EncryptionKeyring,
   mail?: Mailer,
+  allowsDestination?: (url: URL) => boolean,
 ): Promise<number> {
   try {
-    const json = await openValue(
-      destination.config,
-      sealContext(destination),
-      keyring,
-      maxDestinationConfigBytes,
-    );
+    const json = await destinationPlaintext(destination, keyring);
 
     if (json === undefined) return 0;
 
-    const config: DestinationConfig = JSON.parse(json);
+    const parsed = sealedDestinationConfig.safeParse(JSON.parse(json));
+
+    if (!parsed.success || "to" in parsed.data !== (destination.kind === "email")) return 0;
+
+    const config = parsed.data;
 
     if ("to" in config) {
       if (!mail) return 0;
@@ -203,6 +237,8 @@ export async function deliver(
 
       return 202;
     }
+
+    if (allowsDestination && !allowsDestination(config.url)) return 0;
 
     const body = JSON.stringify(destination.kind === "slack" ? slackMessage(event) : event);
 

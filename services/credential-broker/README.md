@@ -102,6 +102,85 @@ BEACHSIDE_BROKER_ADMIN_KEY="$(sed -n 's/^BROKER_ADMIN_KEY=//p' services/credenti
 
 Keys referenced from `.env.deploy` take precedence, so run this from a checkout without one, or use the installed `beachside-broker` command, which reads only the environment.
 
+## Hosted tenants
+
+A deployment with no `BROKER_TENANT_DOMAIN` serves just the built-in broker over HTTP. Its hostname, `grant-registry` object, role keys, and configuration stay in place. Apply the bundled Worker upgrade before enabling tenant access.
+
+Set a hostname suffix under a Cloudflare zone you control. Use a proxied wildcard DNS record, a TLS certificate for that wildcard, and a Workers Route. Continue to serve your existing broker hostname. For example, add this to `wrangler.local.jsonc` and keep every other broker hostname in `BROKER_HOST_ALIASES`, including your `workers.dev` hostname if enabled. The broker blocks hosted-tenant HTTP integrations and alert destinations from targeting these names or any tenant subdomain. Keep the list current when adding an alias. [Cloudflare Workers Routes](https://developers.cloudflare.com/workers/configuration/routing/routes/)
+
+```jsonc
+{
+  "routes": [
+    { "pattern": "broker.example.com", "custom_domain": true },
+    { "pattern": "*.broker.example.com/*", "zone_name": "example.com" },
+  ],
+  "workers_dev": false,
+  "vars": {
+    "BROKER_TENANT_DOMAIN": "broker.example.com",
+    "BROKER_HOST_ALIASES": "another-broker.example.com",
+  },
+}
+```
+
+The hosted control plane uses private Service Bindings to the same broker Worker. Bind the SaaS app to the `PlatformControl` entrypoint for `provision`, `list`, and `inspect`. Bind a separate trusted operator Worker to `PlatformOperator` for `setStatus`, `rotateRoleKey`, `rewrap`, `rotateDataKey`, `erase`, and `auditLog`. A platform binding grants the calling Worker all operations exported by that entrypoint. Provisioning requires a configured tenant domain. The audit log records provisioning and sensitive operations with tenant ID, operation, channel, timestamps, and outcome. Use `auditLog({ before, limit, tenant })` to page through retained records. A row marked `unconfirmed` has lacked an outcome for at least five minutes. Inspect the tenant before retrying that operation. Expected RPC refusals carry the same error code as HTTP in the exception message. The authenticated operator application can keep a separate audit trail for its individual human callers.
+
+```jsonc
+{
+  "services": [
+    {
+      "binding": "BROKER_CONTROL",
+      "service": "beachside-credential-broker",
+      "entrypoint": "PlatformControl",
+    },
+  ],
+}
+```
+
+### Optional platform HTTP API
+
+Private RPC works independently of the HTTP switch. Leave `BROKER_PLATFORM_HTTP_ENABLED` unset for RPC-only operation. To enable the API, set it to the string `"true"` in Wrangler vars. On an existing Worker, `bun run deploy:setup --platform-key-only` creates any missing HTTP keys over Wrangler's standard input and prints each once. The routine `BROKER_PLATFORM_KEY` authorizes provisioning, listing, and inspection. `BROKER_PLATFORM_OPERATOR_KEY` authorizes status changes, role-key rotation, rewrap, data-key rotation, and deletion. Plain `bun run deploy` omits both secrets.
+
+The API returns new role keys once and exposes tenant status and counts. It keeps stored upstream credentials and tenant data keys private.
+
+| Platform route                                    | Behaviour                                                                                                                                                                                                        |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/platform/tenants`                       | Creates a tenant with a caller-chosen lowercase alphanumeric ID of 8–32 characters. Returns `id`, `adminKey` and `issuerKey`. Retry a tenant in `provisioning`. Active, suspended, and deleted IDs are reserved. |
+| `GET /v1/platform/tenants`                        | Lists tenant IDs, statuses, and timestamps. Pass `limit` and then `after` with the returned `next` cursor.                                                                                                       |
+| `GET /v1/platform/tenants/:id`                    | Reads the lifecycle state and counts when the registry is available.                                                                                                                                             |
+| `PATCH /v1/platform/tenants/:id`                  | Sets `status` to `active` or `suspended`. Allow up to 30 seconds for cached lookups to expire.                                                                                                                   |
+| `POST /v1/platform/tenants/:id/keys/:role/rotate` | Replaces an `admin` or `issuer` key. Returns the replacement once and invalidates the old key.                                                                                                                   |
+| `POST /v1/platform/tenants/:id/rewrap`            | Re-encrypts the tenant's data key under the active root key.                                                                                                                                                     |
+| `POST /v1/platform/tenants/:id/data-key/rotate`   | Rotates the tenant data key, reseals its credentials and alert configurations, and returns the active key version. Retry to resume an incomplete rotation.                                                       |
+| `DELETE /v1/platform/tenants/:id`                 | Suspends access, erases tenant data, and keeps a tombstone for the ID. Safe to retry.                                                                                                                            |
+
+Use `https://<id>.broker.example.com` as the tenant's broker URL in the client, Git remotes, and gateways. Tenant role keys work only on that hostname. Sandbox grants keep the existing `bsg_<64 hex>` format. Hosted canaries trip on their own hostname on proxy, management, and enabled platform HTTP routes. Tenant admins use `PUT /v1/admin/config` or the admin client's `setConfig` to replace the stored `githubActions` policy and per-grant `limits`. GitHub Actions tokens must have the exact audience `beachside-broker:<id>` and go to the matching tenant hostname. Hosted tenants can use encrypted-store integrations and Slack or webhook alert destinations.
+
+For root key rotation, keep the old root in `BROKER_ENCRYPTION_KEYS` while you add the replacement and set `BROKER_ENCRYPTION_KEY_VERSION` to make it active. Call `rewrap` for each active or suspended tenant and verify success before retiring the old root. Rewrap preserves the tenant data key, so existing tenant integration ciphertext and grants remain usable. The built-in broker's ciphertext is encrypted directly with the root keyring. Keep old root versions until those integrations and alert destinations have also been rotated or recreated.
+
+To replace a tenant's data key, call `PlatformOperator.rotateDataKey({ id })`, or the optional HTTP rotation route with the operator credential. The registry makes the new version active before resealing existing records. Reads can use the previous key while it is still needed. The operation retires the previous key after no stored envelopes reference it. To safely retry after a lost response, provide the original key version as `expectedKeyVersion`. Repeating the request with that version resumes an active rotation or returns its completed result. A request without an expected version starts a new rotation if the previous one already completed. A `tenant_ciphertext_unavailable` error identifies the affected integration or alert destination by kind and ID. Repair or remove that record before retrying. The previous key stays available until every remaining record is resealed. If key exposure may have exposed upstream credentials, also rotate those credentials at their providers.
+
+## Trusted token issuers
+
+An operator can configure up to four issuers in deployment `BROKER_CONFIG.trustedIssuers`. Each entry sets the exact issuer, HTTPS JWKS URI and audience, and the roles it may sign. Set the audience to the broker origin for a pinned issuer or to `https://<BROKER_TENANT_DOMAIN>` for hosted issuers. Roles default to `["issuer"]`.
+
+```json
+{
+  "trustedIssuers": [
+    {
+      "issuer": "https://api.example.com",
+      "jwksUri": "https://api.example.com/.well-known/jwks.json",
+      "audience": "https://gateway.example.com",
+      "roles": ["issuer"],
+      "tenant": "k3j9x2m4p7q1"
+    }
+  ]
+}
+```
+
+A pinned entry accepts only its configured org's `tenant` claim on the built-in broker. This works with the default hostname and without a platform key. An unpinned entry requires `BROKER_TENANT_DOMAIN`. Granting it `admin` lets that issuer administer every hosted tenant. Send the bearer token to the tenant subdomain named in its signed `tenant` claim.
+
+Sign tokens with ES256 and include `iss`, `aud` as a string, `sub`, `iat`, `exp`, `tenant`, and `role`. The broker rejects expired tokens and tokens issued more than 600 seconds ago. Subjects must be 1–128 printable ASCII characters. Use a stable, distinct subject per agent so it can list, renew, and revoke its own grants. Each issuer has its own subject namespace. The optional integration scope also applies to listing, renewal, and revocation. An issuer token may include an `integrations` array to narrow its permissions further. Present the JWT as an `Authorization: Bearer` credential to the matching admin or issuance API. The admin config endpoint reports applicable issuers and roles.
+
 ## Manage integrations
 
 From the deployment checkout, open the integration setup wizard. Choose OpenRouter, keep the ID `openrouter`, and enter its upstream API key when prompted. The command runs the management CLI with the URL and the admin key referenced from `.env.deploy`, and lets the issuer mint grants for the new integration unless you pass `--no-allow-issue`.
@@ -406,4 +485,4 @@ Any sandbox workload or provider infrastructure able to read a grant can use it 
 
 ## Validate locally
 
-Run `bun run test` from the repository root. The suite uses Node.js 22 or later to run workerd on loopback with fixture upstreams. It uses local Git and GitHub CLI and creates a temporary loopback certificate with OpenSSL. They run without Cloudflare credentials or upstream API accounts.
+Run `bun run test` from the repository root. The suite uses Node.js 22 or later to run workerd on loopback with fixture upstreams. It uses local Git and GitHub CLI and creates a temporary loopback certificate with OpenSSL. They run without Cloudflare credentials or upstream API accounts. The hosted-tenant fixture uses its own directory binding, synthetic tenant hostnames, and fixture upstreams to exercise isolation, lifecycle operations, and the unchanged sandbox token format. Generate directory schema changes with `bun run --cwd services/credential-broker db:generate --config drizzle.directory.config.ts --name your_change`.

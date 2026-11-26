@@ -7,9 +7,15 @@
   // Every version would otherwise get its own public URL sharing the keys and the registry.
   "preview_urls": false,
   "durable_objects": {
-    "bindings": [{ "name": "REGISTRY", "class_name": "GrantRegistry" }],
+    "bindings": [
+      { "name": "REGISTRY", "class_name": "GrantRegistry" },
+      { "name": "DIRECTORY", "class_name": "TenantDirectory" },
+    ],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrantRegistry"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GrantRegistry"] },
+    { "tag": "v2", "new_sqlite_classes": ["TenantDirectory"] },
+  ],
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
   // Native logs and fetch traces can include full request URLs.
   "observability": {

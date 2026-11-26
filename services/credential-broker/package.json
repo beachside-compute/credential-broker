@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "check": "tsc -p tsconfig.json",
-    "test": "bun build ./test/runtime.node.ts ./test/tracing.node.ts --target=node --format=esm --packages=external --outdir=dist/test && node --test ./dist/test/runtime.node.js ./dist/test/tracing.node.js",
+    "test": "bun build ./test/runtime.node.ts ./test/tracing.node.ts ./test/tenants.node.ts --target=node --format=esm --packages=external --outdir=dist/test && node --test ./dist/test/runtime.node.js ./dist/test/tracing.node.js ./dist/test/tenants.node.js",
     "db:generate": "drizzle-kit generate",
     "deploy:wrangler": "wrangler deploy",
     "dev": "wrangler dev --local"

@@ -67,7 +67,7 @@ export function refusalMessage(reason: IssuanceRefusal, ids: readonly string[]):
     case "not_allowlisted":
       return `Integration${plural ? "s" : ""} ${names} ${plural ? "are" : "is"} not allowed to issue grants. Allow ${plural ? "them" : "it"} with \`${hint(`issuer allow ${ids.join(" ")}`)}\``;
     case "not_in_policy":
-      return `This GitHub Actions workflow's broker policy does not include ${names}. Add ${plural ? "them" : "it"} to the workflow's integrations in BROKER_CONFIG and redeploy`;
+      return `This issuer's broker policy does not include ${names}. Add ${plural ? "them" : "it"} to the configured issuer policy`;
   }
 }
 

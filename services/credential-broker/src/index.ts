@@ -2,8 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { z } from "zod";
 import { grantIdPattern, newGrantToken, tokenHash } from "./grants/tokens";
-import { administrator, orchestrator } from "./auth";
-import { apiVersion, grantLabel, integrationId, maxGrantTtlSeconds, parseConfig } from "./config";
+import { apiVersion, grantLabel, integrationId, maxGrantTtlSeconds } from "./config";
 import type { ResolvedCredential } from "./credentials/source";
 import { workerSecretSource } from "./credentials/sources/worker-secret";
 import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
@@ -11,13 +10,22 @@ import { failure, upstream, withCompletion } from "./proxy/forward";
 import { GrantRegistry, leaseTtlMs } from "./grants/registry";
 import { grantView } from "./grants/view";
 import { route, sandboxToken, upstreamRoute } from "./proxy/routes";
-import { managementKeyring, privateJson, privateNoContent, readJson, registry } from "./http";
+import { privateJson, privateNoContent, readJson } from "./http";
 import type { Worker } from "./http";
 import { adminRoutes } from "./integrations/admin";
 import type { IntegrationSelector } from "./integrations/types";
 import { finishSpan, grantOrigin, parseTraceparent, startSpan } from "./observability/tracing";
 import { alertOnTrip, tripRoleKey } from "./canaries/admin";
 import { tripRequest } from "./canaries/alerts";
+import type { Tenant } from "./tenants/tenant";
+import { resolveTenant } from "./tenants/resolve";
+import { defaultTenant } from "./tenants/identity";
+import { isBrokerHost } from "./tenants/hosts";
+import { platformRoutes } from "./tenants/platform";
+
+export { PlatformControl, PlatformOperator } from "./tenants/platform-rpc";
+
+export { TenantDirectory } from "./tenants/directory";
 
 export { GrantRegistry };
 
@@ -37,11 +45,13 @@ const renewRequest = z.strictObject({ ttlSeconds });
  */
 async function traced(
   context: Context<Worker>,
+  tenant: Tenant,
   operation: "grant.list" | "grant.renew" | "status",
   work: () => Promise<Response>,
 ): Promise<Response> {
   const span = startSpan(
     context.env,
+    tenant.id,
     (task) => context.executionCtx.waitUntil(task),
     operation,
     parseTraceparent(context.req.header("traceparent") ?? null),
@@ -61,27 +71,37 @@ async function traced(
 
 const app = new Hono<Worker>();
 
-app.onError(() => failure(503, "broker_unavailable"));
+app.onError((error) =>
+  error.message === "tenant_key_changed"
+    ? failure(409, "tenant_key_changed")
+    : failure(503, "broker_unavailable"),
+);
 
 app.route("/v1/admin", adminRoutes);
 
+app.route("/v1/platform", platformRoutes);
+
 app.post("/v1/grants", async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const request = context.req.raw;
-  const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
+  const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  managementKeyring(context.env);
+  await tenant.keyring();
 
   const parent = parseTraceparent(request.headers.get("traceparent"));
 
   const span = startSpan(
     context.env,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "grant.create",
     parent,
@@ -107,7 +127,7 @@ app.post("/v1/grants", async (context) => {
     const id = crypto.randomUUID();
     const expiresAt = Date.now() + ttlSeconds * 1_000;
 
-    const result = await registry(context.env).create(
+    const result = await tenant.store.create(
       {
         id,
         hash: await tokenHash(token),
@@ -159,83 +179,94 @@ app.post("/v1/grants", async (context) => {
 });
 
 app.get("/v1/status", async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "authentication_required");
+
   const request = context.req.raw;
   const limits = { maxGrantTtlSeconds };
 
-  if (await administrator(request, context.env.BROKER_ADMIN_KEY)) {
-    managementKeyring(context.env);
+  await tenant.config();
 
-    return traced(context, "status", async () =>
+  if (await tenant.administrator(request)) {
+    await tenant.keyring();
+
+    return traced(context, tenant, "status", async () =>
       privateJson({
         apiVersion,
         role: "admin",
         limits,
-        counts: await registry(context.env).counts(),
+        counts: await tenant.store.counts(),
       }),
     );
   }
 
-  const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
+  const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "authentication_required");
   }
 
-  return traced(context, "status", async () =>
+  return traced(context, tenant, "status", async () =>
     privateJson({
       apiVersion,
-      role: principal.owner === "broker-api-key" ? "issuer" : "github-actions",
+      role: principal.kind === "github" ? "github-actions" : "issuer",
       limits,
     }),
   );
 });
 
 app.get("/v1/grants", async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
-  const principal = await orchestrator(context.req.raw, config, context.env.BROKER_ISSUER_KEY);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
+  const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  return traced(context, "grant.list", async () => {
-    const grants = await registry(context.env).listGrants(principal.owner);
+  return traced(context, tenant, "grant.list", async () => {
+    const grants = await tenant.store.listGrants(principal);
 
     return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
   });
 });
 
 app.post("/v1/grants/:id/renew", async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
   const request = context.req.raw;
-  const principal = await orchestrator(request, config, context.env.BROKER_ISSUER_KEY);
+  const principal = await tenant.orchestrator(request);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  return traced(context, "grant.renew", async () => {
+  return traced(context, tenant, "grant.renew", async () => {
     const id = context.req.param("id");
     const input = renewRequest.safeParse(await readJson(request, 1_024));
 
     if (!grantIdPattern.test(id) || !input.success) return failure(400, "invalid_grant_request");
 
-    const result = await registry(context.env).renew(
+    const result = await tenant.store.renew(
       id,
-      principal.owner,
+      principal,
       Date.now() + input.data.ttlSeconds * 1_000,
       tripRequest(request, "renew"),
     );
 
     if (result.status === "not_found") {
-      alertOnTrip(context, result.trip);
+      alertOnTrip(context, tenant, result.trip);
 
       return failure(404, "grant_not_found");
     }
@@ -245,21 +276,25 @@ app.post("/v1/grants/:id/renew", async (context) => {
 });
 
 app.delete("/v1/grants/:id", async (context) => {
-  const config = parseConfig(context.env.BROKER_CONFIG ?? "{}");
-  const principal = await orchestrator(context.req.raw, config, context.env.BROKER_ISSUER_KEY);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "orchestrator_authentication_required");
+
+  const principal = await tenant.orchestrator(context.req.raw);
 
   if (!principal) {
-    await tripRoleKey(context, "issuer-auth");
+    await tripRoleKey(context, tenant, "issuer-auth");
 
     return failure(401, "orchestrator_authentication_required");
   }
 
-  managementKeyring(context.env);
+  await tenant.keyring();
 
   const parent = parseTraceparent(context.req.header("traceparent") ?? null);
 
   const span = startSpan(
     context.env,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "grant.revoke",
     parent,
@@ -278,11 +313,8 @@ app.delete("/v1/grants/:id", async (context) => {
 
     alertOnTrip(
       context,
-      await registry(context.env).revoke(
-        id,
-        principal.owner,
-        tripRequest(context.req.raw, "revoke"),
-      ),
+      tenant,
+      await tenant.store.revoke(id, principal, tripRequest(context.req.raw, "revoke")),
     );
     status = 204;
 
@@ -304,7 +336,11 @@ app.all("*", async (context) => {
 
   if (!token) return failure(401, "grant_authentication_required", isGit);
 
-  const store = registry(context.env);
+  const tenant = await resolveTenant(context);
+
+  if (!tenant) return failure(401, "grant_invalid", isGit);
+
+  const store = tenant.store;
 
   const selector: IntegrationSelector =
     incoming.type === "gateway" ? { type: "gateway", id: incoming.id } : { type: "github" };
@@ -313,7 +349,7 @@ app.all("*", async (context) => {
     await tokenHash(token),
     selector,
     request.headers.has("x-api-key"),
-    parseConfig(context.env.BROKER_CONFIG ?? "{}").limits ?? {},
+    tenant.id === defaultTenant ? ((await tenant.config()).limits ?? {}) : undefined,
     tripRequest(
       request,
       incoming.type === "gateway" ? "gateway" : incoming.type === "git" ? "git" : "github-api",
@@ -323,7 +359,7 @@ app.all("*", async (context) => {
   );
 
   if (authorized.status === "invalid") {
-    alertOnTrip(context, authorized.trip);
+    alertOnTrip(context, tenant, authorized.trip);
 
     return failure(401, "grant_invalid", isGit);
   }
@@ -336,6 +372,7 @@ app.all("*", async (context) => {
 
   const span = startSpan(
     context.env,
+    tenant.id,
     (work) => context.executionCtx.waitUntil(work),
     "gateway",
     undefined,
@@ -362,7 +399,8 @@ app.all("*", async (context) => {
 
   const blockedEndpoint =
     target?.type === "http" &&
-    (request.headers.has("upgrade") ||
+    ((tenant.id !== defaultTenant && isBrokerHost(context.env, request.url, target.url)) ||
+      request.headers.has("upgrade") ||
       path === undefined ||
       path.includes(token) ||
       [...requestUrl.searchParams].some(
@@ -385,7 +423,7 @@ app.all("*", async (context) => {
         const values = await openEndpointValues(
           reference,
           integration,
-          managementKeyring(context.env),
+          await tenant.keyring(authorized.keyState),
         );
 
         if (values) credential = { values };
@@ -393,10 +431,13 @@ app.all("*", async (context) => {
     } else {
       credential =
         reference.source === "worker-secret"
-          ? await workerSecretSource(context.env).resolve(reference)
-          : await encryptedStoreSource(integration, managementKeyring(context.env)).resolve(
-              reference,
-            );
+          ? tenant.id === defaultTenant
+            ? await workerSecretSource(context.env).resolve(reference)
+            : undefined
+          : await encryptedStoreSource(
+              integration,
+              await tenant.keyring(authorized.keyState),
+            ).resolve(reference);
     }
   } catch {
     complete(503);

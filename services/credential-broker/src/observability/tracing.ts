@@ -36,7 +36,8 @@ export type AdminOperation =
   | "admin.issuer_permissions.read"
   | "admin.issuer_permissions.update"
   | "admin.grant.list"
-  | "admin.config.read";
+  | "admin.config.read"
+  | "admin.config.update";
 
 type Operation =
   | "grant.create"
@@ -49,6 +50,7 @@ type Operation =
 
 export function startSpan(
   env: TraceExportBindings,
+  tenant: string,
   waitUntil: (work: Promise<void>) => void,
   operation: Operation,
   parent?: SpanContext,
@@ -79,13 +81,15 @@ export function startSpan(
       ],
     });
 
-    return provider
-      .getTracer(scope, "0.0.0")
-      .startSpan(
-        `beachside.broker.${operation}`,
-        { kind: SpanKind.SERVER, links: origin ? [{ context: origin }] : [] },
-        parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT,
-      );
+    return provider.getTracer(scope, "0.0.0").startSpan(
+      `beachside.broker.${operation}`,
+      {
+        kind: SpanKind.SERVER,
+        attributes: { "beachside.broker.tenant": tenant },
+        links: origin ? [{ context: origin }] : [],
+      },
+      parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT,
+    );
   } catch {
     return;
   }

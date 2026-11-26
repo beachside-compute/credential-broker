@@ -1,0 +1,1 @@
+ALTER TABLE `tenant` ADD `active_data_key` text DEFAULT 't1' NOT NULL;

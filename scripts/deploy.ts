@@ -7,12 +7,17 @@ import {
   loadDeploymentFile,
   plaintextKeys,
   plaintextWarning,
+  randomKey,
   saveBrokerURL,
   setupError,
 } from "./deployment-file";
 import { isSecretReference, resolveSecret } from "../src/secret-ref.js";
 import { CredentialBrokerError } from "../src/transport.js";
-import { parseConfig } from "../services/credential-broker/src/config";
+import { brokerHosts, wranglerHostConfig } from "../services/credential-broker/src/tenants/hosts";
+import {
+  HostedIssuerConfigurationError,
+  parseConfig,
+} from "../services/credential-broker/src/config";
 import { credentialValue } from "../services/credential-broker/src/credentials/source";
 import {
   traceAuthorization,
@@ -76,6 +81,14 @@ async function withDeployConfig<T>(
     return setupError(`Could not parse services/credential-broker/${localConfig}`);
   }
 
+  try {
+    brokerHosts(wranglerHostConfig.parse(config).vars ?? {});
+  } catch {
+    return setupError(
+      "Invalid BROKER_TENANT_DOMAIN, BROKER_HOST_ALIASES, or BROKER_PLATFORM_HTTP_ENABLED",
+    );
+  }
+
   const owned = repositoryOwnedKeys.filter((key) => key in overrides);
 
   if (owned.length) {
@@ -104,13 +117,36 @@ async function withDeployConfig<T>(
   }
 }
 
+function deploymentBrokerConfig(raw: string) {
+  const service = resolve(repository, servicePath);
+  const local = resolve(service, localConfig);
+  const tracked = resolve(service, "wrangler.jsonc");
+
+  try {
+    const config = {
+      ...(existsSync(tracked) && readConfig(tracked)),
+      ...(existsSync(local) && readConfig(local)),
+    };
+
+    return parseConfig(
+      raw,
+      Boolean(brokerHosts(wranglerHostConfig.parse(config).vars ?? {}).domain),
+    );
+  } catch (error) {
+    if (error instanceof HostedIssuerConfigurationError) return setupError(error.message);
+
+    return setupError("Invalid broker policy or hostname configuration");
+  }
+}
+
 /** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
 async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
   const deployment = new Map<string, string>();
   const read = (name: string) => resolveSecret(env[name]!, name, env);
 
+  const config = deploymentBrokerConfig(env.BROKER_CONFIG ?? "{}");
+
   try {
-    const config = parseConfig(env.BROKER_CONFIG ?? "{}");
     deployment.set("BROKER_CONFIG", JSON.stringify(config));
 
     for (const name of config.workerSecretBindings) {
@@ -149,6 +185,7 @@ async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, st
 interface Run {
   /** Sees stdout and stderr as they are forwarded. */
   watch?: (text: string) => void;
+  stdin?: Blob;
   /** Captures stdout and stderr instead of forwarding them. */
   capture?: boolean;
 }
@@ -156,14 +193,14 @@ interface Run {
 async function runCommand(
   env: NodeJS.ProcessEnv,
   args: string[],
-  { watch, capture }: Run = {},
+  { watch, capture, stdin }: Run = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const piped = Boolean(watch || capture);
 
   const child = Bun.spawn([process.execPath, "run", ...args], {
     cwd: resolve(repository, servicePath),
     env,
-    stdin: capture ? "ignore" : "inherit",
+    stdin: stdin ?? (capture ? "ignore" : "inherit"),
     stdout: piped ? "pipe" : "inherit",
     stderr: piped ? "pipe" : "inherit",
   });
@@ -411,6 +448,55 @@ async function setup(
   return 0;
 }
 
+async function setupPlatformKey(
+  inherited: NodeJS.ProcessEnv,
+  settings: NodeJS.ProcessEnv,
+  printAnyway: boolean,
+): Promise<number> {
+  if (!printAnyway && !process.stdout.isTTY)
+    return setupError(
+      "Setup prints each new platform key once. Run it in a terminal or pass --print-keys",
+    );
+
+  const env = wranglerEnvironment(inherited, settings);
+  const existing = await workerSecretNames(env);
+
+  if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
+    return setupError("Run bun run deploy:setup before setting up the platform key");
+
+  const names = ["BROKER_PLATFORM_KEY", "BROKER_PLATFORM_OPERATOR_KEY"].filter(
+    (name) => !existing.has(name),
+  );
+
+  if (!names.length)
+    return setupError("The Worker already has both platform keys. Setup never replaces role keys");
+
+  return withDeployConfig(undefined, async (config) => {
+    for (const [index, name] of names.entries()) {
+      const key = randomKey();
+
+      const { code } = await runCommand(env, ["wrangler", "secret", "put", name, ...config], {
+        stdin: new Blob([key]),
+      });
+
+      if (code !== 0) {
+        const remaining = names.slice(index).join(", ");
+        console.error(
+          `Platform key setup stopped. Retry to check the Worker and create missing keys: ${remaining}`,
+        );
+
+        return code;
+      }
+
+      console.info(`Save this key in your password manager now. It cannot be read back.
+
+  ${name}=${key}`);
+    }
+
+    return 0;
+  });
+}
+
 async function deploy() {
   const args = process.argv.slice(2);
   const setupOnly = args[0] === "--setup-only";
@@ -422,8 +508,11 @@ async function deploy() {
       .code;
 
   if (args.length === 1 && args[0] === "--dry-run") {
+    const settings = { ...inherited, ...loadDeploymentFile(envPath) };
+    deploymentBrokerConfig(settings.BROKER_CONFIG ?? "{}");
+
     return withDeployConfig(
-      emailSender({ ...inherited, ...loadDeploymentFile(envPath) }),
+      emailSender(settings),
       async (config) =>
         (
           await runCommand(wranglerEnvironment(inherited, {}), [
@@ -445,27 +534,29 @@ async function deploy() {
   if (setupOnly) {
     const options = args.slice(1);
 
-    if (options.some((option) => option !== "--print-keys"))
-      return setupError("bun run deploy:setup takes only --print-keys");
+    if (options.some((option) => !["--print-keys", "--platform-key-only"].includes(option)))
+      return setupError("bun run deploy:setup accepts --print-keys and --platform-key-only");
 
-    return setup(envPath, inherited, file, settings, options.length > 0);
+    const printAnyway = options.includes("--print-keys");
+
+    return options.includes("--platform-key-only")
+      ? setupPlatformKey(inherited, settings, printAnyway)
+      : setup(envPath, inherited, file, settings, printAnyway);
   }
 
   const plaintext = plaintextKeys(file);
 
   if (plaintext.length) console.warn(`${plaintextWarning(plaintext)} Deploys never upload keys.`);
-  const secrets = await settingSecrets(settings);
   const env = wranglerEnvironment(inherited, settings);
   const dryRun = args.includes("--dry-run");
+  const existing = dryRun ? undefined : await workerSecretNames(env);
 
-  if (!dryRun) {
-    const existing = await workerSecretNames(env);
+  if (existing && (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS")))
+    return setupError(
+      "This Worker has no broker keys yet. Create the broker with bun run deploy:setup first",
+    );
 
-    if (!existing.has("BROKER_ADMIN_KEY") || !existing.has("BROKER_ENCRYPTION_KEYS"))
-      return setupError(
-        "This Worker has no broker keys yet. Create the broker with bun run deploy:setup first",
-      );
-  }
+  const secrets = await settingSecrets(settings);
 
   const { code, url } = await deployWrangler(env, secrets, args, settings.BEACHSIDE_BROKER_URL);
 

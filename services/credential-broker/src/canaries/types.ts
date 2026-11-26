@@ -1,4 +1,5 @@
 import type { EncryptedCredential } from "../credentials/source";
+import type { TenantKeyState } from "../grants/registry";
 import type { AlertKind } from "./schema";
 
 /** What the broker saw of a request that presented a canary. Values are display strings. */
@@ -30,6 +31,7 @@ export type AlertEvent = Readonly<Record<string, string>>;
 export interface Trip {
   event: AlertEvent;
   deliveries: AlertDelivery[];
+  keyState: TenantKeyState | null;
 }
 
 export interface CanarySummary {

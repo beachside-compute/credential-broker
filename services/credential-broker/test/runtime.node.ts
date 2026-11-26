@@ -24,7 +24,7 @@ import {
   CredentialBrokerError,
 } from "../../../src/index";
 import { requireApiKey } from "../../../src/transport";
-import { assertSeparateRoleKeys } from "../src/auth";
+import { assertSeparateRoleKeys } from "../src/tenants/role-keys";
 import { isBrokerApiKey, matchesKey } from "../src/auth/api-key";
 import { parseConfig } from "../src/config";
 import {
@@ -1168,7 +1168,7 @@ test(
       });
 
       assert.deepEqual(await storage.exec("SELECT COUNT(*) AS count FROM __drizzle_migrations"), [
-        { count: 6 },
+        { count: 8 },
       ]);
 
       const path = "/gateway/openai/v1/models";

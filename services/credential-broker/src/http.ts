@@ -1,31 +1,17 @@
-import { assertSeparateRoleKeys } from "./auth";
-import type { RoleBindings } from "./auth";
-import { encryptionKeyring } from "./credentials/sources/encrypted-store";
 import type { EncryptionBindings } from "./credentials/sources/encrypted-store";
 import type { WorkerSecretBindings } from "./credentials/sources/worker-secret";
-import type { GrantRegistry } from "./grants/registry";
 import type { TraceExportBindings } from "./observability/otlp";
 
-interface Env extends TraceExportBindings, WorkerSecretBindings, RoleBindings, EncryptionBindings {
-  BROKER_CONFIG?: string;
+import type { Tenant, TenantBindings } from "./tenants/tenant";
+
+export interface Env
+  extends TraceExportBindings, WorkerSecretBindings, TenantBindings, EncryptionBindings {
   /** Present only when the deployment sets BROKER_EMAIL_FROM. */
   EMAIL?: SendEmail;
   BROKER_EMAIL_FROM?: string;
-  REGISTRY: DurableObjectNamespace<GrantRegistry>;
 }
 
-export type Worker = { Bindings: Env };
-
-export function registry(env: Env) {
-  return env.REGISTRY.getByName("grant-registry");
-}
-
-export function managementKeyring(env: Env) {
-  const keyring = encryptionKeyring(env);
-  assertSeparateRoleKeys(env, keyring.keys.values());
-
-  return keyring;
-}
+export type Worker = { Bindings: Env; Variables: { tenant: Tenant } };
 
 export function privateJson<Value>(value: Value, status = 200): Response {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });

@@ -66,6 +66,16 @@ function provisionStub(root: string) {
     import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
     const [command, ...args] = process.argv.slice(2);
     if (command === "secret") {
+      if (args[0] === "put") {
+        if (process.env.FAILED_SECRET_PUT === args[1]) process.exit(3);
+        const key = readFileSync(0, "utf8");
+        appendFileSync("calls.jsonl", JSON.stringify({
+          command, name: args[1], validKey: /^[A-Za-z0-9_-]{43}$/.test(key),
+          fromEnvironment: Boolean(process.env.BROKER_PLATFORM_KEY || process.env.BROKER_PLATFORM_OPERATOR_KEY),
+          usedFile: args.includes("--secrets-file"),
+        }) + "\\n");
+        process.exit(0);
+      }
       const config = args.includes("--config") ? JSON.parse(readFileSync(args[args.indexOf("--config") + 1], "utf8")) : {};
       if (process.env.SECRET_LIST_NAME && config.name !== process.env.SECRET_LIST_NAME) process.exit(1);
       if (process.env.SECRET_LIST_ERROR) {
@@ -182,6 +192,94 @@ test("setup deploys fresh keys once, prints the role keys and saves only the URL
     expect(unreadable.code).toBe(1);
     expect(unreadable.stderr).toContain("Could not read the Worker's secrets");
     expect(calls(service)).toHaveLength(1);
+  }));
+
+test("HTTP platform setup uploads independent keys only over standard input", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    const setup = [...command, "--setup-only", "--platform-key-only", "--print-keys"];
+    const env = { WORKER_SECRETS: deployed, BROKER_PLATFORM_KEY: "fixture-derived-key" };
+    const run = spawn(setup, env);
+
+    expect(run.code, run.stderr).toBe(0);
+    const issued = run.stdout.match(/BROKER_PLATFORM(?:_OPERATOR)?_KEY=[A-Za-z0-9_-]{43}/g) ?? [];
+    expect(new Set(issued.map((line) => line.split("=")[1])).size).toBe(2);
+    expect(existsSync(join(root, ".env.deploy"))).toBe(false);
+
+    const updated = {
+      ...env,
+      WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY,BROKER_PLATFORM_OPERATOR_KEY",
+    };
+
+    expect(spawn(setup, updated).code).toBe(1);
+    expect(spawn(command, updated).code).toBe(0);
+
+    const [setupCall, operatorCall, deployCall] = calls(service);
+    expect(setupCall).toEqual({
+      command: "secret",
+      name: "BROKER_PLATFORM_KEY",
+      validKey: true,
+      fromEnvironment: false,
+      usedFile: false,
+    });
+    expect(operatorCall).toEqual({ ...setupCall, name: "BROKER_PLATFORM_OPERATOR_KEY" });
+    expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_KEY");
+    expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_OPERATOR_KEY");
+  }));
+
+test("platform key setup resumes a partial upload without replacing the first key", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+    const setup = [...command, "--setup-only", "--platform-key-only", "--print-keys"];
+
+    const initial = spawn(setup, {
+      WORKER_SECRETS: deployed,
+      FAILED_SECRET_PUT: "BROKER_PLATFORM_OPERATOR_KEY",
+    });
+
+    expect(initial.code).toBe(3);
+    expect(initial.stdout).toMatch(/BROKER_PLATFORM_KEY=[A-Za-z0-9_-]{43}/);
+    expect(initial.stderr).toContain("BROKER_PLATFORM_OPERATOR_KEY");
+
+    const retry = spawn(setup, { WORKER_SECRETS: deployed + ",BROKER_PLATFORM_KEY" });
+    expect(retry.code).toBe(0);
+    expect(calls(service).map(({ name }) => name)).toEqual([
+      "BROKER_PLATFORM_KEY",
+      "BROKER_PLATFORM_OPERATOR_KEY",
+    ]);
+  }));
+
+test("setup and dry run agree on whether unpinned trusted issuers are enabled", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+
+    const env = {
+      BROKER_CONFIG: JSON.stringify({
+        trustedIssuers: [
+          {
+            issuer: "https://issuer.example.org",
+            jwksUri: "https://issuer.example.org/jwks",
+            audience: "https://broker.example.org",
+          },
+        ],
+      }),
+    };
+
+    const setup = [...command, "--setup-only", "--print-keys"];
+    const dryRun = [...command, "--dry-run"];
+
+    expect(spawn(setup, env).stderr).toContain("require BROKER_TENANT_DOMAIN");
+    expect(spawn(dryRun, env).stderr).toContain("require BROKER_TENANT_DOMAIN");
+
+    writeFileSync(
+      join(service, "wrangler.jsonc"),
+      JSON.stringify({
+        vars: { BROKER_TENANT_DOMAIN: "broker.example.org" },
+      }),
+    );
+
+    expect(spawn(dryRun, env).code).toBe(0);
+    expect(spawn(setup, env).code).toBe(0);
   }));
 
 test("setup prints the keys even when it cannot save the URL", () =>
