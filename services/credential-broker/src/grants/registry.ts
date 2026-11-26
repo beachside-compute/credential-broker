@@ -4,7 +4,7 @@ import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
 import type { Principal } from "../auth";
-import { requestLimit } from "../config";
+import { requestLimit, tenantConfigFor } from "../config";
 import type { RequestLimits, TenantConfig } from "../config";
 import type { CredentialReference, EncryptedCredential } from "../credentials/source";
 import { integrations, issuerIntegrations } from "../integrations/schema";
@@ -108,12 +108,18 @@ export interface DestinationRecord {
 
 type IntegrationCreation = "exists" | "limit" | IntegrationMetadata;
 
+export interface TenantKeyState {
+  active: string;
+  keys: { version: string; wrapped: EncryptedCredential }[];
+}
+
 export type Authorization =
   | {
       status: "allowed";
       leaseId: string;
       traceparent: string | null;
       integration: StoredIntegration;
+      keyState: TenantKeyState | null;
     }
   | { status: "invalid"; trip?: Trip }
   | { status: "forbidden" | "busy" };
@@ -180,10 +186,18 @@ export class GrantRegistry extends DurableObject {
       .run();
   }
 
-  dataKeys() {
+  dataKeys(): TenantKeyState {
+    return this.readDataKeys(this.activeDataKey() ?? tenantDataKeyVersion);
+  }
+
+  private readDataKeys(active: string): TenantKeyState {
     return {
-      active: this.activeDataKey() ?? tenantDataKeyVersion,
-      keys: this.db.select().from(dataKeys).orderBy(dataKeys.version).all(),
+      active,
+      keys: this.db
+        .select({ version: dataKeys.version, wrapped: dataKeys.wrapped })
+        .from(dataKeys)
+        .orderBy(dataKeys.version)
+        .all(),
     };
   }
 
@@ -897,7 +911,7 @@ export class GrantRegistry extends DurableObject {
     hash: string,
     selector: IntegrationSelector,
     usesApiKeyHeader: boolean,
-    limits: RequestLimits,
+    deploymentLimits: RequestLimits | undefined,
     request: TripRequest,
   ): Authorization {
     const now = Date.now();
@@ -937,7 +951,16 @@ export class GrantRegistry extends DurableObject {
       if (usesApiKeyHeader && integration.kind !== "anthropic" && integration.kind !== "http")
         return { status: "invalid" };
 
-      const { requestsPerMinute, concurrentRequests } = requestLimit(integration, limits);
+      const hosted =
+        deploymentLimits === undefined ? this.db.select().from(tenant).get() : undefined;
+
+      if (deploymentLimits === undefined && !hosted) return { status: "invalid" };
+
+      const limits = hosted
+        ? tenantConfigFor(hosted.id).parse(hosted.config ?? {}).limits
+        : deploymentLimits;
+
+      const { requestsPerMinute, concurrentRequests } = requestLimit(integration, limits ?? {});
 
       const scope = { grantId: grant.id, identity: integration.identity };
       const window = Math.floor(now / minuteMs);
@@ -981,7 +1004,12 @@ export class GrantRegistry extends DurableObject {
         .values({ id: leaseId, ...scope, expiresAt: now + leaseTtlMs })
         .run();
 
-      return { status: "allowed", leaseId, traceparent: grant.traceparent, integration };
+      const keyState =
+        hosted && integration.credential.source === "encrypted-store"
+          ? this.readDataKeys(hosted.activeDataKey)
+          : null;
+
+      return { status: "allowed", leaseId, traceparent: grant.traceparent, integration, keyState };
     });
   }
 

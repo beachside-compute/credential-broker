@@ -976,7 +976,26 @@ test("tenant data key rotation resumes and retires the old key only after reseal
     await store.exec(
       "UPDATE alert_destinations SET config = json_set(config, '$.ciphertext', 'corrupt')",
     );
-    await error(await operate(rotate, "POST"), 409, "tenant_ciphertext_unavailable");
+    await store.exec(
+      "UPDATE integrations SET credential = json_set(credential, '$.ciphertext', 'corrupt') WHERE id = 'model'",
+    );
+    const badIntegration = await operate(rotate, "POST");
+    assert.equal(badIntegration.status, 409);
+    assert.deepEqual(await badIntegration.json(), {
+      error: "tenant_ciphertext_unavailable",
+      record: { kind: "integration", id: "model" },
+    });
+
+    await store.exec(
+      "UPDATE integrations SET credential = ? WHERE id = 'model'",
+      credential.credential,
+    );
+    const badAlert = await operate(rotate, "POST");
+    assert.equal(badAlert.status, 409);
+    assert.deepEqual(await badAlert.json(), {
+      error: "tenant_ciphertext_unavailable",
+      record: { kind: "alert_destination", id: "alerts" },
+    });
     assert.deepEqual(await store.exec("SELECT active_data_key AS version FROM tenant"), [
       { version: "t2" },
     ]);

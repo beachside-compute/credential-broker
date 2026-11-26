@@ -38,7 +38,8 @@ const listInput = pageInput.extend({
 export const platformRoutes = new Hono<PlatformWorker>();
 
 platformRoutes.onError((error) => {
-  if (error instanceof PlatformError) return privateJson({ error: error.code }, error.status);
+  if (error instanceof PlatformError)
+    return privateJson({ error: error.code, ...(error.record && { record: error.record }) }, error.status);
 
   console.error(JSON.stringify({ event: "platform_operation_failed" }));
 

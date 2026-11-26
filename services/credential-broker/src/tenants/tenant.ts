@@ -6,7 +6,7 @@ import { parseConfig, tenantConfigFor } from "../config";
 import type { BrokerConfig, TrustedIssuer } from "../config";
 import { importDataKey } from "../credentials/sources/encrypted-store";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
-import type { GrantRegistry } from "../grants/registry";
+import type { GrantRegistry, TenantKeyState } from "../grants/registry";
 import { tokenHash } from "../grants/tokens";
 import type { Env } from "../http";
 import { rootKeyring, unwrapDataKey } from "./data-key";
@@ -29,7 +29,7 @@ export interface Tenant {
   id: string;
   store: DurableObjectStub<GrantRegistry>;
   config(): Promise<BrokerConfig>;
-  keyring(): Promise<EncryptionKeyring>;
+  keyring(state?: TenantKeyState | null): Promise<EncryptionKeyring>;
   administrator(request: Request): Promise<boolean>;
   orchestrator(request: Request): Promise<Principal | undefined>;
   hasIssuerKey(): Promise<boolean>;
@@ -89,7 +89,11 @@ function hostedTenant(env: Env, id: string): Tenant {
     id,
     store,
     config: getConfig,
-    keyring: () => hostedKeyring(env, id, store),
+    async keyring(state) {
+      if (state === null) throw new Error("Tenant encryption key unavailable");
+
+      return hostedKeyring(env, id, state ?? (await store.dataKeys()));
+    },
     async administrator(request) {
       const token = authenticationToken(request);
 
@@ -164,7 +168,7 @@ export function invalidateTenantKeyring(env: Env, id: string) {
 async function hostedKeyring(
   env: Env,
   id: string,
-  store: Tenant["store"],
+  { active, keys }: TenantKeyState,
 ): Promise<EncryptionKeyring> {
   const root = rootKeyring(env);
   let cache = keyrings.get(env.REGISTRY);
@@ -177,8 +181,6 @@ async function hostedKeyring(
   const now = Date.now();
 
   for (const [tenant, entry] of cache) if (entry.expires <= now) cache.delete(tenant);
-
-  const { active, keys } = await store.dataKeys();
 
   const fingerprint = JSON.stringify([
     active,

@@ -345,7 +345,7 @@ app.all("*", async (context) => {
     await tokenHash(token),
     selector,
     request.headers.has("x-api-key"),
-    (await tenant.config()).limits ?? {},
+    tenant.id === defaultTenant ? ((await tenant.config()).limits ?? {}) : undefined,
     tripRequest(
       request,
       incoming.type === "gateway" ? "gateway" : incoming.type === "git" ? "git" : "github-api",
@@ -416,7 +416,11 @@ app.all("*", async (context) => {
 
     if (integration.kind === "http") {
       if (reference.source === "encrypted-store") {
-        const values = await openEndpointValues(reference, integration, await tenant.keyring());
+        const values = await openEndpointValues(
+          reference,
+          integration,
+          await tenant.keyring(authorized.keyState),
+        );
 
         if (values) credential = { values };
       }
@@ -426,7 +430,10 @@ app.all("*", async (context) => {
           ? tenant.id === defaultTenant
             ? await workerSecretSource(context.env).resolve(reference)
             : undefined
-          : await encryptedStoreSource(integration, await tenant.keyring()).resolve(reference);
+          : await encryptedStoreSource(
+              integration,
+              await tenant.keyring(authorized.keyState),
+            ).resolve(reference);
     }
   } catch {
     complete(503);

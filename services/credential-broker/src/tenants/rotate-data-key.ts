@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { resealDestination } from "../canaries/alerts";
+import { integrationId } from "../config";
 import { resealCredential } from "../credentials/sources/encrypted-store";
 import type { Env } from "../http";
 import { newDataKey, rootKeyring, wrapDataKey } from "./data-key";
 import type { PlatformActor } from "./directory-schema";
 import { tenantId } from "./identity";
 import { auditOperation, operableTenant, PlatformError } from "./platform-operations";
+import type { PlatformErrorRecord } from "./platform-operations";
 import { invalidateTenantKeyring, tenantFor } from "./tenant";
 
 const rotateInput = z.strictObject({ id: tenantId });
@@ -52,14 +54,14 @@ export async function rotateTenantDataKey(
 
         const replacement = await resealCredential(credential, integration, keyring);
 
-        if (!replacement) throw new PlatformError(409, "tenant_ciphertext_unavailable");
+        if (!replacement) throw unreadableRecord("integration", integration.id);
         await store.changeCredentialEnvelope(identity, credential, replacement);
       }
 
       for (const destination of batch.destinations) {
         const replacement = await resealDestination(destination, keyring);
 
-        if (!replacement) throw new PlatformError(409, "tenant_ciphertext_unavailable");
+        if (!replacement) throw unreadableRecord("alert_destination", destination.id);
         await store.changeDestinationEnvelope(
           destination.identity,
           destination.config,
@@ -77,4 +79,14 @@ export async function rotateTenantDataKey(
 
 function keyChanged(): PlatformError {
   return new PlatformError(409, "tenant_key_changed");
+}
+
+function unreadableRecord(kind: PlatformErrorRecord["kind"], id: string): PlatformError {
+  const parsed = integrationId.safeParse(id);
+
+  return new PlatformError(
+    409,
+    "tenant_ciphertext_unavailable",
+    parsed.success ? { kind, id: parsed.data } : undefined,
+  );
 }

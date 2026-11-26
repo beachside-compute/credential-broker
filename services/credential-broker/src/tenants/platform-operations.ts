@@ -26,12 +26,18 @@ export const auditInput = z.strictObject({
   tenant: tenantId.optional(),
 });
 
+export interface PlatformErrorRecord {
+  kind: "integration" | "alert_destination";
+  id: string;
+}
+
 export class PlatformError extends Error {
   constructor(
     readonly status: 400 | 404 | 409 | 503,
     readonly code: string,
+    readonly record?: PlatformErrorRecord,
   ) {
-    super(code);
+    super(record ? `${code}: ${record.kind} ${record.id}` : code);
   }
 }
 
