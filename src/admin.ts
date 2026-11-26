@@ -614,6 +614,10 @@ export interface BrokerDeploymentConfig {
   } | null;
   readonly workerSecretBindings: number;
   readonly issuerKey: boolean;
+  readonly trustedIssuers?: readonly {
+    readonly issuer: string;
+    readonly roles: readonly ("admin" | "issuer")[];
+  }[];
   /** Effective per-grant limits for each integration. Empty from brokers that predate them. */
   readonly limits: Readonly<Record<string, BrokerRequestLimit>>;
   /** IDs in `BROKER_CONFIG.limits` that match no integration. */
@@ -657,7 +661,12 @@ function deploymentConfig(reply: JsonReply): BrokerDeploymentConfig {
   if (typeof workerSecretBindings !== "number" || typeof issuerKey !== "boolean")
     throw invalidResponse();
 
-  const shared = { workerSecretBindings, issuerKey, ...requestLimits(reply) };
+  const shared = {
+    workerSecretBindings,
+    issuerKey,
+    ...requestLimits(reply),
+    ...trustedIssuerConfig(reply),
+  };
 
   if (githubActions === null) return { githubActions: null, ...shared };
 
@@ -677,6 +686,30 @@ function deploymentConfig(reply: JsonReply): BrokerDeploymentConfig {
       workflows: githubActions.workflows.map(workflowPolicy),
     },
     ...shared,
+  };
+}
+
+function trustedIssuerConfig(reply: JsonReply): Pick<BrokerDeploymentConfig, "trustedIssuers"> {
+  if (!("trustedIssuers" in reply)) return {};
+
+  if (!Array.isArray(reply.trustedIssuers)) throw invalidResponse();
+
+  return {
+    trustedIssuers: reply.trustedIssuers.map((entry) => {
+      if (
+        !entry ||
+        typeof entry !== "object" ||
+        typeof entry.issuer !== "string" ||
+        !Array.isArray(entry.roles)
+      )
+        throw invalidResponse();
+
+      const roles: readonly unknown[] = entry.roles;
+
+      if (!roles.every((role) => role === "admin" || role === "issuer")) throw invalidResponse();
+
+      return { issuer: entry.issuer, roles: [...roles] };
+    }),
   };
 }
 

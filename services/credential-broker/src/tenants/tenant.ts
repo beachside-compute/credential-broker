@@ -10,6 +10,7 @@ import { tokenHash } from "../grants/tokens";
 import type { Env } from "../http";
 import { rootKeyring, unwrapDataKey } from "./data-key";
 import type { TenantDirectory } from "./directory";
+import { brokerHosts } from "./hosts";
 import type { TenantHostBindings } from "./hosts";
 import { defaultTenant } from "./identity";
 import type { TenantRole } from "./identity";
@@ -43,7 +44,7 @@ export function tenantStore(env: Env, id: string) {
 }
 
 function deploymentConfig(env: Env): BrokerConfig {
-  return parseConfig(env.BROKER_CONFIG ?? "{}", Boolean(env.BROKER_PLATFORM_KEY));
+  return parseConfig(env.BROKER_CONFIG ?? "{}", Boolean(brokerHosts(env).domain));
 }
 
 function applicableIssuers(env: Env, id: string): TrustedIssuer[] {
@@ -54,10 +55,19 @@ function applicableIssuers(env: Env, id: string): TrustedIssuer[] {
   );
 }
 
-function trustedRole(env: Env, token: string, id: string, role: TenantRole) {
+async function trustedRole(
+  env: Env,
+  token: string,
+  id: string,
+  role: TenantRole,
+  url: string,
+): Promise<Principal | undefined> {
   if (!token.includes(".")) return;
 
-  return trustedPrincipal(token, applicableIssuers(env, id), id, role);
+  const audience =
+    id === defaultTenant ? new URL(url).origin : `https://${brokerHosts(env).domain}`;
+
+  return trustedPrincipal(token, applicableIssuers(env, id), id, role, audience);
 }
 
 function hostedTenant(env: Env, id: string): Tenant {
@@ -83,7 +93,8 @@ function hostedTenant(env: Env, id: string): Tenant {
 
       return Boolean(
         token &&
-        ((await matchesRole(token, "admin")) || (await trustedRole(env, token, id, "admin"))),
+        ((await matchesRole(token, "admin")) ||
+          (await trustedRole(env, token, id, "admin", request.url))),
       );
     },
     async orchestrator(request) {
@@ -91,12 +102,10 @@ function hostedTenant(env: Env, id: string): Tenant {
 
       if (!token) return;
 
-      if (await matchesRole(token, "issuer")) return { owner: "broker-api-key" };
-
-      if (!token.includes(".")) return;
+      if (await matchesRole(token, "issuer")) return { kind: "api-key", owner: "broker-api-key" };
 
       return (
-        (await trustedRole(env, token, id, "issuer")) ??
+        (await trustedRole(env, token, id, "issuer", request.url)) ??
         githubActionsPrincipal(token, await getConfig())
       );
     },
@@ -124,14 +133,14 @@ function builtInTenant(env: Env): Tenant {
 
       const token = authenticationToken(request);
 
-      return Boolean(token && (await trustedRole(env, token, defaultTenant, "admin")));
+      return Boolean(token && (await trustedRole(env, token, defaultTenant, "admin", request.url)));
     },
     async orchestrator(request) {
       const config = await getConfig();
       const token = authenticationToken(request);
 
       return (
-        (token && (await trustedRole(env, token, defaultTenant, "issuer"))) ||
+        (token && (await trustedRole(env, token, defaultTenant, "issuer", request.url))) ||
         orchestrator(request, config, env.BROKER_ISSUER_KEY)
       );
     },

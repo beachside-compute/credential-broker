@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { and, count, desc, eq, gt, inArray, lte, min, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lte, min, notInArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { migrate } from "drizzle-orm/durable-sqlite/migrator";
 import migrations from "../../drizzle/migrations";
@@ -438,8 +438,8 @@ export class GrantRegistry extends DurableObject {
     return result;
   }
 
-  /** Active grants, newest first. Pass an owner to see only that issuer's grants. */
-  listGrants(owner?: string): GrantSummary[] {
+  /** Active grants, newest first. Pass a principal to limit results to the issuer and its policy. */
+  listGrants(principal?: Principal): GrantSummary[] {
     const now = Date.now();
 
     const names = new Map(
@@ -453,11 +453,7 @@ export class GrantRegistry extends DurableObject {
     return this.db
       .select()
       .from(grants)
-      .where(
-        owner === undefined
-          ? gt(grants.expiresAt, now)
-          : and(eq(grants.owner, owner), gt(grants.expiresAt, now)),
-      )
+      .where(and(gt(grants.expiresAt, now), principal && this.grantScope(principal)))
       .orderBy(desc(grants.createdAt), grants.id)
       .all()
       .map((grant) => summary(grant, names));
@@ -466,7 +462,7 @@ export class GrantRegistry extends DurableObject {
   /** Move an active grant's expiry to `expiresAt`, keeping its scope and token. */
   async renew(
     id: string,
-    owner: string,
+    principal: Principal,
     expiresAt: number,
     request: TripRequest,
   ): Promise<Renewal> {
@@ -475,7 +471,7 @@ export class GrantRegistry extends DurableObject {
     const renewed = this.db
       .update(grants)
       .set({ expiresAt })
-      .where(and(eq(grants.id, id), eq(grants.owner, owner), gt(grants.expiresAt, now)))
+      .where(and(eq(grants.id, id), this.grantScope(principal), gt(grants.expiresAt, now)))
       .returning()
       .get();
 
@@ -549,10 +545,10 @@ export class GrantRegistry extends DurableObject {
   }
 
   /** Revoke a grant. Naming a canary instead trips it. */
-  revoke(id: string, owner: string, request: TripRequest): Trip | undefined {
+  revoke(id: string, principal: Principal, request: TripRequest): Trip | undefined {
     const revoked = this.db
       .delete(grants)
-      .where(and(eq(grants.id, id), eq(grants.owner, owner)))
+      .where(and(eq(grants.id, id), this.grantScope(principal)))
       .returning({ id: grants.id })
       .get();
 
@@ -885,6 +881,24 @@ export class GrantRegistry extends DurableObject {
       .get();
 
     if (next?.expire != null) await this.scheduleCleanup(Math.min(next.expire, now + leaseTtlMs));
+  }
+
+  private grantScope(principal: Principal) {
+    const owner = eq(grants.owner, principal.owner);
+
+    if (principal.integrations === undefined) return owner;
+
+    const allowed = this.db
+      .select({ identity: integrations.identity })
+      .from(integrations)
+      .where(inArray(integrations.id, principal.integrations));
+
+    const outsidePolicy = notInArray(sql`value`, allowed);
+
+    return and(
+      owner,
+      sql`NOT EXISTS (SELECT 1 FROM json_each(${grants.permissions}) WHERE ${outsidePolicy})`,
+    );
   }
 
   private findIntegration(id: string) {

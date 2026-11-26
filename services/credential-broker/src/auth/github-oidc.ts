@@ -48,6 +48,7 @@ export async function githubActionsPrincipal(
     if (!matching.length) return;
 
     return {
+      kind: "github",
       owner: `github:${matching[0].repositoryId}:${run.data}`,
       integrations: [...new Set(matching.flatMap((rule) => rule.integrations))],
     };

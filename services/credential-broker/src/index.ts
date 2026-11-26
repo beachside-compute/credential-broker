@@ -206,7 +206,7 @@ app.get("/v1/status", async (context) => {
   return traced(context, tenant, "status", async () =>
     privateJson({
       apiVersion,
-      role: principal.owner.startsWith("github:") ? "github-actions" : "issuer",
+      role: principal.kind === "github" ? "github-actions" : "issuer",
       limits,
     }),
   );
@@ -226,7 +226,7 @@ app.get("/v1/grants", async (context) => {
   }
 
   return traced(context, tenant, "grant.list", async () => {
-    const grants = await tenant.store.listGrants(principal.owner);
+    const grants = await tenant.store.listGrants(principal);
 
     return privateJson({ grants: grants.map((grant) => grantView(grant, false)) });
   });
@@ -254,7 +254,7 @@ app.post("/v1/grants/:id/renew", async (context) => {
 
     const result = await tenant.store.renew(
       id,
-      principal.owner,
+      principal,
       Date.now() + input.data.ttlSeconds * 1_000,
       tripRequest(request, "renew"),
     );
@@ -308,7 +308,7 @@ app.delete("/v1/grants/:id", async (context) => {
     alertOnTrip(
       context,
       tenant,
-      await tenant.store.revoke(id, principal.owner, tripRequest(context.req.raw, "revoke")),
+      await tenant.store.revoke(id, principal, tripRequest(context.req.raw, "revoke")),
     );
     status = 204;
 

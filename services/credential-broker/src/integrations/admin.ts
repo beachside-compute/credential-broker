@@ -117,7 +117,7 @@ adminRoutes.get("/config", traceAdmin("admin.config.read"), async (context) => {
     unknownLimitIds: Object.keys(limits).filter((id) => !known.some((row) => row.id === id)),
     workerSecretBindings: config.workerSecretBindings.length,
     issuerKey: await tenant.hasIssuerKey(),
-    ...(trustedIssuers.length && { trustedIssuers }),
+    trustedIssuers,
   });
 });
 

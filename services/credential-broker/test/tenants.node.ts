@@ -109,7 +109,7 @@ function options(enabled = true, root = "v1", registry = true, policyEntry?: Tru
         BROKER_ISSUER_KEY: issuer,
         BROKER_ENCRYPTION_KEYS: rootKeys,
         BROKER_ENCRYPTION_KEY_VERSION: root,
-        BROKER_TENANT_DOMAIN: domain,
+        ...(enabled && { BROKER_TENANT_DOMAIN: domain }),
         BROKER_HOST_ALIASES: "default-broker.example.net",
         BROKER_CONFIG: JSON.stringify({
           githubActions: { audience: "default-audience", workflows: [policy] },
@@ -549,7 +549,6 @@ test("unconfigured tenancy rejects hosted requests without the directory binding
 
   try {
     await error(await operate(), 404, "unsupported_route");
-    await error(await call(a, "/v1/status", admin), 401, "authentication_required");
     await error(await call(a, gatewayPath, `bsg_${"a".repeat(64)}`, "POST"), 401, "grant_invalid");
     assert.equal((await call(domain, "/v1/status", admin)).status, 200);
   } finally {
@@ -671,7 +670,26 @@ test("trusted issuers act on one hosted subdomain and own only their subject's g
       [{ issuer: trustedIssuer, roles: ["admin", "issuer"] }],
     );
 
+    await seed(a, tenant.adminKey, "other", "trusted-other-fixture");
     const record = grantToken.parse(await (await issue(a, issuerToken)).json());
+    const second = grantToken.parse(await (await issue(a, issuerToken, "other")).json());
+    const narrowedToken = await signed({ integrations: ["model"] });
+    const visible = z.object({ grants: z.array(z.object({ id: z.string() })) });
+    assert.deepEqual(
+      visible.parse(await (await call(a, "/v1/grants", narrowedToken)).json()).grants,
+      [{ id: record.id }],
+    );
+    const broader = `/v1/grants/${second.id}`;
+    await error(
+      await call(a, broader + "/renew", narrowedToken, "POST", { ttlSeconds: 60 }),
+      404,
+      "grant_not_found",
+    );
+    assert.equal((await call(a, broader, narrowedToken, "DELETE")).status, 204);
+    assert.equal(
+      (await call(a, broader + "/renew", issuerToken, "POST", { ttlSeconds: 60 })).status,
+      200,
+    );
     const grantPath = `/v1/grants/${record.id}`;
     await error(
       await call(a, grantPath + "/renew", agentTwo, "POST", { ttlSeconds: 60 }),

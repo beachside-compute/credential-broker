@@ -1,6 +1,7 @@
-import { createRemoteJWKSet, decodeJwt, jwtVerify } from "jose";
+import { createRemoteJWKSet, customFetch, decodeJwt, jwtVerify } from "jose";
 import { z } from "zod";
 import type { Principal } from ".";
+import { tokenHash } from "../grants/tokens";
 import { integrationId } from "../config";
 import type { TrustedIssuer } from "../config";
 import { defaultTenant, tenantId, tenantRole } from "../tenants/identity";
@@ -21,7 +22,25 @@ function issuerKeys(entry: TrustedIssuer) {
 
   if (cached) return cached;
 
-  const keys = createRemoteJWKSet(new URL(entry.jwksUri));
+  let failedUntil = 0;
+
+  const keys = createRemoteJWKSet(new URL(entry.jwksUri), {
+    timeoutDuration: 2_000,
+    [customFetch]: async (url, options) => {
+      if (Date.now() < failedUntil) throw new Error("Issuer keys temporarily unavailable");
+
+      try {
+        const response = await fetch(url, options);
+
+        if (response.status !== 200) failedUntil = Date.now() + 5_000;
+
+        return response;
+      } catch (error) {
+        failedUntil = Date.now() + 5_000;
+        throw error;
+      }
+    },
+  });
 
   if (keysets.size >= 16) keysets.delete(keysets.keys().next().value!);
   keysets.set(id, keys);
@@ -34,6 +53,7 @@ export async function trustedPrincipal(
   entries: readonly TrustedIssuer[],
   tenant: string,
   role: TenantRole,
+  audience: string,
 ): Promise<Principal | undefined> {
   if (entries.length === 0 || token.split(".").length !== 3) return;
 
@@ -41,7 +61,7 @@ export async function trustedPrincipal(
     const hint = decodeJwt(token);
     const entry = entries.find((candidate) => candidate.issuer === hint.iss);
 
-    if (!entry || !entry.roles.includes(role)) return;
+    if (!entry || entry.audience !== audience || !entry.roles.includes(role)) return;
 
     const expectedTenant = tenant === defaultTenant ? entry.tenant : tenant;
 
@@ -71,7 +91,11 @@ export async function trustedPrincipal(
     )
       return;
 
-    return { owner: `trusted:${result.data.sub}`, integrations: result.data.integrations };
+    return {
+      kind: "trusted",
+      owner: `trusted:${await tokenHash(entry.issuer)}:${result.data.sub}`,
+      integrations: result.data.integrations,
+    };
   } catch {
     return;
   }

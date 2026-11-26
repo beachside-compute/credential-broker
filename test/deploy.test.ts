@@ -219,6 +219,39 @@ test("hosted setup uploads a fresh platform key only over standard input", () =>
     expect(deployCall.bindings).not.toHaveProperty("BROKER_PLATFORM_KEY");
   }));
 
+test("setup and dry run agree on whether unpinned trusted issuers are enabled", () =>
+  fixture(async (root) => {
+    const { service, command } = provisionStub(root);
+
+    const env = {
+      BROKER_CONFIG: JSON.stringify({
+        trustedIssuers: [
+          {
+            issuer: "https://issuer.example.org",
+            jwksUri: "https://issuer.example.org/jwks",
+            audience: "https://broker.example.org",
+          },
+        ],
+      }),
+    };
+
+    const setup = [...command, "--setup-only", "--print-keys"];
+    const dryRun = [...command, "--dry-run"];
+
+    expect(spawn(setup, env).stderr).toContain("require BROKER_TENANT_DOMAIN");
+    expect(spawn(dryRun, env).stderr).toContain("require BROKER_TENANT_DOMAIN");
+
+    writeFileSync(
+      join(service, "wrangler.jsonc"),
+      JSON.stringify({
+        vars: { BROKER_TENANT_DOMAIN: "broker.example.org" },
+      }),
+    );
+
+    expect(spawn(dryRun, env).code).toBe(0);
+    expect(spawn(setup, env).code).toBe(0);
+  }));
+
 test("setup prints the keys even when it cannot save the URL", () =>
   fixture(async (root) => {
     const { service, command } = provisionStub(root);

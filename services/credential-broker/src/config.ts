@@ -130,21 +130,25 @@ const configuration = tenantConfiguration.extend({
 
 export type BrokerConfig = z.infer<typeof configuration>;
 
-let cachedConfig: { raw: string; platformEnabled: boolean; config: BrokerConfig } | undefined;
+let cachedConfig: { raw: string; hosted: boolean; config: BrokerConfig } | undefined;
 
-export function parseConfig(raw: string, platformEnabled = false): BrokerConfig {
-  if (cachedConfig?.raw === raw && cachedConfig.platformEnabled === platformEnabled)
-    return cachedConfig.config;
+export class HostedIssuerConfigurationError extends Error {
+  constructor() {
+    super("Unpinned trusted issuers require BROKER_TENANT_DOMAIN");
+  }
+}
+
+export function parseConfig(raw: string, hosted = false): BrokerConfig {
+  if (cachedConfig?.raw === raw && cachedConfig.hosted === hosted) return cachedConfig.config;
 
   const result = configuration.safeParse(JSON.parse(raw));
 
-  if (
-    !result.success ||
-    (!platformEnabled && result.data.trustedIssuers?.some(({ tenant }) => !tenant))
-  )
-    throw new Error("Invalid broker configuration");
+  if (!result.success) throw new Error("Invalid broker configuration");
 
-  cachedConfig = { raw, platformEnabled, config: result.data };
+  if (!hosted && result.data.trustedIssuers?.some(({ tenant }) => !tenant))
+    throw new HostedIssuerConfigurationError();
+
+  cachedConfig = { raw, hosted, config: result.data };
 
   return result.data;
 }

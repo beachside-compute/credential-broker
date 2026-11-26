@@ -142,7 +142,7 @@ For root key rotation, keep the old root in `BROKER_ENCRYPTION_KEYS` while you a
 
 ## Trusted token issuers
 
-An operator can configure up to four issuers in deployment `BROKER_CONFIG.trustedIssuers`. Each entry sets the exact issuer, HTTPS JWKS URI and audience, and the roles it may sign. Choose an audience unique to this broker, such as its origin. Roles default to `["issuer"]`.
+An operator can configure up to four issuers in deployment `BROKER_CONFIG.trustedIssuers`. Each entry sets the exact issuer, HTTPS JWKS URI and audience, and the roles it may sign. Set the audience to the broker origin for a pinned issuer or to `https://<BROKER_TENANT_DOMAIN>` for hosted issuers. Roles default to `["issuer"]`.
 
 ```json
 {
@@ -158,9 +158,9 @@ An operator can configure up to four issuers in deployment `BROKER_CONFIG.truste
 }
 ```
 
-A pinned entry accepts only its configured org's `tenant` claim on the built-in broker. This works with the default hostname and without a platform key. An unpinned entry requires hosted tenancy. Send the bearer token to the tenant subdomain named in its signed `tenant` claim.
+A pinned entry accepts only its configured org's `tenant` claim on the built-in broker. This works with the default hostname and without a platform key. An unpinned entry requires `BROKER_TENANT_DOMAIN`. Granting it `admin` lets that issuer administer every hosted tenant. Send the bearer token to the tenant subdomain named in its signed `tenant` claim.
 
-Sign tokens with ES256 and include `iss`, `aud` as a string, `sub`, `iat`, `exp`, `tenant`, and `role`. The broker rejects expired tokens and tokens issued more than 600 seconds ago. Subjects must be 1–128 printable ASCII characters. Use a stable, distinct subject per agent so it can list, renew, and revoke its own grants. Issuers trusted for the same tenant share this subject namespace. An issuer token may include an `integrations` array to narrow its permissions further. Present the JWT as an `Authorization: Bearer` credential to the matching admin or issuance API. The admin config endpoint reports applicable issuers and roles.
+Sign tokens with ES256 and include `iss`, `aud` as a string, `sub`, `iat`, `exp`, `tenant`, and `role`. The broker rejects expired tokens and tokens issued more than 600 seconds ago. Subjects must be 1–128 printable ASCII characters. Use a stable, distinct subject per agent so it can list, renew, and revoke its own grants. Each issuer has its own subject namespace. The optional integration scope also applies to listing, renewal, and revocation. An issuer token may include an `integrations` array to narrow its permissions further. Present the JWT as an `Authorization: Bearer` credential to the matching admin or issuance API. The admin config endpoint reports applicable issuers and roles.
 
 ## Manage integrations
 

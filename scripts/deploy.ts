@@ -14,7 +14,10 @@ import {
 import { isSecretReference, resolveSecret } from "../src/secret-ref.js";
 import { CredentialBrokerError } from "../src/transport.js";
 import { brokerHosts, wranglerHostConfig } from "../services/credential-broker/src/tenants/hosts";
-import { parseConfig } from "../services/credential-broker/src/config";
+import {
+  HostedIssuerConfigurationError,
+  parseConfig,
+} from "../services/credential-broker/src/config";
 import { credentialValue } from "../services/credential-broker/src/credentials/source";
 import {
   traceAuthorization,
@@ -114,16 +117,36 @@ async function withDeployConfig<T>(
   }
 }
 
+function deploymentBrokerConfig(raw: string) {
+  const service = resolve(repository, servicePath);
+  const local = resolve(service, localConfig);
+  const tracked = resolve(service, "wrangler.jsonc");
+
+  try {
+    const config = {
+      ...(existsSync(tracked) && readConfig(tracked)),
+      ...(existsSync(local) && readConfig(local)),
+    };
+
+    return parseConfig(
+      raw,
+      Boolean(brokerHosts(wranglerHostConfig.parse(config).vars ?? {}).domain),
+    );
+  } catch (error) {
+    if (error instanceof HostedIssuerConfigurationError) return setupError(error.message);
+
+    return setupError("Invalid broker policy or hostname configuration");
+  }
+}
+
 /** Worker secrets that every deploy may update. The broker keys are set only by the first deploy. */
-async function settingSecrets(
-  env: NodeJS.ProcessEnv,
-  platformEnabled = false,
-): Promise<Record<string, string>> {
+async function settingSecrets(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
   const deployment = new Map<string, string>();
   const read = (name: string) => resolveSecret(env[name]!, name, env);
 
+  const config = deploymentBrokerConfig(env.BROKER_CONFIG ?? "{}");
+
   try {
-    const config = parseConfig(env.BROKER_CONFIG ?? "{}", platformEnabled);
     deployment.set("BROKER_CONFIG", JSON.stringify(config));
 
     for (const name of config.workerSecretBindings) {
@@ -471,8 +494,11 @@ async function deploy() {
       .code;
 
   if (args.length === 1 && args[0] === "--dry-run") {
+    const settings = { ...inherited, ...loadDeploymentFile(envPath) };
+    deploymentBrokerConfig(settings.BROKER_CONFIG ?? "{}");
+
     return withDeployConfig(
-      emailSender({ ...inherited, ...loadDeploymentFile(envPath) }),
+      emailSender(settings),
       async (config) =>
         (
           await runCommand(wranglerEnvironment(inherited, {}), [
@@ -516,10 +542,7 @@ async function deploy() {
       "This Worker has no broker keys yet. Create the broker with bun run deploy:setup first",
     );
 
-  const secrets = await settingSecrets(
-    settings,
-    dryRun || Boolean(existing?.has("BROKER_PLATFORM_KEY")),
-  );
+  const secrets = await settingSecrets(settings);
 
   const { code, url } = await deployWrangler(env, secrets, args, settings.BEACHSIDE_BROKER_URL);
 

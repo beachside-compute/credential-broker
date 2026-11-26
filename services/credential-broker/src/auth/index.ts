@@ -4,6 +4,7 @@ import { matchesKey } from "./api-key";
 import { githubActionsPrincipal } from "./github-oidc";
 
 export interface Principal {
+  kind: "api-key" | "github" | "trusted";
   owner: string;
   integrations?: string[];
 }
@@ -23,7 +24,7 @@ export async function orchestrator(
 
   if (!token) return;
 
-  if (await matchesKey(apiKey, token)) return { owner: "broker-api-key" };
+  if (await matchesKey(apiKey, token)) return { kind: "api-key", owner: "broker-api-key" };
 
   return githubActionsPrincipal(token, config);
 }

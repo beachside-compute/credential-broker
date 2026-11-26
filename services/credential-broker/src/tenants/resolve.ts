@@ -48,8 +48,7 @@ export async function resolveTenant<E extends Worker>(
   const { env } = context;
   const id = requestTenant(env, context.req.url);
 
-  if (!id || (id !== defaultTenant && (!env.BROKER_PLATFORM_KEY || !(await isActive(env, id)))))
-    return;
+  if (!id || (id !== defaultTenant && !(await isActive(env, id)))) return;
 
   const tenant = tenantFor(env, id);
   context.set("tenant", tenant);
