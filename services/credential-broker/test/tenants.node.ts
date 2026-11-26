@@ -5,6 +5,7 @@ import { build } from "esbuild";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { convertV4MiniflareOptions, Miniflare, Response as RuntimeResponse } from "miniflare";
 import { z } from "zod";
+import { brokerHosts, isBrokerHost, requestTenant } from "../src/tenants/hosts";
 import { createCredentialBrokerAdmin } from "../../../src/admin";
 
 const admin = "default-admin-fixture-0123456789abcdef";
@@ -551,4 +552,30 @@ test("unknown subdomains never need a registry binding", async () => {
   } finally {
     await runtime.dispose();
   }
+});
+
+test("host aliases normalize operator input and fail closed for invalid settings", () => {
+  const bindings = {
+    BROKER_TENANT_DOMAIN: domain,
+    BROKER_HOST_ALIASES: " LOCAL.EXAMPLE.NET. , worker.account.workers.dev, ",
+  };
+
+  assert.deepEqual(brokerHosts(bindings).aliases, [
+    "local.example.net",
+    "worker.account.workers.dev",
+  ]);
+  assert.deepEqual(brokerHosts({ BROKER_HOST_ALIASES: "" }).aliases, []);
+  assert.throws(() =>
+    brokerHosts({
+      BROKER_HOST_ALIASES: Array.from({ length: 33 }, (_, id) => `host${id}.example.net`).join(","),
+    }),
+  );
+  assert.throws(() => brokerHosts({ BROKER_TENANT_DOMAIN: domain, BROKER_HOST_ALIASES: a }));
+  assert.equal(requestTenant(bindings, "https://worker.account.workers.dev"), "default");
+  assert.equal(requestTenant(bindings, "https://unlisted.account.workers.dev"), undefined);
+  assert.equal(
+    isBrokerHost(bindings, `https://${a}`, new URL("https://worker.account.workers.dev")),
+    true,
+  );
+  assert.equal(isBrokerHost(bindings, `https://${a}`, new URL("https://api.example.net")), false);
 });

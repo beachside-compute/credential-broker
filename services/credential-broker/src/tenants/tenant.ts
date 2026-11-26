@@ -1,7 +1,7 @@
 import { administrator, authenticationToken, orchestrator } from "../auth";
 import { githubActionsPrincipal } from "../auth/github-oidc";
 import type { Principal } from "../auth";
-import { parseConfig } from "../config";
+import { parseConfig, tenantConfigFor } from "../config";
 import type { BrokerConfig } from "../config";
 import type { EncryptionKeyring } from "../credentials/sources/encrypted-store";
 import type { GrantRegistry } from "../grants/registry";
@@ -46,7 +46,7 @@ function hostedTenant(env: Env, id: string): Tenant {
 
   const getConfig = () =>
     (config ??= store.storedConfig().then((data) => ({
-      ...data,
+      ...tenantConfigFor(id).parse(data),
       workerSecretBindings: [],
     })));
 
@@ -104,6 +104,10 @@ export function tenantFor(env: Env, id: string): Tenant {
   return id === defaultTenant ? builtInTenant(env) : hostedTenant(env, id);
 }
 
+export function invalidateTenantKeyring(env: Env, id: string) {
+  keyrings.get(env.REGISTRY)?.delete(id);
+}
+
 async function hostedKeyring(
   env: Env,
   id: string,
@@ -122,15 +126,22 @@ async function hostedKeyring(
 
   if (cached && cached.expires > now) return cached.keyring;
 
+  for (const [tenant, entry] of cache) if (entry.expires <= now) cache.delete(tenant);
+
   const { active, keys } = await store.dataKeys();
 
-  const unwrapped = await Promise.all(
+  const unwrapped = await Promise.allSettled(
     keys.map(
       async ({ version, wrapped }) => [version, await unwrapDataKey(wrapped, id, root)] as const,
     ),
   );
 
-  const keyring = { active, keys: new Map(unwrapped) };
+  const keyring = {
+    active,
+    keys: new Map(
+      unwrapped.flatMap((result) => (result.status === "fulfilled" ? [result.value] : [])),
+    ),
+  };
 
   if (!keyring.keys.has(active)) throw new Error("Tenant encryption key unavailable");
 

@@ -7,11 +7,11 @@ import { tokenHash } from "../grants/tokens";
 import { privateJson, privateNoContent, readJson } from "../http";
 import type { Worker } from "../http";
 import { newDataKey, rootKeyring, unwrapDataKey, wrapDataKey } from "./data-key";
-import { tenantDomain } from "./hosts";
+import { brokerHosts } from "./hosts";
 import { tenantId, tenantRole } from "./identity";
 import { invalidateActive, resolveTenant, tenantDirectory } from "./resolve";
 import { newRoleKey } from "./role-keys";
-import { tenantStore } from "./tenant";
+import { invalidateTenantKeyring, tenantStore } from "./tenant";
 
 const createInput = z.strictObject({ id: tenantId });
 
@@ -38,6 +38,7 @@ platformRoutes.use("*", async (context, next) => {
   if (!token || !(await matchesKey(env.BROKER_PLATFORM_KEY, token))) {
     if (token?.startsWith("bsg_")) {
       const tenant = await resolveTenant(context);
+
       if (tenant) await tripRoleKey(context, tenant, "platform-auth");
     }
 
@@ -45,7 +46,8 @@ platformRoutes.use("*", async (context, next) => {
   }
 
   rootKeyring(env);
-  tenantDomain.parse(env.BROKER_TENANT_DOMAIN);
+
+  if (!brokerHosts(env).domain) return privateJson({ error: "broker_unavailable" }, 503);
   await next();
 });
 
@@ -66,6 +68,11 @@ platformRoutes.post("/tenants", async (context) => {
   ]);
 
   const created = await tenantDirectory(env).provision({ id, adminHash, issuerHash, dataKey });
+
+  if (created) {
+    invalidateActive(env, id);
+    invalidateTenantKeyring(env, id);
+  }
 
   return created
     ? privateJson({ id, adminKey, issuerKey }, 201)
@@ -164,9 +171,12 @@ platformRoutes.post("/tenants/:id/rewrap", async (context) => {
   const key = await unwrapDataKey(previous, id.data, root);
   const wrapped = await wrapDataKey(key, id.data, root);
 
-  return (await store.rewrapDataKeys(previous, wrapped))
-    ? privateNoContent()
-    : privateJson({ error: "tenant_key_changed" }, 409);
+  if (!(await store.rewrapDataKeys(previous, wrapped)))
+    return privateJson({ error: "tenant_key_changed" }, 409);
+
+  invalidateTenantKeyring(env, id.data);
+
+  return privateNoContent();
 });
 
 platformRoutes.delete("/tenants/:id", async (context) => {
@@ -177,6 +187,7 @@ platformRoutes.delete("/tenants/:id", async (context) => {
   const { env } = context;
   const erased = await tenantDirectory(env).erase(id.data);
   invalidateActive(env, id.data);
+  invalidateTenantKeyring(env, id.data);
 
   return erased ? privateNoContent() : tenantNotFound();
 });
@@ -185,10 +196,17 @@ function tenantNotFound() {
   return privateJson({ error: "tenant_not_found" }, 404);
 }
 
-function tenantView(row: { id: string; status: string; createdAt: number; updatedAt: number }) {
+function tenantView(row: {
+  id: string;
+  status: string;
+  deleting: boolean;
+  createdAt: number;
+  updatedAt: number;
+}) {
   return {
     id: row.id,
     status: row.status,
+    ...(row.deleting && { deleting: true }),
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
   };

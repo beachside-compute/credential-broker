@@ -13,6 +13,7 @@ import {
 } from "./deployment-file";
 import { isSecretReference, resolveSecret } from "../src/secret-ref.js";
 import { CredentialBrokerError } from "../src/transport.js";
+import { brokerHosts } from "../services/credential-broker/src/tenants/hosts";
 import { parseConfig } from "../services/credential-broker/src/config";
 import { credentialValue } from "../services/credential-broker/src/credentials/source";
 import {
@@ -75,6 +76,14 @@ async function withDeployConfig<T>(
     config = { ...readConfig(resolve(service, "wrangler.jsonc")), ...overrides };
   } catch {
     return setupError(`Could not parse services/credential-broker/${localConfig}`);
+  }
+
+  try {
+    brokerHosts(config.vars ?? {});
+  } catch {
+    return setupError(
+      "Invalid BROKER_TENANT_DOMAIN or BROKER_HOST_ALIASES in wrangler.local.jsonc",
+    );
   }
 
   const owned = repositoryOwnedKeys.filter((key) => key in overrides);

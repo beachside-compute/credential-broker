@@ -7,34 +7,39 @@ import type { Tenant } from "./tenant";
 
 const active = new WeakMap<Env["DIRECTORY"], Map<string, number>>();
 
+const inactive = new WeakMap<Env["DIRECTORY"], Map<string, number>>();
+
 export function tenantDirectory(env: Env) {
   return env.DIRECTORY.getByName("tenant-directory");
 }
 
 export function invalidateActive(env: Env, id: string) {
   active.get(env.DIRECTORY)?.delete(id);
+  inactive.get(env.DIRECTORY)?.delete(id);
 }
 
 async function isActive(env: Env, id: string): Promise<boolean> {
-  let cache = active.get(env.DIRECTORY);
+  const now = Date.now();
+
+  if ((active.get(env.DIRECTORY)?.get(id) ?? 0) > now) return true;
+
+  if ((inactive.get(env.DIRECTORY)?.get(id) ?? 0) > now) return false;
+
+  const found = await tenantDirectory(env).active(id);
+  const entries = found ? active : inactive;
+  let cache = entries.get(env.DIRECTORY);
 
   if (!cache) {
     cache = new Map();
-    active.set(env.DIRECTORY, cache);
+    entries.set(env.DIRECTORY, cache);
   }
-
-  const now = Date.now();
-
-  if ((cache.get(id) ?? 0) > now) return true;
 
   cache.delete(id);
 
-  if (!(await tenantDirectory(env).active(id))) return false;
-
   if (cache.size >= 1024) cache.delete(cache.keys().next().value!);
-  cache.set(id, now + 30_000);
+  cache.set(id, now + (found ? 30_000 : 2_000));
 
-  return true;
+  return found;
 }
 
 export async function resolveTenant<E extends Worker>(
