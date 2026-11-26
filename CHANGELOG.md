@@ -1,5 +1,11 @@
 # @beachside/credential-client
 
+## 0.6.0
+
+### Minor Changes
+
+- 6e69fa2: Enable optional tenant subdomains with per-tenant storage, role keys, and limits. Add `setConfig` to the admin client for updating a hosted tenant's configuration.
+
 ## 0.5.0
 
 ### Minor Changes
