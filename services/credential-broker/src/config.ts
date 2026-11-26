@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { brokerIntegration } from "./integrations/definitions";
 import type { IntegrationKind } from "./integrations/types";
 import { tenantId, tenantRole } from "./tenants/identity";
 
@@ -52,24 +53,12 @@ const limitOverride = z.strictObject({
 
 export type RequestLimits = Record<string, z.infer<typeof limitOverride>>;
 
-/** Per grant and integration. Git clones and fetches burst far more than model calls. */
-const defaultLimits: Record<
-  IntegrationKind,
-  { requestsPerMinute: number; concurrentRequests: number }
-> = {
-  github: { requestsPerMinute: 800, concurrentRequests: 32 },
-  anthropic: { requestsPerMinute: 600, concurrentRequests: 32 },
-  openai: { requestsPerMinute: 600, concurrentRequests: 32 },
-  openrouter: { requestsPerMinute: 600, concurrentRequests: 32 },
-  http: { requestsPerMinute: 300, concurrentRequests: 8 },
-};
-
 export function requestLimit(
   integration: { id: string; kind: IntegrationKind },
   limits: RequestLimits,
 ) {
   return {
-    ...defaultLimits[integration.kind],
+    ...brokerIntegration(integration.kind).limit,
     ...(Object.hasOwn(limits, integration.id) && limits[integration.id]),
   };
 }

@@ -1,12 +1,8 @@
 import { endpointBaseURL, safeEndpointPath } from "../../../../src/endpoint";
 import { bearer, grantTokenPattern } from "../grants/tokens";
+import type { ModelDefinition } from "../../../../src/integrations";
+import { brokerIntegration } from "../integrations/definitions";
 import type { IntegrationTarget } from "../integrations/types";
-
-const aiOrigins = {
-  openai: "https://api.openai.com",
-  anthropic: "https://api.anthropic.com",
-  openrouter: "https://openrouter.ai",
-};
 
 const repo = "[A-Za-z0-9_.-]+";
 
@@ -95,16 +91,17 @@ export function upstreamRoute(
   request: RequestRoute,
   integration: IntegrationTarget,
 ): Route | undefined {
+  const definition = brokerIntegration(integration.kind);
+
   if (request.type !== "gateway") {
-    return integration.kind === "github" ? { ...request, integration } : undefined;
+    return definition.family === "github" ? { ...request, integration } : undefined;
   }
 
-  const { kind } = integration;
   const { path, search, method, id } = request;
 
-  if (kind === "github" || id !== integration.id) return;
+  if (definition.family === "github" || id !== integration.id) return;
 
-  if (kind === "http") {
+  if (definition.family === "endpoint") {
     const base = integration.endpoint && endpointBaseURL(integration.endpoint.baseURL);
 
     return base
@@ -112,11 +109,14 @@ export function upstreamRoute(
       : undefined;
   }
 
-  if (!aiAllowed(kind, path, method) || hasSensitiveQuery(new URLSearchParams(search))) return;
+  if (!modelAllowed(definition, path, method) || hasSensitiveQuery(new URLSearchParams(search)))
+    return;
 
-  const prefix = kind === "openrouter" ? "/api" : "";
-
-  return { type: "ai", integration, url: new URL(`${prefix}${path}${search}`, aiOrigins[kind]) };
+  return {
+    type: "ai",
+    integration,
+    url: new URL(`${definition.upstreamPrefix}${path}${search}`, definition.origin),
+  };
 }
 
 function hasSensitiveQuery(params: URLSearchParams): boolean {
@@ -127,7 +127,7 @@ function hasSensitiveQuery(params: URLSearchParams): boolean {
   return false;
 }
 
-function aiAllowed(kind: keyof typeof aiOrigins, path: string, method: string): boolean {
+function modelAllowed(definition: ModelDefinition, path: string, method: string): boolean {
   if (
     (method === "GET" || method === "HEAD") &&
     /^\/v1\/models(?:\/[a-zA-Z0-9_.:-]+)?$/.test(path)
@@ -137,9 +137,7 @@ function aiAllowed(kind: keyof typeof aiOrigins, path: string, method: string): 
 
   if (method !== "POST") return false;
 
-  if (kind === "anthropic") return path === "/v1/messages" || path === "/v1/messages/count_tokens";
-
-  return path === "/v1/chat/completions" || path === "/v1/responses" || path === "/v1/embeddings";
+  return definition.generate.includes(path);
 }
 
 function githubAllowed(path: string, method: string): boolean {
@@ -213,7 +211,8 @@ export function brokerLink(value: string, target: Route): string | undefined {
     if (path === "/graphql") return;
     path = `/api/v3${path}`;
   } else if (target.type === "ai") {
-    const prefix = target.integration.kind === "openrouter" ? "/api" : "";
+    const definition = brokerIntegration(target.integration.kind);
+    const prefix = definition.family === "model" ? definition.upstreamPrefix : "";
 
     if (!path.startsWith(`${prefix}/v1/`)) return;
     path = `/gateway/${target.integration.id}${path.slice(prefix.length)}`;

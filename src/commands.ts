@@ -11,6 +11,7 @@ import {
   type BrokerWorkflowPolicy,
 } from "./admin.js";
 import { normalizeEndpoint, normalizeEndpointValues } from "./endpoint.js";
+import { integrationDefinition, integrationKindNames } from "./integrations.js";
 import { resolveSecret } from "./secret-ref.js";
 import type { BrokerGrantSummary } from "./grants.js";
 import {
@@ -232,16 +233,15 @@ async function credentialFromFlags(flags: {
   return usageError("Select exactly one credential source with --secret-stdin or --worker-secret");
 }
 
+const providers = integrationKindNames.filter(
+  (kind): kind is Exclude<BrokerIntegrationKind, "http"> =>
+    integrationDefinition(kind).family !== "endpoint",
+);
+
 function provider(value: string | undefined): Exclude<BrokerIntegrationKind, "http"> {
-  switch (value) {
-    case "github":
-    case "anthropic":
-    case "openai":
-    case "openrouter":
-      return value;
-    default:
-      return usageError("Choose --provider github, anthropic, openai, openrouter or http");
-  }
+  const kind = providers.find((name) => name === value);
+
+  return kind ?? usageError(`Choose --provider ${providers.join(", ")} or http`);
 }
 
 function integrationIds(positionals: string[], many: boolean): string[] {
@@ -410,18 +410,9 @@ function integrationLines(items: readonly BrokerIntegration[]): string {
 }
 
 function builtInUpstream(kind: BrokerIntegrationKind): string {
-  switch (kind) {
-    case "github":
-      return "https://github.com";
-    case "anthropic":
-      return "https://api.anthropic.com";
-    case "openai":
-      return "https://api.openai.com";
-    case "openrouter":
-      return "https://openrouter.ai";
-    case "http":
-      return "";
-  }
+  const definition = integrationDefinition(kind);
+
+  return definition.family === "endpoint" ? "" : definition.origin;
 }
 
 function integrationDetail(item: BrokerIntegration): string {

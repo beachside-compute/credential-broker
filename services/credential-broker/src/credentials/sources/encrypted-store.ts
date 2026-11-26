@@ -1,5 +1,6 @@
 import { matchingEndpointValues, normalizeEndpointValues } from "../../../../../src/endpoint";
 import { z } from "zod";
+import { brokerIntegration } from "../../integrations/definitions";
 import type { HttpIntegrationRevision, IntegrationRevision } from "../../integrations/types";
 import { credentialValue } from "../source";
 import type { CredentialSource, EncryptedCredential } from "../source";
@@ -66,7 +67,7 @@ export async function resealCredential(
     reference,
     aad(integration, reference.keyVersion),
     keyring,
-    integration.kind === "http" ? 67_000 : 4096,
+    brokerIntegration(integration.kind).maxCredentialBytes,
   );
 
   if (value === undefined) return;
@@ -215,7 +216,7 @@ function aad(integration: IntegrationRevision, keyVersion: string) {
       integration.kind,
       integration.credentialVersion,
       keyVersion,
-      ...(integration.kind === "http" ? [integration.endpoint] : []),
+      ...(brokerIntegration(integration.kind).family === "endpoint" ? [integration.endpoint] : []),
     ]),
   );
 }

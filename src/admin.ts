@@ -39,10 +39,9 @@ import {
   type BrokerGrantSummary,
   type BrokerStatus,
 } from "./grants.js";
+import { isIntegrationKind, type IntegrationKindName } from "./integrations.js";
 
-const integrationKinds = ["github", "anthropic", "openai", "openrouter", "http"] as const;
-
-export type BrokerIntegrationKind = (typeof integrationKinds)[number];
+export type BrokerIntegrationKind = IntegrationKindName;
 
 export type BrokerIntegrationCredential =
   | { source: "encrypted-store"; value: string }
@@ -92,10 +91,6 @@ const secretBinding = /^CREDENTIAL_[A-Z][A-Z0-9_]{0,79}$/;
 const secretValue = /^[\x21-\x7e]{1,4096}$/;
 
 const utcTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-
-function isKind(value: string): value is BrokerIntegrationKind {
-  return integrationKinds.some((kind) => kind === value);
-}
 
 function requireId(id: string) {
   if (typeof id !== "string" || !integrationName.test(id))
@@ -176,7 +171,7 @@ function integrationMetadata(reply: unknown, expectedId?: string): BrokerIntegra
     !integrationName.test(id) ||
     (expectedId !== undefined && id !== expectedId) ||
     typeof kind !== "string" ||
-    !isKind(kind) ||
+    !isIntegrationKind(kind) ||
     typeof enabled !== "boolean" ||
     (credentialSource !== "encrypted-store" && credentialSource !== "worker-secret") ||
     typeof credentialVersion !== "number" ||
@@ -322,7 +317,7 @@ export function createCredentialBrokerAdmin(options: CredentialBrokerAdminOption
       async create(input: BrokerIntegrationInput, call: BrokerRequestOptions = {}) {
         const id = requireId(input.id);
 
-        if (!isKind(input.kind))
+        if (!isIntegrationKind(input.kind))
           throw new CredentialBrokerError(
             "INVALID_ARGUMENT",
             "Unsupported credential broker integration kind",

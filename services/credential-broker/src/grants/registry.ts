@@ -7,6 +7,7 @@ import type { Principal } from "../auth";
 import { requestLimit, tenantConfigFor } from "../config";
 import type { RequestLimits, TenantConfig } from "../config";
 import type { CredentialReference, EncryptedCredential } from "../credentials/source";
+import { brokerIntegration, kindsIn } from "../integrations/definitions";
 import { integrations, issuerIntegrations } from "../integrations/schema";
 import { maxIntegrations } from "../integrations/types";
 import type {
@@ -558,7 +559,7 @@ export class GrantRegistry extends DurableObject {
 
       if (refusal) return refusal;
 
-      if (known.filter(({ kind }) => kind === "github").length > 1)
+      if (known.filter(({ kind }) => brokerIntegration(kind).family === "github").length > 1)
         return { status: "ambiguous_github" };
 
       // Bound all active rows, including simultaneous issuances from several workflow runs.
@@ -960,7 +961,7 @@ export class GrantRegistry extends DurableObject {
             eq(integrations.enabled, true),
             inArray(integrations.identity, grant.permissions),
             selector.type === "github"
-              ? eq(integrations.kind, "github")
+              ? inArray(integrations.kind, kindsIn("github"))
               : eq(integrations.id, selector.id),
           ),
         )
@@ -970,12 +971,12 @@ export class GrantRegistry extends DurableObject {
 
       if (
         candidates.length !== 1 ||
-        (selector.type === "gateway" && integration.kind === "github")
+        (selector.type === "gateway" && brokerIntegration(integration.kind).family === "github")
       ) {
         return { status: "forbidden" };
       }
 
-      if (usesApiKeyHeader && integration.kind !== "anthropic" && integration.kind !== "http")
+      if (usesApiKeyHeader && !brokerIntegration(integration.kind).apiKeyHeader)
         return { status: "invalid" };
 
       const hosted =

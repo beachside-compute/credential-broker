@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unsafe-dictionary-type -- Parse canary and alert replies at the HTTP trust boundary. */
 import { CredentialBrokerError, integrationName } from "./transport.js";
+import { isIntegrationKind, type IntegrationKindName } from "./integrations.js";
 
 export type BrokerAlertKind = "slack" | "webhook" | "email";
 
@@ -48,18 +49,10 @@ export interface BrokerCanaryToken {
   readonly kinds: Readonly<Record<string, CanaryIntegrationKind>>;
 }
 
-type CanaryIntegrationKind = "github" | "anthropic" | "openai" | "openrouter" | "http";
-
-const kindNames: readonly CanaryIntegrationKind[] = [
-  "github",
-  "anthropic",
-  "openai",
-  "openrouter",
-  "http",
-];
+type CanaryIntegrationKind = IntegrationKindName;
 
 function kindName(value: unknown): CanaryIntegrationKind {
-  return kindNames.find((kind) => kind === value) ?? invalid();
+  return typeof value === "string" && isIntegrationKind(value) ? value : invalid();
 }
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
