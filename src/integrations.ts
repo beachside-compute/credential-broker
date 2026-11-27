@@ -86,5 +86,5 @@ export function integrationDefinition(kind: IntegrationKindName): IntegrationDef
 }
 
 export function isIntegrationKind(value: string): value is IntegrationKindName {
-  return Object.hasOwn(integrationDefinitions, value);
+  return integrationKindNames.some((kind) => kind === value);
 }
