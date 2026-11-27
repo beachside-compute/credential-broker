@@ -1,10 +1,12 @@
 import type { BrokerEndpoint } from "../../../../src/endpoint";
+import { integrationKindNames } from "../../../../src/integrations";
+import type { IntegrationKindName } from "../../../../src/integrations";
 import { z } from "zod";
 import type { CredentialReference } from "../credentials/source";
 
-export const integrationKind = z.enum(["github", "anthropic", "openai", "openrouter", "http"]);
+export const integrationKind = z.enum(integrationKindNames);
 
-export type IntegrationKind = z.infer<typeof integrationKind>;
+export type IntegrationKind = IntegrationKindName;
 
 export interface IntegrationRevision {
   identity: string;

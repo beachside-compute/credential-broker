@@ -3,9 +3,8 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { grantIdPattern, newGrantToken, tokenHash } from "./grants/tokens";
 import { apiVersion, grantLabel, integrationId, maxGrantTtlSeconds } from "./config";
-import type { ResolvedCredential } from "./credentials/source";
-import { workerSecretSource } from "./credentials/sources/worker-secret";
-import { encryptedStoreSource, openEndpointValues } from "./credentials/sources/encrypted-store";
+import { resolveCredential } from "./credentials/resolve";
+import type { UpstreamCredential } from "./credentials/resolve";
 import { failure, upstream, withCompletion } from "./proxy/forward";
 import { GrantRegistry, leaseTtlMs } from "./grants/registry";
 import { grantView } from "./grants/view";
@@ -413,32 +412,13 @@ app.all("*", async (context) => {
     return failure(404, "unsupported_route");
   }
 
-  let credential: ResolvedCredential | { values: Record<string, string> } | undefined;
+  let credential: UpstreamCredential | undefined;
 
   try {
-    const reference = integration.credential;
-
-    if (integration.kind === "http") {
-      if (reference.source === "encrypted-store") {
-        const values = await openEndpointValues(
-          reference,
-          integration,
-          await tenant.keyring(authorized.keyState),
-        );
-
-        if (values) credential = { values };
-      }
-    } else {
-      credential =
-        reference.source === "worker-secret"
-          ? tenant.id === defaultTenant
-            ? await workerSecretSource(context.env).resolve(reference)
-            : undefined
-          : await encryptedStoreSource(
-              integration,
-              await tenant.keyring(authorized.keyState),
-            ).resolve(reference);
-    }
+    credential = await resolveCredential(integration, {
+      workerSecrets: tenant.id === defaultTenant ? context.env : undefined,
+      keyring: () => tenant.keyring(authorized.keyState),
+    });
   } catch {
     complete(503);
 

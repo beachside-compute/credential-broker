@@ -31,6 +31,11 @@ import {
   type BrokerGrantSummary,
   type BrokerStatus,
 } from "./grants.js";
+import {
+  integrationDefinition,
+  isIntegrationKind,
+  type IntegrationKindName,
+} from "./integrations.js";
 
 export { CredentialBrokerError, maxGrantTtlSeconds } from "./transport.js";
 
@@ -81,7 +86,7 @@ export interface BrokerGrantRequest {
   label?: string;
 }
 
-export type BrokerIntegrationKindName = "github" | "anthropic" | "openai" | "openrouter" | "http";
+export type BrokerIntegrationKindName = IntegrationKindName;
 
 export interface BrokerGrant {
   readonly id: string;
@@ -141,14 +146,6 @@ const gitVariables = [
   "GIT_CONFIG_VALUE_2",
 ];
 
-const kindNames: readonly BrokerIntegrationKindName[] = [
-  "github",
-  "anthropic",
-  "openai",
-  "openrouter",
-  "http",
-];
-
 function validTtl(ttlSeconds: number): boolean {
   return Number.isSafeInteger(ttlSeconds) && ttlSeconds >= 1 && ttlSeconds <= maxGrantTtlSeconds;
 }
@@ -189,14 +186,17 @@ export function githubGrantEnv(base: URL, token: string) {
 
 /** The `<PREFIX>_BASE_URL` / `<PREFIX>_API_KEY` prefix a sandbox gets for a non-GitHub integration. */
 export function grantEnvPrefix(id: string, kind: BrokerIntegrationKindName): string {
-  return (kind === "http" ? id.replaceAll("-", "_") : kind).toUpperCase();
+  return (
+    integrationDefinition(kind).family === "endpoint" ? id.replaceAll("-", "_") : kind
+  ).toUpperCase();
 }
 
 /** The base URL a client should use for one integration, given its kind. */
 export function integrationBaseURL(base: URL, id: string, kind: BrokerIntegrationKindName) {
+  const definition = integrationDefinition(kind);
   const gateway = gatewayBaseURL(base, id);
 
-  return kind === "openai" || kind === "openrouter" ? `${gateway}/v1` : gateway;
+  return definition.family === "model" ? `${gateway}${definition.clientPath}` : gateway;
 }
 
 /** Resolve a fresh GitHub Actions identity token per broker request. Run on the trusted host. */
@@ -409,7 +409,8 @@ export function createCredentialBroker(options: CredentialBrokerOptions) {
         kinds && typeof kinds === "object" && !Array.isArray(kinds)
           ? Object.fromEntries(
               Object.entries(kinds).flatMap(([name, kind]) => {
-                const known = kindNames.find((value) => value === kind);
+                const known =
+                  typeof kind === "string" && isIntegrationKind(kind) ? kind : undefined;
 
                 return body.integrations.includes(name) && known ? [[name, known]] : [];
               }),

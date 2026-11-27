@@ -1,6 +1,7 @@
 import type { BrokerEndpointHeader } from "../../../../src/endpoint";
 import { reservedEndpointHeader } from "../../../../src/endpoint";
 import type { ResolvedCredential } from "../credentials/source";
+import { brokerIntegration } from "../integrations/definitions";
 import { brokerLink } from "./routes";
 import type { Route } from "./routes";
 
@@ -63,7 +64,12 @@ export async function upstream(
   if (!headers.has("user-agent")) headers.set("user-agent", "Beachside-Credential-Broker/0.0.0");
   headers.set("accept-encoding", "identity");
 
-  if ("value" in credential) setLegacyCredential(headers, target, credential.value);
+  if ("value" in credential) {
+    const integration = brokerIntegration(target.integration.kind);
+
+    if (!("authorize" in integration)) return failure(503, "credential_unavailable");
+    integration.authorize(headers, credential.value, target.type);
+  }
 
   // No retries. In particular, a transport error says nothing about whether a write landed.
   const response = await fetch(target.url, {
@@ -131,18 +137,6 @@ export async function upstream(
     headers: responseHeaders,
     encodeBody: "manual",
   });
-}
-
-function setLegacyCredential(headers: Headers, target: Route, value: string): void {
-  if (target.type === "git") {
-    headers.set("authorization", `Basic ${btoa(`x-access-token:${value}`)}`);
-  } else if (target.integration.kind === "anthropic") {
-    headers.set("x-api-key", value);
-
-    if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
-  } else {
-    headers.set("authorization", `Bearer ${value}`);
-  }
 }
 
 function connectionHeaders(headers: Headers): ReadonlySet<string> {
